@@ -378,3 +378,22 @@ transcript_is_german() {
     GERMAN_MARKER_MATCHED="$matched"
     [ "$matched" -ge "$GERMAN_MARKER_WORDS_MIN" ]
 }
+
+_no_process_matches() {
+    ! pgrep -f "$1" >/dev/null 2>&1
+}
+
+# Wait until no process matches `pattern`, or give up. Returns 0 when nothing
+# matches (including when nothing ever did), 1 when a match is still alive
+# after `timeout_s`.
+#
+# `pkill` reports "matched nothing" and "killed it" the same way to a caller
+# that discards the status, and a lane that kills and then asserts on files
+# cannot tell the two apart: a live process keeps the files in exactly the
+# state the assertions expect. A rename of the bundle or the executable is
+# enough to hit that, so the kill needs a verdict of its own rather than a
+# hopeful `|| true`.
+wait_for_process_gone() {
+    local pattern="$1" timeout_s="${2:-10}"
+    poll_until "$timeout_s" 0.2 _no_process_matches "$pattern"
+}

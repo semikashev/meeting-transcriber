@@ -1737,7 +1737,12 @@ run_crash_recovery() {
     #    Kill the simulator too so the relaunch sees no active meeting — the
     #    only recording that can surface post-relaunch is the recovered one.
     log "$label: SIGKILL the app mid-recording (simulating a crash)"
-    pkill -KILL -f "MeetingTranscriber-Dev.app/Contents/MacOS/MeetingTranscriber" 2>/dev/null || true
+    pkill -KILL -f "$_DEV_APP_PATTERN" 2>/dev/null || true
+    # Everything below this line is equally true of an app that is still
+    # running, so the kill needs a verdict of its own (see
+    # `wait_for_process_gone` in lib/e2e-helpers.sh for why).
+    wait_for_process_gone "$_DEV_APP_PATTERN" 10 \
+        || fail "$label: the app survived SIGKILL. Nothing below this point would exercise crash recovery: a live recorder keeps the raw temp present and the mix absent, so every later assertion passes against an ordinary recording. The likely cause is a renamed bundle or executable that the kill pattern no longer matches."
     [ -n "${SIM_PID:-}" ] && kill "$SIM_PID" 2>/dev/null || true
     SIM_PID=""
     sleep 2
