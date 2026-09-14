@@ -1183,6 +1183,20 @@ _RESOLVED_RECORD_ONLY="$(jq -r '.settings.recording.recordOnly' <<<"$_SNAP")"
     || fail "the app resolved settings.recording.recordOnly=$_RESOLVED_RECORD_ONLY but this lane needs $_EXPECTED_RECORD_ONLY. Most likely the preference write did not reach the domain the app reads (see write_dev_default in scripts/lib/e2e-helpers.sh); the other possibility is that a different MeetingTranscriber instance is answering on 127.0.0.1:9876."
 log "app resolved recordOnly=$_RESOLVED_RECORD_ONLY (as configured)"
 
+# Same reasoning one field over: every artifact assertion in this lane is built
+# on `$OUTPUT_DIR`, a literal restatement of a path the app owns and the user
+# can repoint (Settings, a security-scoped bookmark). Restating an app-owned
+# path is what made the record-only assertion vacuous in the first place, so
+# assert the agreement here instead of searching a tree the app never writes to
+# and reporting the emptiness as a pass.
+#
+# `null` means a custom bookmark is set and did not resolve just now, which is a
+# real app state but not one this lane can assert against, so it fails too.
+_RESOLVED_OUTPUT_DIR="$(jq -r '.settings.output.directory // "null"' <<<"$_SNAP")"
+[ "${_RESOLVED_OUTPUT_DIR%/}" = "${OUTPUT_DIR%/}" ] \
+    || fail "the app writes to '$_RESOLVED_OUTPUT_DIR' but this lane asserts against '$OUTPUT_DIR'. Every artifact check here would search a tree the app never touches and report the emptiness as a pass. Clear the custom Output Folder on this host, or point the lane at the app's directory."
+log "app resolved output directory=$_RESOLVED_OUTPUT_DIR (as assumed)"
+
 
 
 # Trigger one meeting, poll until a new pipeline job reaches a terminal
