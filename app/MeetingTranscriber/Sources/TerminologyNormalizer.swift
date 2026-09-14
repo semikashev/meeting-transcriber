@@ -6,7 +6,9 @@ import Foundation
 /// regular expressions because this runs on the main-actor pipeline path.
 struct TerminologyNormalizer: Sendable {
     static let maximumRulesTextBytes = 64 * 1024
-    static let maximumRuleCount = 200
+    // Raised from upstream's 200: Russian needs one rule per case form, so 200
+    // covered only ~35 declinable terms. Matching cost is linear in rule count.
+    static let maximumRuleCount = 1000
     static let maximumTermBytes = 512
 
     struct Diagnostics: Equatable, Sendable {

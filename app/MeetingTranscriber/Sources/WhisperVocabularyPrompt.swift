@@ -12,7 +12,7 @@ enum WhisperVocabularyPrompt {
     static let defaultTokenBudget = 32
     /// Bounds synchronous file loading and parsing on the main actor.
     static let maximumFileBytes = 256 * 1024
-    static let maximumTermCount = 256
+    static let maximumTermCount = 512
     static let maximumTermBytes = 512
 
     /// The values that identify cached tokens for a loaded Whisper model.
