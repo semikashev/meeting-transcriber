@@ -380,8 +380,10 @@ STUB
         rc=1
     fi
 
-    # An absent keychain is a normal answer, not a failure: the lanes decide what
-    # to do about it, and one of them only warns.
+    # An absent keychain is a normal answer from this function, not a failure.
+    # Resolving an identity is a separate job from deciding what a missing one
+    # means, and that decision belongs to the caller: see `have_signing_route`,
+    # which answers it without paying for the resolution.
     out="$(PATH="$workdir/bin:$PATH" \
         DEV_KEYCHAIN="$workdir/absent.keychain-db" \
         SIGNING_LIB="$REPO_ROOT/scripts/lib/signing.sh" \

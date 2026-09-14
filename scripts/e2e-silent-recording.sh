@@ -140,30 +140,35 @@ if [ "$NO_BUILD" = false ]; then
     else
         cp -R "$DEV_BUNDLE_BUILD" "$DEV_BUNDLE_DEPLOY"
     fi
+    # A stable identity is a precondition of this lane rather than a
+    # nice-to-have, because a denied capture reads exactly like the silence the
+    # lane asserts (see `have_signing_route` in lib/signing.sh).
+    if ! have_signing_route "${DEVELOPER_ID:-}" "$DEV_KEYCHAIN"; then
+        echo "  A denied capture is indistinguishable from the silence this lane asserts," >&2
+        echo "  so the run would report success without testing anything." >&2
+        echo "  Run scripts/setup-self-hosted-runner.sh to create the dev signing identity." >&2
+        die "no DEVELOPER_ID and no $DEV_KEYCHAIN — TCC would deny the capture stack"
+    fi
     if [ -n "${DEVELOPER_ID:-}" ]; then
         echo "▸ Re-signing with Developer ID '$DEVELOPER_ID'…"
         resign_deployed_bundle "$DEV_BUNDLE_DEPLOY" "$DEVELOPER_ID" "${E2E_SIGNING_KEYCHAIN:-}" \
             || die "Developer ID re-sign failed"
     else
         # Local-dev path: self-signed cert from setup-self-hosted-runner.sh,
-        # resolved from the keychain by dev_signing_identity.
-        if [ -f "$DEV_KEYCHAIN" ]; then
-            DEV_CERT_HASH="$(dev_signing_identity)"
-            if [ -n "$DEV_CERT_HASH" ]; then
-                echo "▸ Re-signing with self-signed dev cert (SHA1=${DEV_CERT_HASH})..."
-                # codesign honours `--keychain` for the signing identity but
-                # still consults the user-domain search list for trust-chain
-                # resolution. Prepending the dev keychain matches scripts/e2e-app.sh.
-                "$ROOT/scripts/keychain-prepend.sh" "$DEV_KEYCHAIN" 2>/dev/null || true
-                resign_deployed_bundle "$DEV_BUNDLE_DEPLOY" "$DEV_CERT_HASH" "$DEV_KEYCHAIN" \
-                    || die "dev-cert re-sign failed"
-            else
-                echo "  Run scripts/setup-self-hosted-runner.sh to (re-)create it" >&2
-                die "dev keychain present but no '$DEV_CERT_NAME' identity inside"
-            fi
+        # resolved from the keychain by dev_signing_identity. The guard above
+        # has already established that the keychain is there.
+        DEV_CERT_HASH="$(dev_signing_identity)"
+        if [ -n "$DEV_CERT_HASH" ]; then
+            echo "▸ Re-signing with self-signed dev cert (SHA1=${DEV_CERT_HASH})..."
+            # codesign honours `--keychain` for the signing identity but
+            # still consults the user-domain search list for trust-chain
+            # resolution. Prepending the dev keychain matches scripts/e2e-app.sh.
+            "$ROOT/scripts/keychain-prepend.sh" "$DEV_KEYCHAIN" 2>/dev/null || true
+            resign_deployed_bundle "$DEV_BUNDLE_DEPLOY" "$DEV_CERT_HASH" "$DEV_KEYCHAIN" \
+                || die "dev-cert re-sign failed"
         else
-            echo "▸ WARNING: no DEVELOPER_ID and no $DEV_KEYCHAIN — TCC may deny capture" >&2
-            echo "  (run scripts/setup-self-hosted-runner.sh to fix)"
+            echo "  Run scripts/setup-self-hosted-runner.sh to (re-)create it" >&2
+            die "dev keychain present but no '$DEV_CERT_NAME' identity inside"
         fi
     fi
 fi

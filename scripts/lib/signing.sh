@@ -389,6 +389,26 @@ dev_signing_identity() {
     identity_sha1 "$DEV_CERT_NAME" "$DEV_KEYCHAIN"
 }
 
+# have_signing_route <developer-id> <dev-keychain-path>
+#
+# True when this host can re-sign the deployed bundle with a stable identity,
+# either an explicit Developer ID or the self-signed one the setup script
+# installs into the dev keychain. Cheap and pure: it asks what is available,
+# it does not unlock anything or resolve an identity.
+#
+# A lane whose result depends on TCC grants needs this as a precondition, not
+# as a warning. Without a stable identity the grants do not survive the
+# re-sign, the capture stack is denied, and the tap delivers zeroes from its
+# first buffer, which is indistinguishable from the quiet the lane is there to
+# detect. There is no further signal to assert, so the honest move is to refuse
+# rather than to report a verdict that means nothing.
+have_signing_route() {
+    local developer_id="$1" dev_keychain="$2"
+    [ -n "$developer_id" ] && return 0
+    [ -f "$dev_keychain" ] && return 0
+    return 1
+}
+
 # resign_deployed_bundle <app-bundle> <identity> [keychain]
 #
 # Re-sign a bundle that was built and deployed elsewhere, with a stable identity
