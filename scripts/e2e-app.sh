@@ -322,10 +322,13 @@ DEFAULT_FIXTURE="$ROOT/app/MeetingTranscriber/Tests/Fixtures/two_speakers_de.wav
 RPC_TOKEN_FILE="$HOME/Library/Application Support/MeetingTranscriber/.rpc-token"
 RPC_BASE="http://127.0.0.1:9876"
 
-# Record-only output lands here — `AppPaths.downloadsProtocolsDir` +
-# `/recordings`. Unsandboxed (Homebrew variant) so this is a real path,
-# not a container-mapped one.
-RECORDINGS_DIR="$HOME/Downloads/MeetingTranscriber/recordings"
+# The app's output folder — `AppPaths.downloadsProtocolsDir`. Unsandboxed
+# (Homebrew variant) so this is a real path, not a container-mapped one.
+# Recordings and protocols are SIBLINGS under it: audio and its sidecar go to
+# `recordings/`, transcripts and protocols to `protocols/`. Derive both from
+# one root so an assertion cannot end up pointed at the wrong sibling.
+OUTPUT_DIR="$HOME/Downloads/MeetingTranscriber"
+RECORDINGS_DIR="$OUTPUT_DIR/recordings"
 # `find -newer` marker so cleanup only touches THIS run's files — never
 # pre-existing user data (see CLAUDE.md feedback on destructive FS scans).
 RECORD_ONLY_MARKER="/tmp/e2e-app-record-only-marker.$$"
@@ -1523,8 +1526,7 @@ run_mic_only() {
     # Negative: record-only short-circuits before VAD/transcription/protocol, and
     # a manual trigger must not be the exception that slips past it.
     local unexpected
-    unexpected="$(find "$RECORDINGS_DIR" -maxdepth 1 -type f -newer "$RECORD_ONLY_MARKER" \
-        \( -name '*.txt' -o -name '*.md' \) 2>/dev/null | head -5)"
+    unexpected="$(pipeline_output_artifacts "$OUTPUT_DIR" "$RECORD_ONLY_MARKER")"
     [ -z "$unexpected" ] || fail "$label: a microphone recording must not produce transcript/protocol; found: $unexpected"
     assert_last_job_unchanged "$label"
     assert_app_alive
@@ -1608,10 +1610,8 @@ run_one_record_only_meeting() {
         "System-audio capture produced no usable signal: likely a wrong tap PID set, a missing TCC audio-capture grant, or a regressed capture path."
 
     # Negative: record-only short-circuits before VAD/transcription/protocol.
-    # No `.txt`/`.md` files from THIS meeting should exist in recordings/.
     local unexpected
-    unexpected="$(find "$RECORDINGS_DIR" -maxdepth 1 -type f -newer "$meeting_marker" \
-        \( -name '*.txt' -o -name '*.md' \) 2>/dev/null | head -5)"
+    unexpected="$(pipeline_output_artifacts "$OUTPUT_DIR" "$meeting_marker")"
     [ -z "$unexpected" ] || fail "$label: record-only should not produce transcript/protocol; found: $unexpected"
 
     # Negative: PipelineQueue.enqueue() was skipped, so `lastJob.jobID`

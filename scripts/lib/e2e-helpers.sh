@@ -378,3 +378,27 @@ transcript_is_german() {
     GERMAN_MARKER_MATCHED="$matched"
     [ "$matched" -ge "$GERMAN_MARKER_WORDS_MIN" ]
 }
+
+# Files a completed pipeline would have written under the output folder, newer
+# than `marker`. The record-only lanes use this as a negative assertion:
+# record-only short-circuits before transcription and protocol generation, so a
+# `.txt` or `.md` belonging to this meeting means the pipeline ran when it must
+# not have.
+#
+# Searches the output ROOT rather than one subdirectory, deliberately. The
+# transcript and the protocol land in `<output>/protocols` while the audio and
+# its sidecar land in `<output>/recordings`, and pinning the search to the
+# recordings directory is how this assertion came to be satisfied
+# unconditionally: no `.txt` or `.md` can appear there in either the working or
+# the broken world. Searching from the root cannot be outlived by a change to
+# which subdirectory the app writes into.
+#
+# stderr is deliberately not silenced: a `find` that cannot read the tree would
+# otherwise be indistinguishable from a clean run, which is the same shape of
+# defect this function replaces.
+pipeline_output_artifacts() {
+    local output_dir="$1" marker="$2"
+    [ -d "$output_dir" ] || return 0
+    find "$output_dir" -type f -newer "$marker" \
+        \( -name '*.txt' -o -name '*.md' \)
+}
