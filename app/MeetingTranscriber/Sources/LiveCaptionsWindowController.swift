@@ -19,21 +19,21 @@ import SwiftUI
 /// caption-bar content — the SwiftUI hierarchy's ideal size republished on
 /// every layout pass, NSHostingController called `setFrame`, which fired
 /// another layout, recursing until the stack overflowed. The fixed-size
-/// trade-off: very long captions clip vertically once they exceed
-/// `panelHeight`; that's acceptable for the PoC and the surrounding overlay
-/// only renders a few lines anyway.
+/// trade-off: very long captions clip vertically once they exceed the
+/// preset's panel height; that's acceptable for the PoC and the surrounding
+/// overlay only renders a few lines anyway. The dimensions come from
+/// `LiveCaptionsSize` (Settings → Transcription → Caption size), which pairs
+/// each panel size with the font it was measured for; `apply(size:)` swaps
+/// both together.
 @MainActor
 final class LiveCaptionsWindowController {
     private var panel: NSPanel?
     private let state: LiveCaptionsState
+    private var size: LiveCaptionsSize
 
     private var modifierMonitor: Any?
     private var moveObserver: (any NSObjectProtocol)?
 
-    private static let panelWidth: CGFloat = 720
-    /// Tall enough for 4 lines of 22 pt text plus the rounded-background
-    /// padding (14 pt × 2). Lines beyond this clip silently.
-    private static let panelHeight: CGFloat = 200
     private static let bottomMargin: CGFloat = 60
 
     /// UserDefaults key for the bottom-left origin of the panel. Stored as
@@ -41,8 +41,10 @@ final class LiveCaptionsWindowController {
     /// bottom-centre of main screen".
     static let originDefaultsKey = "liveCaptionsPanelOrigin"
 
-    init(state: LiveCaptionsState) {
+    init(state: LiveCaptionsState, size: LiveCaptionsSize = .medium) {
         self.state = state
+        self.size = size
+        state.setSize(size)
     }
 
     /// Show the caption bar (creating the panel lazily on first call).
@@ -50,6 +52,34 @@ final class LiveCaptionsWindowController {
         let panel = ensurePanel()
         positionAtSavedOrDefault(panel)
         panel.orderFrontRegardless()
+    }
+
+    /// Switch presets. The overlay's font and the panel's frame change in one
+    /// step so neither can be observed at the other's old size; a bar that
+    /// already exists keeps its bottom edge and horizontal centre (see
+    /// `resizedFrame`). The origin is persisted here rather than left to the
+    /// move observer so a bar resized while hidden reappears at the same
+    /// centre on the next `show()`, which reads the saved origin back.
+    func apply(size: LiveCaptionsSize) {
+        guard size != self.size else { return }
+        self.size = size
+        state.setSize(size)
+        guard let panel else { return }
+        panel.setFrame(Self.resizedFrame(panel.frame, to: size), display: true)
+        persistOrigin(panel.frame.origin)
+    }
+
+    /// The frame a panel at `frame` takes when switched to `size`: same
+    /// bottom edge, same horizontal centre. Anchoring the bottom-left corner
+    /// instead would walk the bar sideways on every preset change, since the
+    /// user parks it by eye at the bottom-centre of a call window.
+    static func resizedFrame(_ frame: NSRect, to size: LiveCaptionsSize) -> NSRect {
+        NSRect(
+            x: frame.midX - size.panelSize.width / 2,
+            y: frame.minY,
+            width: size.panelSize.width,
+            height: size.panelSize.height,
+        )
     }
 
     /// Hide the caption bar without destroying the panel — re-showing is
@@ -65,9 +95,7 @@ final class LiveCaptionsWindowController {
         host.autoresizingMask = [.width, .height]
 
         let panel = NSPanel(
-            contentRect: NSRect(
-                x: 0, y: 0, width: Self.panelWidth, height: Self.panelHeight,
-            ),
+            contentRect: NSRect(origin: .zero, size: size.panelSize),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false,
@@ -97,20 +125,14 @@ final class LiveCaptionsWindowController {
     /// if no saved origin exists or the screen it lived on is gone.
     private func positionAtSavedOrDefault(_ panel: NSPanel) {
         let origin = savedOrigin() ?? defaultBottomCentreOrigin()
-        panel.setFrame(
-            NSRect(
-                x: origin.x, y: origin.y,
-                width: Self.panelWidth, height: Self.panelHeight,
-            ),
-            display: true,
-        )
+        panel.setFrame(NSRect(origin: origin, size: size.panelSize), display: true)
     }
 
     private func defaultBottomCentreOrigin() -> CGPoint {
         guard let screen = NSScreen.main else { return .zero }
         let visible = screen.visibleFrame
         return CGPoint(
-            x: visible.midX - Self.panelWidth / 2,
+            x: visible.midX - size.panelSize.width / 2,
             y: visible.minY + Self.bottomMargin,
         )
     }
@@ -125,7 +147,7 @@ final class LiveCaptionsWindowController {
               let x = dict["x"] as? Double, let y = dict["y"] as? Double
         else { return nil }
         let candidate = CGPoint(x: x, y: y)
-        let topLeft = CGPoint(x: x, y: y + Self.panelHeight)
+        let topLeft = CGPoint(x: x, y: y + size.panelSize.height)
         let onScreen = NSScreen.screens.contains { $0.visibleFrame.contains(topLeft) }
         return onScreen ? candidate : nil
     }
