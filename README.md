@@ -109,7 +109,7 @@ flowchart TD
 
 - macOS 14.2+ (required for CATapDescription audio capture)
 - **One of:**
-  - [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) — installed and logged in (`claude --version`)
+  - [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) — installed and logged in (`claude --version`). If the CLI's OAuth session can't refresh in the background, an Anthropic API key can be set in Settings → Output → Protocol Generation as a fallback (uses metered billing instead of your subscription)
   - An OpenAI-compatible API endpoint (e.g. [Ollama](https://ollama.com), LM Studio, llama.cpp) — configure in Settings
 
 No HuggingFace token needed — FluidAudio and WhisperKit download their models automatically on first run.

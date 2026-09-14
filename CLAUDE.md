@@ -29,6 +29,8 @@ scripts/                   # build_release / run_app / e2e-*.sh drivers, lint.sh
 Casks/                     # Homebrew Cask formulae (meeting-transcriber + @beta)
 .github/workflows/         # CI (lint/analyze/test), release, e2e lanes, quality-and-safety, pages
 docs/                      # architecture-macos.md + plans/ (committed RFCs; .local/ = gitignored scratch)
+site/                      # Static GitHub Pages landing page, deployed by .github/workflows/pages.yml
+licenses/ / THIRD-PARTY-NOTICES.md  # Vendored third-party license texts + their provenance notice
 protocols/                 # Protocol output dir (gitignored)
 speakers.json / .env       # Runtime voice profiles + env vars (gitignored)
 ```
@@ -220,6 +222,7 @@ Use the `/git-workflow` skill. Commit proactively after every logical unit of wo
 - `AppSettings.protocolLanguage` string (default `"German"`) is substituted into the prompt as `{LANGUAGE}`. `{MEETING_DATE}` (`YYYY-MM-DD`) and `{MEETING_TIME}` (`HH:mm`) resolve from a captured recording start time, or to `Unknown` for imports and recovery jobs. Only a captured recording start adds the authoritative meeting-metadata preamble, so processing time is never presented as a meeting time.
 - `ProtocolGenerator.loadPrompt()` loads custom prompt from `AppPaths.customPromptFile` (`~/Library/Application Support/MeetingTranscriber/protocol_prompt.md`), falls back to built-in default.
 - `OpenAIProtocolGenerator` supports any OpenAI-compatible HTTP API (Ollama, LM Studio, llama.cpp, etc.).
+- **Anthropic API key override** (Settings → Output → Protocol Generation): `AppSettings.claudeAPIKey`, Keychain-backed like `openAIAPIKey`, under its own Keychain account so it never collides with another tool's Anthropic credential on the same machine. `ClaudeCLIProtocolGenerator.buildEnvironment` injects it as `ANTHROPIC_API_KEY` only when the base environment has none. Exists because the CLI's own OAuth session can expire without a way to refresh from a background subprocess, leaving protocol generation stuck with nothing the user can act on. Never auto-discovered: an explicit key overrides a healthy `claude.ai` OAuth login rather than falling back to it, so silently finding one would move a working subscription session onto metered billing, and the CLI does not fall back to OAuth on a bad key — it retries for a few minutes and then fails. Empty (the default) reproduces the previous CLI-only behavior exactly.
 - **Transcript output options** (Settings → Output): `AppSettings.includeFullTranscriptInProtocol` (append the verbatim transcript to the generated Markdown) and `AppSettings.saveRawTranscriptSeparately` (keep the standalone `.txt`) both default to `true` for backward compatibility, and are captured per job at enqueue time so a settings change mid-queue doesn't retroactively affect jobs already running. The raw transcript is retained regardless of the setting whenever protocol generation is disabled, fails, or the job ends in an error — losing the only transcription is worse than an unwanted file.
 
 **UI:**
@@ -412,7 +415,7 @@ Two build variants controlled by compile-time flag `APPSTORE` (`-Xswiftc -DAPPST
 | **Safari call audio** | Yes (`ProcessResponsibility` via `dlsym`) | No (private symbol unavailable; bundle-derived PIDs only) |
 | **Entitlements** | Mic only | Sandbox + mic + network + file picker |
 | **Build** | `./scripts/build_release.sh` | `./scripts/build_release.sh --appstore` |
-| **Tests** | ~1,900 | fewer (CLI + RPC tests excluded via `#if !APPSTORE`) |
+| **Tests** | ~3,100 | fewer (CLI + RPC tests excluded via `#if !APPSTORE`) |
 
 - CLI-specific code lives in `ClaudeCLIProtocolGenerator.swift` and `DebugRPCServer.swift` (each entire file `#if !APPSTORE`)
 - `ProtocolProvider` enum uses `CaseIterable` — `.claudeCLI` case excluded at compile time, picker adapts automatically
