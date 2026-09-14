@@ -77,21 +77,21 @@ final class TerminologyNormalizerTests: XCTestCase {
         XCTAssertTrue(normalizer.diagnostics.isTooLarge)
     }
 
-    func testRuleLimitAccepts200Rules() {
-        let validRules = (0 ..< 200)
+    func testRuleLimitAcceptsMaximumRuleCount() {
+        let validRules = (0 ..< TerminologyNormalizer.maximumRuleCount)
             .map { "Canonical\($0) => variant\($0)" }
         let normalizer = TerminologyNormalizer(rulesText: validRules.joined(separator: "\n"))
 
-        XCTAssertEqual(normalizer.diagnostics.activeRuleCount, 200)
+        XCTAssertEqual(normalizer.diagnostics.activeRuleCount, TerminologyNormalizer.maximumRuleCount)
         XCTAssertEqual(normalizer.diagnostics.ignoredLineCount, 0)
     }
 
-    func testRuleLimitReportsThe201stRuleAsIgnored() {
-        let validRules = (0 ..< 200)
+    func testRuleLimitReportsTheRulePastMaximumAsIgnored() {
+        let validRules = (0 ..< TerminologyNormalizer.maximumRuleCount)
             .map { "Canonical\($0) => variant\($0)" }
         let normalizer = TerminologyNormalizer(rulesText: (validRules + ["Extra => extra"]).joined(separator: "\n"))
 
-        XCTAssertEqual(normalizer.diagnostics.activeRuleCount, 200)
+        XCTAssertEqual(normalizer.diagnostics.activeRuleCount, TerminologyNormalizer.maximumRuleCount)
         XCTAssertEqual(normalizer.diagnostics.ignoredLineCount, 1)
     }
 

@@ -174,6 +174,8 @@ final class SettingsInteractionTests: XCTestCase {
         try toggle.tap()
 
         XCTAssertTrue(settings.calendarTitlesEnabled, "tapping the toggle must turn the setting on")
+    }
+
     // MARK: - Caption size picker
 
     func testCaptionSizePickerSelectionWritesBackToSettings() throws {

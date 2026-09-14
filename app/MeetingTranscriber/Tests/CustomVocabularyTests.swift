@@ -115,16 +115,17 @@ final class CustomVocabularyTests: XCTestCase {
         XCTAssertEqual(settings.customVocabularyValidation, .empty)
     }
 
-    func testVocabularyValidationAccepts256TermsAndRejects257() throws {
-        let acceptedTerms = (0 ..< 256).map { "Term\($0)" }
+    func testVocabularyValidationAcceptsMaximumTermCountAndRejectsOneMore() throws {
+        let maximum = WhisperVocabularyPrompt.maximumTermCount
+        let acceptedTerms = (0 ..< maximum).map { "Term\($0)" }
         let acceptedFile = try makeVocabularyFile(contents: acceptedTerms.joined(separator: "\n"))
         defer { try? FileManager.default.removeItem(at: acceptedFile) }
 
         settings.setCustomVocabularyFile(acceptedFile)
 
-        XCTAssertEqual(settings.customVocabularyValidation, .ready(termCount: 256))
+        XCTAssertEqual(settings.customVocabularyValidation, .ready(termCount: maximum))
 
-        let rejectedTerms = (0 ... 256).map { "Term\($0)" }
+        let rejectedTerms = (0 ... maximum).map { "Term\($0)" }
         let rejectedFile = try makeVocabularyFile(contents: rejectedTerms.joined(separator: "\n"))
         defer { try? FileManager.default.removeItem(at: rejectedFile) }
 
