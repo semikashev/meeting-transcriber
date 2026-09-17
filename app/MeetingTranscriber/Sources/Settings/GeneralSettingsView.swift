@@ -46,7 +46,8 @@ struct GeneralSettingsView: View {
                     """
                     Detects web meetings (Google Meet, Whereby, web Zoom/Teams) by the WebRTC \
                     signal, so any browser works. Other apps that place calls can trigger it too; \
-                    it always asks before recording, and "Never for this app" stops one for good.
+                    it asks before recording (unless the calendar option below vouches for the \
+                    call), and "Never for this app" stops one for good.
                     """,
                 )
                 .font(.caption)
@@ -114,8 +115,27 @@ struct GeneralSettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.red)
             }
+            autoRecordRows
         }
         .onAppear { calendarAccessGranted = EventKitMeetingLookup.hasAccess }
+    }
+
+    /// Nested under the naming toggle rather than beside it: the lookup it
+    /// relies on is off without the one above, so a lone "on" here would do
+    /// nothing and look like a bug.
+    @ViewBuilder private var autoRecordRows: some View {
+        Toggle("Record browser meetings on the calendar without asking", isOn: $settings.autoRecordCalendarMeetings)
+            .accessibilityIdentifier(A11yID.autoRecordCalendarMeetingsToggle)
+            .disabled(!settings.calendarTitlesEnabled)
+        Text(
+            """
+            Skips the "Record browser meeting?" prompt when the call falls into an event \
+            that has other attendees or a conference link. Calls outside the calendar and \
+            personal blocks still ask. "Never for this app" wins over the calendar.
+            """,
+        )
+        .font(.caption)
+        .foregroundStyle(.secondary)
     }
 
     /// Apps the user answered "Never for this app" about.

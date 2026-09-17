@@ -15,10 +15,21 @@ struct CalendarEventCandidate: Equatable, Sendable {
 }
 
 /// What the pipeline learns from a calendar match: the title the recording is
-/// filed under and the attendees the protocol can name.
+/// filed under, the attendees the protocol can name, and whether the event
+/// looks like a call at all.
 struct CalendarMeeting: Equatable, Sendable {
     let title: String
     let attendees: [String]
+    /// The event carries a link to a conference the app in use could be
+    /// showing. Defaulted because most readers only want the name.
+    var hasConferenceLink = false
+
+    /// A meeting with other people in it, as opposed to a block the user put
+    /// on their own calendar: somebody was invited, or there is a call to
+    /// join. Auto-recording keys on this (see `WatchLoop+Consent`).
+    var involvesOthers: Bool {
+        !attendees.isEmpty || hasConferenceLink
+    }
 }
 
 /// Pure choice of the calendar event a recording belongs to.
@@ -55,8 +66,12 @@ enum CalendarMeetingMatcher {
         return ["zoom.us", "teams.microsoft.com", "teams.live.com", "webex.com", "meet.google.com", "whereby.com", "telemost.yandex"]
     }
 
+    static func hasConferenceLink(_ event: CalendarEventCandidate, forApp appName: String) -> Bool {
+        let text = event.conferenceText.lowercased()
+        return conferenceDomains(forApp: appName).contains { text.contains($0) }
+    }
+
     static func bestMatch(recordingStart: Date, appName: String, among events: [CalendarEventCandidate]) -> Match? {
-        let domains = conferenceDomains(forApp: appName)
         let scored: [(CalendarEventCandidate, Int)] = events.compactMap { event in
             let title = event.title.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !event.isAllDay, !title.isEmpty else { return nil }
@@ -64,8 +79,7 @@ enum CalendarMeetingMatcher {
                   event.end >= recordingStart else { return nil }
             var score = 0
             if event.start <= recordingStart { score += 1000 }
-            let text = event.conferenceText.lowercased()
-            if domains.contains(where: { text.contains($0) }) { score += 100 }
+            if hasConferenceLink(event, forApp: appName) { score += 100 }
             if !event.attendees.isEmpty { score += 10 }
             score -= Int(abs(event.start.timeIntervalSince(recordingStart)) / 60)
             return (event, score)
@@ -74,6 +88,7 @@ enum CalendarMeetingMatcher {
         let meeting = CalendarMeeting(
             title: top.0.title.trimmingCharacters(in: .whitespacesAndNewlines),
             attendees: top.0.attendees,
+            hasConferenceLink: hasConferenceLink(top.0, forApp: appName),
         )
         return Match(meeting: meeting, isAmbiguous: scored.filter { $0.1 == top.1 }.count > 1)
     }

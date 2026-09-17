@@ -80,6 +80,9 @@ class WatchLoop {
     /// Internal so the consent gate can live in `WatchLoop+Consent.swift`.
     var consentPolicy: BrowserConsentPolicy
     let denyListStore: any ConsentDenyListStoring
+    /// Dynamic accessor — whether a calendar meeting with other people in it may
+    /// skip the browser consent prompt; see `WatchLoop+Consent.swift`.
+    let autoRecordCalendarMeetings: () -> Bool
     /// Names a recording after the calendar event it falls into; see `WatchLoop+CalendarTitle.swift`.
     let calendarLookup: any CalendarMeetingLookup
 
@@ -133,6 +136,7 @@ class WatchLoop {
         pidAliveCheck: @escaping (pid_t) -> Bool = { kill($0, 0) == 0 },
         consentPolicy: BrowserConsentPolicy = BrowserConsentPolicy(),
         denyListStore: any ConsentDenyListStoring = InMemoryConsentDenyListStore(),
+        autoRecordCalendarMeetings: @escaping () -> Bool = { false },
         calendarLookup: any CalendarMeetingLookup = NoCalendarLookup(),
     ) {
         self.detector = detector
@@ -152,6 +156,7 @@ class WatchLoop {
         self.pidAliveCheck = pidAliveCheck
         self.consentPolicy = consentPolicy
         self.denyListStore = denyListStore
+        self.autoRecordCalendarMeetings = autoRecordCalendarMeetings
         self.calendarLookup = calendarLookup
     }
 
