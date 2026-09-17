@@ -26,6 +26,11 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate, App
     static let recordActionID = "BROWSER_MEETING_RECORD"
     static let ignoreActionID = "BROWSER_MEETING_IGNORE"
     static let neverActionID = "BROWSER_MEETING_NEVER"
+    /// The "record this in-room meeting?" prompt (`InRoomMeetingPrompter`).
+    /// Its own category because Never makes no sense for it: there is no app
+    /// to retire, and the way to stop the asking is the setting. The action
+    /// identifiers are shared, so `consentAnswer(for:)` reads both prompts.
+    static let microphoneCategoryID = "MICROPHONE_MEETING_PROMPT"
     /// How long an unanswered prompt stays open before it resolves itself as
     /// `.expired`. Five minutes, not one: it no longer blocks anything (the
     /// watch loop kept polling since issue #543), and a minute was only ever
@@ -77,7 +82,7 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate, App
         }
         isSetUp = true
         scheduler.setDelegate(self)
-        scheduler.setCategories([Self.makeConsentCategory()])
+        scheduler.setCategories([Self.makeConsentCategory(), Self.makeMicrophoneCategory()])
         scheduler.requestAuthorization()
     }
 
@@ -192,6 +197,18 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate, App
         )
     }
 
+    /// The "record this in-room meeting?" category: Record / Ignore only.
+    static func makeMicrophoneCategory() -> UNNotificationCategory {
+        let record = UNNotificationAction(identifier: recordActionID, title: "Record", options: [])
+        let ignore = UNNotificationAction(identifier: ignoreActionID, title: "Ignore", options: [])
+        return UNNotificationCategory(
+            identifier: microphoneCategoryID,
+            actions: [record, ignore],
+            intentIdentifiers: [],
+            options: [],
+        )
+    }
+
     /// Pure mapping from the tapped action to an answer. Only the explicit
     /// Record action grants consent; Never is its own durable answer; Ignore, a
     /// swipe-away dismiss, the default body tap and anything unrecognised all
@@ -210,6 +227,18 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate, App
     /// visible prompt, `.expired` when nobody answered in time.
     @MainActor
     func askToRecord(title: String, body: String) async -> ConsentAnswer {
+        await ask(title: title, body: body, categoryID: Self.consentCategoryID)
+    }
+
+    /// The in-room counterpart: same parking, timeout and RPC hook, fewer
+    /// buttons (`makeMicrophoneCategory`).
+    @MainActor
+    func askToRecordMicrophone(title: String, body: String) async -> ConsentAnswer {
+        await ask(title: title, body: body, categoryID: Self.microphoneCategoryID)
+    }
+
+    @MainActor
+    private func ask(title: String, body: String, categoryID: String) async -> ConsentAnswer {
         let deliverable = isSetUp && canDeliver()
 
         #if !APPSTORE
@@ -225,7 +254,7 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate, App
         guard deliverable else { return .declined }
         let id = UUID().uuidString
         let answer = await consentCoordinator.awaitDecision(id: id) { [self] in
-            postConsentNotification(id: id, title: title, body: body)
+            postConsentNotification(id: id, title: title, body: body, categoryID: categoryID)
         }
         // However it resolved — tapped, expired, or answered over RPC — the
         // question is settled, so the prompt must not stay in Notification
@@ -260,13 +289,13 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate, App
     /// `makeNotificationContent`; only the `scheduler.add` is I/O). The decision
     /// itself is driven by `didReceive` / the coordinator timeout, whichever
     /// resolves first.
-    private func postConsentNotification(id: String, title: String, body: String) {
+    private func postConsentNotification(id: String, title: String, body: String, categoryID: String) {
         scheduler.add(UNNotificationRequest(
             identifier: id,
             content: Self.makeNotificationContent(
                 title: title,
                 body: body,
-                categoryID: Self.consentCategoryID,
+                categoryID: categoryID,
                 // The one notification the app posts that asks a question with a
                 // deadline. At `.active` it is a banner: gone in seconds, and
                 // suppressed outright by any Focus mode, so it expires unseen and

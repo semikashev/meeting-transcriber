@@ -37,7 +37,10 @@ final class NotificationManagerSchedulingTests: XCTestCase {
         XCTAssertTrue(manager.isSetUp)
         XCTAssertIdentical(fake.delegate, manager)
         XCTAssertTrue(fake.authRequested)
-        XCTAssertEqual(fake.categories.map(\.identifier), [NotificationManager.consentCategoryID])
+        XCTAssertEqual(
+            Set(fake.categories.map(\.identifier)),
+            [NotificationManager.consentCategoryID, NotificationManager.microphoneCategoryID],
+        )
     }
 
     func testSetUpSkippedWhenNotDeliverable() {
@@ -116,6 +119,34 @@ final class NotificationManagerSchedulingTests: XCTestCase {
         manager.resolveConsent(responseIdentifier: posted.identifier, actionIdentifier: NotificationManager.recordActionID)
         let answer = await task.value
         XCTAssertEqual(answer, .granted)
+    }
+
+    /// The in-room prompt parks the same way, under its own category, and its
+    /// Record action grants. What the category offers is pinned separately.
+    func testAskToRecordMicrophonePostsUnderTheMicrophoneCategory() async {
+        let (manager, fake) = makeManager()
+        manager.setUp()
+        let task = Task { await manager.askToRecordMicrophone(title: "Record \"Weekly\" from the microphone?", body: "Now.") }
+
+        guard let posted = await firstPostedRequest(from: fake) else {
+            XCTFail("no prompt posted")
+            return
+        }
+        XCTAssertEqual(posted.content.categoryIdentifier, NotificationManager.microphoneCategoryID)
+        XCTAssertEqual(posted.content.title, "Record \"Weekly\" from the microphone?")
+        XCTAssertEqual(posted.content.interruptionLevel, .timeSensitive)
+
+        manager.resolveConsent(responseIdentifier: posted.identifier, actionIdentifier: NotificationManager.recordActionID)
+        let answer = await task.value
+        XCTAssertEqual(answer, .granted)
+    }
+
+    /// No "Never for this app": there is no app to retire, and the setting is
+    /// the way to stop the asking.
+    func testMicrophoneCategoryOffersRecordAndIgnoreOnly() {
+        let category = NotificationManager.makeMicrophoneCategory()
+        XCTAssertEqual(category.identifier, NotificationManager.microphoneCategoryID)
+        XCTAssertEqual(category.actions.map(\.identifier), [NotificationManager.recordActionID, NotificationManager.ignoreActionID])
     }
 
     func testAskToRecordIgnoreActionDeclines() async {

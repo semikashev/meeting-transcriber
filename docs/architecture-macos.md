@@ -151,7 +151,10 @@ State writes to `AppPaths.dataDir`; IPC + queue snapshots to `ipcDir`.
 | `WatchLoop+Consent.swift` | Browser-meeting consent gate, split out of `WatchLoop`; only patterns with `requiresRecordingConsent` reach it. With `autoRecordCalendarMeetings` on, a call inside a calendar event that involves other people skips the prompt (checked after the deny list and cooldowns) |
 | `WatchLoop+CalendarTitle.swift` | Calendar-backed naming at enqueue, split out of `WatchLoop`: title + attendees from the event running at recording start |
 | `CalendarMeetingMatcher.swift` | Pure choice of the calendar event a recording belongs to (must still be running at recording start; conference link, attendees, closest start break ties) |
-| `CalendarMeetingLookup.swift` | `CalendarMeetingLookup` protocol, `NoCalendarLookup` default, `EventKitMeetingLookup` reading the Mac's calendars |
+| `CalendarMeetingLookup.swift` | `CalendarMeetingLookup` protocol (`meeting(startingAt:appName:)` for naming, `events(around:)` for callers with their own rule), `NoCalendarLookup` default, `EventKitMeetingLookup` reading the Mac's calendars |
+| `InRoomMeetingPolicy.swift` | Pure choice of the calendar meeting worth an in-room prompt: begun, other attendees, no conference link, not declined; asked at most twice within ten minutes of its start |
+| `InRoomMeetingPrompter.swift` | Owned by `AppState` for the app's lifetime; every 20 s asks the calendar, posts the microphone prompt while watching is on and nothing records, starts the microphone recording on Record and puts watching back when it ends |
+| `AppNotifying.swift` | The notifier seam (`notify`, `askToRecord`, `askToRecordMicrophone`, `resolveBrowserConsent`, `notificationVisibility`), its defaults and `SilentNotifier` — moved out of `AppState.swift` |
 | `DualSourceRecorder.swift` | Orchestrates AudioTapLib capture + mic, mixes tracks |
 | `RecordingProvider.swift` | Protocol abstraction over `DualSourceRecorder` for mock injection in `WatchLoop` tests |
 | `WatchLoop+RecordOnly.swift` | Record-only output branch (moves WAVs + writes `RecordingSidecar`), split out of `WatchLoop` |

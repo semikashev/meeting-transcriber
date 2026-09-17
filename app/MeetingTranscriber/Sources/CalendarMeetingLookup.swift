@@ -10,6 +10,17 @@ private let logger = Logger(subsystem: AppPaths.logSubsystem, category: "Calenda
 /// from Settings when the feature is switched on, never from the poll loop.
 protocol CalendarMeetingLookup {
     func meeting(startingAt start: Date, appName: String) -> CalendarMeeting?
+
+    /// The events around `now`, unranked, for a caller with its own rule
+    /// (`InRoomMeetingPolicy`). Defaults to none, so a lookup that only names
+    /// recordings need not know about it.
+    func events(around now: Date) -> [CalendarEventCandidate]
+}
+
+extension CalendarMeetingLookup {
+    func events(around _: Date) -> [CalendarEventCandidate] {
+        []
+    }
 }
 
 /// The default: no calendar, window titles as before.
@@ -55,14 +66,19 @@ final class EventKitMeetingLookup: CalendarMeetingLookup {
         }
     }
 
-    func meeting(startingAt start: Date, appName: String) -> CalendarMeeting? {
-        guard isEnabled(), Self.hasAccess else { return nil }
+    func events(around now: Date) -> [CalendarEventCandidate] {
+        guard isEnabled(), Self.hasAccess else { return [] }
         let predicate = store.predicateForEvents(
-            withStart: start.addingTimeInterval(-Self.scanWindow),
-            end: start.addingTimeInterval(Self.scanWindow),
+            withStart: now.addingTimeInterval(-Self.scanWindow),
+            end: now.addingTimeInterval(Self.scanWindow),
             calendars: nil,
         )
-        let candidates = store.events(matching: predicate).compactMap(Self.candidate)
+        return store.events(matching: predicate).compactMap(Self.candidate)
+    }
+
+    func meeting(startingAt start: Date, appName: String) -> CalendarMeeting? {
+        guard isEnabled(), Self.hasAccess else { return nil }
+        let candidates = events(around: start)
         guard let match = CalendarMeetingMatcher.bestMatch(recordingStart: start, appName: appName, among: candidates) else {
             logger.info("No calendar event covers the recording start")
             return nil
@@ -89,6 +105,7 @@ final class EventKitMeetingLookup: CalendarMeetingLookup {
             let address = attendee.url.absoluteString.replacingOccurrences(of: "mailto:", with: "")
             return address.isEmpty ? nil : address
         }
+        let me = (event.attendees ?? []).first(where: \.isCurrentUser)
         return CalendarEventCandidate(
             title: event.title ?? "",
             start: start,
@@ -96,6 +113,7 @@ final class EventKitMeetingLookup: CalendarMeetingLookup {
             isAllDay: event.isAllDay,
             attendees: attendees,
             conferenceText: [event.url?.absoluteString, event.location, event.notes].compactMap(\.self).joined(separator: " "),
+            isDeclined: me?.participantStatus == .declined,
         )
     }
 }
