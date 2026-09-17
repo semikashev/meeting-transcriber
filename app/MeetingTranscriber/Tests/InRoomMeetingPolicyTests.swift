@@ -47,7 +47,11 @@ final class InRoomMeetingPolicyTests: XCTestCase {
 
     /// A call to join is meeting detection's business, not the microphone's.
     func testAnyConferenceLinkDisqualifies() {
-        for text in ["https://zoom.us/j/1", "https://telemost.yandex.ru/j/2", "https://salutejazz.ru/x", "https://meet.google.com/a-b"] {
+        let links = [
+            "https://zoom.us/j/1", "https://telemost.yandex.ru/j/2", "https://telemost.360.yandex.ru/j/3",
+            "https://salutejazz.ru/x", "https://meet.google.com/a-b",
+        ]
+        for text in links {
             XCTAssertFalse(InRoomMeetingPolicy.isInRoomMeeting(event("Sync", from: 0, to: 60, text: text), now: at(1)), text)
         }
     }

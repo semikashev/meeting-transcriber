@@ -119,8 +119,8 @@ final class AppState {
 
     /// The in-room prompter's view of the watching controller, as closures:
     /// it may ask while watching is on and nothing records (and the microphone
-    /// is not switched off), starts the microphone through the same guarded
-    /// path as the menu, and puts watching back through the idempotent start.
+    /// is not switched off), and starts the microphone through the same
+    /// guarded path as the menu.
     private static func makeInRoomPrompter(
         settings: AppSettings, notifier: any AppNotifying, watching: WatchingController,
     ) -> InRoomMeetingPrompter {
@@ -133,8 +133,6 @@ final class AppState {
                     watching.isWatching && !watching.isRecording && !watching.isManualRecording && !settings.noMic
                 },
                 startRecording: { [watching] in await watching.beginManualRecording(.microphone)?.value == .started },
-                isRecording: { [watching] in watching.isManualRecording },
-                resumeWatching: { [watching] in await watching.startWatching() },
             ),
         )
     }

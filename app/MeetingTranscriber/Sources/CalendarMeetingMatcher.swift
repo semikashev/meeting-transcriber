@@ -64,7 +64,7 @@ enum CalendarMeetingMatcher {
     /// service missing here turns its online meetings into in-room prompts.
     static let anyConferenceDomains = [
         "zoom.us", "teams.microsoft.com", "teams.live.com", "webex.com", "meet.google.com", "whereby.com",
-        "telemost.yandex", "salutejazz.ru", "jazz.sber.ru", "ktalk.ru", "dion.vc", "vk.com/call", "calls.mail.ru",
+        "telemost.yandex", "telemost.360.yandex", "salutejazz.ru", "jazz.sber.ru", "ktalk.ru", "dion.vc", "vk.com/call", "calls.mail.ru",
         "meet.jit.si", "facetime.apple.com",
     ]
 
