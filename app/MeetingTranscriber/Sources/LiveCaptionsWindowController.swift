@@ -40,6 +40,11 @@ final class LiveCaptionsWindowController {
     private var modifierMonitor: Any?
     private var moveObserver: (any NSObjectProtocol)?
 
+    /// Where the panel origin is persisted. Production passes nothing and
+    /// gets `.standard`; tests inject a suite so they never touch the real
+    /// saved position.
+    private let defaults: UserDefaults
+
     private static let bottomMargin: CGFloat = 60
 
     /// UserDefaults key for the bottom-left origin of the panel. Stored as
@@ -47,9 +52,10 @@ final class LiveCaptionsWindowController {
     /// bottom-centre of main screen".
     static let originDefaultsKey = "liveCaptionsPanelOrigin"
 
-    init(state: LiveCaptionsState, size: LiveCaptionsSize = .medium) {
+    init(state: LiveCaptionsState, size: LiveCaptionsSize = .medium, defaults: UserDefaults = .standard) {
         self.state = state
         self.size = size
+        self.defaults = defaults
         state.setSize(size)
     }
 
@@ -61,31 +67,54 @@ final class LiveCaptionsWindowController {
     }
 
     /// Switch presets. The overlay's font and the panel's frame change in one
-    /// step so neither can be observed at the other's old size; a bar that
-    /// already exists keeps its bottom edge and horizontal centre (see
-    /// `resizedFrame`). The origin is persisted here rather than left to the
-    /// move observer so a bar resized while hidden reappears at the same
-    /// centre on the next `show()`, which reads the saved origin back.
+    /// step so neither can be observed at the other's old size, and the bar
+    /// keeps its bottom edge and horizontal centre (see `resizedFrame`).
+    ///
+    /// The saved origin is updated on both paths. With a panel, it is
+    /// persisted here rather than left to the move observer because a
+    /// `setFrame` that changes the size posts no `didMoveNotification` at all
+    /// (measured: 0 of 36 runs), so the observer could never catch it.
+    /// Without a panel, which is the common case for a preset change made in
+    /// Settings before the first recording (the controller exists from
+    /// launch, the panel only from the first recording), the origin saved by
+    /// an earlier session is a bottom-left corner for the old width; it is
+    /// re-centred for the new width so the next `show()` puts the bar's
+    /// centre where the user left it.
     func apply(size: LiveCaptionsSize) {
         guard size != self.size else { return }
+        let previous = self.size
         self.size = size
         state.setSize(size)
-        guard let panel else { return }
-        panel.setFrame(Self.resizedFrame(panel.frame, to: size), display: true)
-        persistOrigin(panel.frame.origin)
+        if let panel {
+            panel.setFrame(Self.resizedFrame(panel.frame, to: size, within: panel.screen?.visibleFrame), display: true)
+            persistOrigin(panel.frame.origin)
+        } else if let saved = storedOrigin() {
+            let frame = NSRect(origin: saved, size: previous.panelSize)
+            persistOrigin(Self.resizedFrame(frame, to: size, within: nil).origin)
+        }
     }
 
     /// The frame a panel at `frame` takes when switched to `size`: same
     /// bottom edge, same horizontal centre. Anchoring the bottom-left corner
     /// instead would walk the bar sideways on every preset change, since the
     /// user parks it by eye at the bottom-centre of a call window.
-    static func resizedFrame(_ frame: NSRect, to size: LiveCaptionsSize) -> NSRect {
-        NSRect(
+    ///
+    /// The result is pushed back inside `screen` when one is given: AppKit
+    /// does not constrain a borderless non-activating panel (measured:
+    /// `constrainFrameRect` returns the target unchanged), so a bar parked
+    /// flush against a side edge would otherwise grow past it by half the
+    /// width delta.
+    static func resizedFrame(_ frame: NSRect, to size: LiveCaptionsSize, within screen: NSRect?) -> NSRect {
+        var resized = NSRect(
             x: frame.midX - size.panelSize.width / 2,
             y: frame.minY,
             width: size.panelSize.width,
             height: size.panelSize.height,
         )
+        guard let screen else { return resized }
+        resized.origin.x = min(max(resized.minX, screen.minX), screen.maxX - resized.width)
+        resized.origin.y = min(max(resized.minY, screen.minY), screen.maxY - resized.height)
+        return resized
     }
 
     /// Hide the caption bar without destroying the panel — re-showing is
@@ -143,23 +172,32 @@ final class LiveCaptionsWindowController {
         )
     }
 
-    /// Read the saved origin and reject it if no currently-attached screen
-    /// contains its top-left corner (handles "user disconnected the
-    /// secondary monitor where the bar lived"). Returns nil → caller falls
-    /// back to default placement.
-    private func savedOrigin() -> CGPoint? {
-        let defaults = UserDefaults.standard
+    /// The saved origin, or nil when none was ever persisted. No screen check:
+    /// `apply` re-centres it whether or not that screen is attached right now.
+    private func storedOrigin() -> CGPoint? {
         guard let dict = defaults.dictionary(forKey: Self.originDefaultsKey),
               let x = dict["x"] as? Double, let y = dict["y"] as? Double
         else { return nil }
-        let candidate = CGPoint(x: x, y: y)
-        let topLeft = CGPoint(x: x, y: y + size.panelSize.height)
-        let onScreen = NSScreen.screens.contains { $0.visibleFrame.contains(topLeft) }
+        return CGPoint(x: x, y: y)
+    }
+
+    /// Read the saved origin and reject it if no currently-attached screen
+    /// contains both top corners of the bar at the current size (handles
+    /// "user disconnected the secondary monitor where the bar lived", and a
+    /// position saved for a wider screen). Returns nil → caller falls back
+    /// to default placement.
+    private func savedOrigin() -> CGPoint? {
+        guard let candidate = storedOrigin() else { return nil }
+        let top = candidate.y + size.panelSize.height
+        let corners = [CGPoint(x: candidate.x, y: top), CGPoint(x: candidate.x + size.panelSize.width, y: top)]
+        let onScreen = NSScreen.screens.contains { screen in
+            corners.allSatisfy { screen.visibleFrame.contains($0) }
+        }
         return onScreen ? candidate : nil
     }
 
     private func persistOrigin(_ origin: CGPoint) {
-        UserDefaults.standard.set(
+        defaults.set(
             ["x": origin.x, "y": origin.y],
             forKey: Self.originDefaultsKey,
         )

@@ -13,7 +13,7 @@ enum LiveCaptionsSize: String, CaseIterable, Codable {
     case medium
     case large
 
-    /// Point size of the caption rows. The backend label scales with it.
+    /// Point size of the caption rows.
     var fontSize: CGFloat {
         switch self {
         case .small: 16
@@ -22,12 +22,22 @@ enum LiveCaptionsSize: String, CaseIterable, Codable {
         }
     }
 
+    /// Point size of the backend label above the rows: half the row size,
+    /// which reproduces the 11 pt the label shipped with at `.medium`, but
+    /// never below 10 pt, the smallest size AppKit uses for text anywhere.
+    var labelFontSize: CGFloat {
+        max(10, fontSize / 2)
+    }
+
     /// Fixed panel dimensions: wide enough for a sentence at `fontSize`,
-    /// tall enough for four rows plus the overlay's padding. `.medium` is the
-    /// size the bar shipped with before the preset existed.
+    /// tall enough for the backend label plus four rows, the row spacing and
+    /// the overlay's padding, with one wrapped row of headroom (rows do wrap,
+    /// about equally often at every preset; `LiveCaptionsSizeTests` pins the
+    /// relation). `.medium` is the size the bar shipped with before the
+    /// preset existed.
     var panelSize: CGSize {
         switch self {
-        case .small: CGSize(width: 520, height: 140)
+        case .small: CGSize(width: 520, height: 160)
         case .medium: CGSize(width: 720, height: 200)
         case .large: CGSize(width: 920, height: 260)
         }
