@@ -148,7 +148,7 @@ State writes to `AppPaths.dataDir`; IPC + queue snapshots to `ipcDir`.
 | `ConsentAnswer.swift` | Three-way outcome of a consent prompt (yes / no / unanswered) — kept distinct from a `Bool` so a decline and a timeout get different re-prompt cooldowns (issue #543) |
 | `BrowserConsentReadiness.swift` | Whether a browser-meeting consent prompt can actually reach the user — polls `NotificationVisibility` since the prompt is itself a notification and a broken notification channel can't report its own brokenness |
 | `ConsentPromptCoordinator.swift` | Coordinates an async yes/no recording-consent prompt: register pending decision by id, resolve once via answer or timeout |
-| `WatchLoop+Consent.swift` | Browser-meeting consent gate, split out of `WatchLoop`; only patterns with `requiresRecordingConsent` reach it |
+| `WatchLoop+Consent.swift` | Browser-meeting consent gate, split out of `WatchLoop`; only patterns with `requiresRecordingConsent` reach it. With `autoRecordCalendarMeetings` on, a call inside a calendar event that involves other people skips the prompt (checked after the deny list and cooldowns) |
 | `WatchLoop+CalendarTitle.swift` | Calendar-backed naming at enqueue, split out of `WatchLoop`: title + attendees from the event running at recording start |
 | `CalendarMeetingMatcher.swift` | Pure choice of the calendar event a recording belongs to (must still be running at recording start; conference link, attendees, closest start break ties) |
 | `CalendarMeetingLookup.swift` | `CalendarMeetingLookup` protocol, `NoCalendarLookup` default, `EventKitMeetingLookup` reading the Mac's calendars |

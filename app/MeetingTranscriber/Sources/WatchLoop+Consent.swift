@@ -6,6 +6,8 @@ private let logger = Logger(subsystem: AppPaths.logSubsystem, category: "WatchLo
 /// Browser-meeting recording-consent gate (issue #503), split out of `WatchLoop`
 /// to keep its body under the line-length cap. Only patterns with
 /// `requiresRecordingConsent` reach it; native meetings auto-start unchanged.
+/// A browser meeting the calendar vouches for may skip the prompt too, when
+/// the user opted into that (`calendarVouches(for:)`).
 ///
 /// The answer is awaited in its own task rather than inline in the poll loop
 /// (issue #543). Inline, `detector.checkOnce()` was not called at all while a
@@ -35,6 +37,10 @@ extension WatchLoop {
             detector.reset(appName: app) // re-detect after the debounce
             return true
         }
+        // Checked after the policy, not before it: "Never for this app" and a
+        // decline still fresh in the cooldown are answers the user gave, and
+        // the calendar must not talk over them.
+        if calendarVouches(for: meeting) { return false }
 
         pendingConsentApp = app
         // `app` is already the concrete browser: a browser meeting is carried
@@ -52,6 +58,23 @@ extension WatchLoop {
             )
             finishConsent(for: meeting, answer: answer)
         }
+        return true
+    }
+
+    /// Whether the calendar answers the consent question for this browser
+    /// meeting. With the setting on, a call that falls into an event the user
+    /// was invited to (or that has a link to join) is one they planned to be
+    /// in, and the prompt only adds a button they forget to click. A block
+    /// with nobody else in it says nothing about a call that happens to
+    /// overlap it, so the prompt stays for those. The lookup is the same one
+    /// that names the recording, so a calendar the user has not granted, or
+    /// the naming feature switched off, keeps this off too.
+    private func calendarVouches(for meeting: DetectedMeeting) -> Bool {
+        guard autoRecordCalendarMeetings() else { return false }
+        let app = meeting.pattern.appName
+        guard let event = calendarLookup.meeting(startingAt: nowProvider(), appName: app),
+              event.involvesOthers else { return false }
+        logger.info("Recording \(app, privacy: .public) without asking: calendar event \(event.title, privacy: .private) is running")
         return true
     }
 

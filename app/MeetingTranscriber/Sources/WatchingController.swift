@@ -251,6 +251,7 @@ final class WatchingController {
                     },
                     notifier: notifier,
                     denyListStore: ConsentDenyListStore(settings: settings),
+                    autoRecordCalendarMeetings: { [settings] in settings.autoRecordCalendarMeetings },
                     calendarLookup: EventKitMeetingLookup { [settings] in settings.calendarTitlesEnabled },
                 )
 

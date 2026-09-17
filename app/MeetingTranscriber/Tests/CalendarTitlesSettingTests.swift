@@ -20,4 +20,17 @@ final class CalendarTitlesSettingTests: XCTestCase {
             "the choice has to survive a relaunch",
         )
     }
+
+    func testAutoRecordPersistsAcrossInstances() throws {
+        let defaults = try XCTUnwrap(
+            UserDefaults(suiteName: "calendar-auto-record-\(getpid())-\(UUID().uuidString)"),
+        )
+        let settings = AppSettings(defaults: defaults)
+        XCTAssertFalse(settings.autoRecordCalendarMeetings, "opt-in: it starts recordings nobody clicked for")
+
+        settings.autoRecordCalendarMeetings = true
+
+        XCTAssertEqual(defaults.object(forKey: "autoRecordCalendarMeetings") as? Bool, true)
+        XCTAssertTrue(AppSettings(defaults: defaults).autoRecordCalendarMeetings)
+    }
 }

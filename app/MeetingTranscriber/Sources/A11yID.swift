@@ -21,6 +21,7 @@ enum A11yID {
     static let recordOnlyToggle = "recordOnlyToggle"
     static let watchBrowserToggle = "watchBrowserToggle"
     static let calendarTitlesToggle = "calendarTitlesToggle"
+    static let autoRecordCalendarMeetingsToggle = "autoRecordCalendarMeetingsToggle"
     static let browserConsentWarning = "browserConsentWarning"
     static let consentDenyListSection = "consentDenyListSection"
     /// Per-row Remove button in the never-record list, addressed by ROW INDEX,

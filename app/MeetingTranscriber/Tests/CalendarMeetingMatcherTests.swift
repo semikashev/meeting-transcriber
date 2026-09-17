@@ -140,4 +140,36 @@ final class CalendarMeetingMatcherTests: XCTestCase {
             recordingStart: at(10), appName: "Zoom", among: [event("   ", from: 0, to: 60)],
         ))
     }
+
+    // MARK: - Does the event involve anybody else?
+
+    /// The match carries whether the event links a conference, so the consent
+    /// gate can tell a scheduled call from a block on one's own calendar.
+    func testMatchReportsAConferenceLinkForTheAppInUse() throws {
+        let linked = event("Sync", from: 0, to: 60, attendees: [], text: "https://telemost.yandex.ru/j/1")
+        let match = try XCTUnwrap(CalendarMeetingMatcher.bestMatch(
+            recordingStart: at(5), appName: "Arc", among: [linked],
+        ))
+        XCTAssertTrue(match.meeting.hasConferenceLink)
+        XCTAssertTrue(match.meeting.involvesOthers, "a link to join is a call even with no invitees listed")
+    }
+
+    func testAPersonalBlockInvolvesNobody() throws {
+        let block = event("Focus time", from: 0, to: 120, attendees: [], text: "no distractions")
+        let match = try XCTUnwrap(CalendarMeetingMatcher.bestMatch(
+            recordingStart: at(5), appName: "Arc", among: [block],
+        ))
+        XCTAssertFalse(match.meeting.hasConferenceLink)
+        XCTAssertFalse(match.meeting.involvesOthers)
+    }
+
+    /// A Zoom link is not evidence that a Teams call is that meeting.
+    func testAConferenceLinkForAnotherServiceDoesNotCount() throws {
+        let zoom = event("Sync", from: 0, to: 60, text: "https://zoom.us/j/123")
+        let match = try XCTUnwrap(CalendarMeetingMatcher.bestMatch(
+            recordingStart: at(5), appName: "Microsoft Teams", among: [zoom],
+        ))
+        XCTAssertFalse(match.meeting.hasConferenceLink)
+        XCTAssertTrue(match.meeting.involvesOthers, "but the invitees still make it a meeting")
+    }
 }

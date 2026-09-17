@@ -182,6 +182,15 @@ final class AppSettings {
         didSet { defaults.set(calendarTitlesEnabled, forKey: "calendarTitlesEnabled") }
     }
 
+    /// Record a browser meeting without the consent prompt when a calendar
+    /// event with other people in it is running (see `WatchLoop+Consent`).
+    /// Only meaningful with `calendarTitlesEnabled`, which is what grants the
+    /// lookup its calendar. Off by default: it is the one setting that starts
+    /// a recording nobody clicked for.
+    var autoRecordCalendarMeetings: Bool {
+        didSet { defaults.set(autoRecordCalendarMeetings, forKey: "autoRecordCalendarMeetings") }
+    }
+
     // MARK: - Recording
 
     var pollInterval: Double {
@@ -578,6 +587,7 @@ final class AppSettings {
         watchWhatsApp = defaults.object(forKey: "watchWhatsApp") as? Bool ?? false
         autoWatch = defaults.object(forKey: "autoWatch") as? Bool ?? false
         calendarTitlesEnabled = defaults.object(forKey: "calendarTitlesEnabled") as? Bool ?? false
+        autoRecordCalendarMeetings = defaults.object(forKey: "autoRecordCalendarMeetings") as? Bool ?? false
 
         pollInterval = defaults.object(forKey: "pollInterval") as? Double ?? 3.0
         endGrace = defaults.object(forKey: "endGrace") as? Double ?? 15.0
