@@ -113,6 +113,19 @@ enum A11yID {
         "known-less-\(speakerLabel)"
     }
 
+    // Protocols window.
+    static let protocolsFooter = "protocolsFooter"
+
+    /// Per-row delete buttons, addressed by the recording's stem (app-set,
+    /// never user input, so safe to publish unredacted like the row index above).
+    static func protocolsDelete(_ stem: String) -> String {
+        "protocolsDelete.\(stem)"
+    }
+
+    static func protocolsDeleteAudio(_ stem: String) -> String {
+        "protocolsDeleteAudio.\(stem)"
+    }
+
     // Live captions overlay.
     static let liveCaptionBackend = "liveCaptionBackend"
 }
