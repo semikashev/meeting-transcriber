@@ -114,6 +114,27 @@ final class CalendarMeetingMatcherTests: XCTestCase {
         XCTAssertEqual(match.meeting.title, "Breakout")
     }
 
+    /// A recording made in the last minutes of a meeting, with the next one
+    /// starting within the early-join window, belongs to the meeting that is
+    /// running, not to the one that has not started yet.
+    func testRunningEventBeatsTheOneAboutToStart() throws {
+        let running = event("Weekly", from: 0, to: 60)
+        let next = event("Design review", from: 60, to: 90, text: "https://zoom.us/j/1")
+        let match = try XCTUnwrap(CalendarMeetingMatcher.bestMatch(
+            recordingStart: at(50), appName: "Zoom", among: [running, next],
+        ))
+        XCTAssertEqual(match.meeting.title, "Weekly")
+        XCTAssertFalse(match.isAmbiguous)
+    }
+
+    /// Only an upcoming event in the window: still a match (joined early).
+    func testUpcomingEventMatchesWhenNothingIsRunning() {
+        let match = CalendarMeetingMatcher.bestMatch(
+            recordingStart: at(50), appName: "Zoom", among: [event("Design review", from: 60, to: 90)],
+        )
+        XCTAssertEqual(match?.meeting.title, "Design review")
+    }
+
     func testBlankTitlesAreSkipped() {
         XCTAssertNil(CalendarMeetingMatcher.bestMatch(
             recordingStart: at(10), appName: "Zoom", among: [event("   ", from: 0, to: 60)],
