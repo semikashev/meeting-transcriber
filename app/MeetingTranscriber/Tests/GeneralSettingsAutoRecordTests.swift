@@ -33,6 +33,17 @@ final class GeneralSettingsAutoRecordTests: XCTestCase {
         XCTAssertFalse(try autoRecordToggle(calendarTitles: true).isDisabled())
     }
 
+    /// The in-room prompt row shares the gate: same lookup, same reason.
+    func testTheInRoomPromptRowFollowsTheSameGate() throws {
+        let title = "Offer to record in-person meetings from the microphone"
+        let gated = try GeneralSettingsView(settings: makeSettings(calendarTitles: false), notificationVisibility: nil)
+            .inspect().find(ViewType.Toggle.self) { try $0.labelView().text().string() == title }
+        XCTAssertTrue(gated.isDisabled())
+        let open = try GeneralSettingsView(settings: makeSettings(calendarTitles: true), notificationVisibility: nil)
+            .inspect().find(ViewType.Toggle.self) { try $0.labelView().text().string() == title }
+        XCTAssertFalse(open.isDisabled())
+    }
+
     func testTappingTheRowWritesTheSetting() throws {
         let settings = try makeSettings(calendarTitles: true)
         let view = GeneralSettingsView(settings: settings, notificationVisibility: nil)

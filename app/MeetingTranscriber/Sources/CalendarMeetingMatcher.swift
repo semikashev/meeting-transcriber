@@ -12,6 +12,10 @@ struct CalendarEventCandidate: Equatable, Sendable {
     let attendees: [String]
     /// URL, location and notes joined together: where a conference link lives.
     let conferenceText: String
+    /// The user answered the invitation with a no. Defaulted because only the
+    /// in-room prompt cares: a recording is still named after the event it
+    /// happens to fall into.
+    var isDeclined = false
 }
 
 /// What the pipeline learns from a calendar match: the title the recording is
@@ -55,6 +59,15 @@ enum CalendarMeetingMatcher {
         let isAmbiguous: Bool
     }
 
+    /// Every conference service a browser might be showing. Also what decides
+    /// that an event has no call to join at all (`InRoomMeetingPolicy`), so a
+    /// service missing here turns its online meetings into in-room prompts.
+    static let anyConferenceDomains = [
+        "zoom.us", "teams.microsoft.com", "teams.live.com", "webex.com", "meet.google.com", "whereby.com",
+        "telemost.yandex", "salutejazz.ru", "jazz.sber.ru", "ktalk.ru", "dion.vc", "vk.com/call", "calls.mail.ru",
+        "meet.jit.si", "facetime.apple.com",
+    ]
+
     /// Conference domains a native meeting app implies. A browser implies
     /// nothing in particular, so any conference link counts for it.
     static func conferenceDomains(forApp appName: String) -> [String] {
@@ -63,7 +76,7 @@ enum CalendarMeetingMatcher {
         if name.contains("teams") { return ["teams.microsoft.com", "teams.live.com"] }
         if name.contains("webex") { return ["webex.com"] }
         if name.contains("facetime") { return ["facetime.apple.com"] }
-        return ["zoom.us", "teams.microsoft.com", "teams.live.com", "webex.com", "meet.google.com", "whereby.com", "telemost.yandex"]
+        return anyConferenceDomains
     }
 
     static func hasConferenceLink(_ event: CalendarEventCandidate, forApp appName: String) -> Bool {

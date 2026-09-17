@@ -191,6 +191,14 @@ final class AppSettings {
         didSet { defaults.set(autoRecordCalendarMeetings, forKey: "autoRecordCalendarMeetings") }
     }
 
+    /// Offer to record the microphone when a calendar meeting with other
+    /// people and no call link begins (see `InRoomMeetingPrompter`). Same
+    /// dependency on `calendarTitlesEnabled` as the setting above. Off by
+    /// default: it posts a prompt on a schedule the user did not click for.
+    var promptInRoomMeetings: Bool {
+        didSet { defaults.set(promptInRoomMeetings, forKey: "promptInRoomMeetings") }
+    }
+
     // MARK: - Recording
 
     var pollInterval: Double {
@@ -588,6 +596,7 @@ final class AppSettings {
         autoWatch = defaults.object(forKey: "autoWatch") as? Bool ?? false
         calendarTitlesEnabled = defaults.object(forKey: "calendarTitlesEnabled") as? Bool ?? false
         autoRecordCalendarMeetings = defaults.object(forKey: "autoRecordCalendarMeetings") as? Bool ?? false
+        promptInRoomMeetings = defaults.object(forKey: "promptInRoomMeetings") as? Bool ?? false
 
         pollInterval = defaults.object(forKey: "pollInterval") as? Double ?? 3.0
         endGrace = defaults.object(forKey: "endGrace") as? Double ?? 15.0

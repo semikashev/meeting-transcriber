@@ -120,8 +120,8 @@ struct GeneralSettingsView: View {
         .onAppear { calendarAccessGranted = EventKitMeetingLookup.hasAccess }
     }
 
-    /// Nested under the naming toggle rather than beside it: the lookup it
-    /// relies on is off without the one above, so a lone "on" here would do
+    /// Nested under the naming toggle rather than beside it: the lookup both
+    /// rely on is off without the one above, so a lone "on" here would do
     /// nothing and look like a bug.
     @ViewBuilder private var autoRecordRows: some View {
         Toggle("Record browser meetings on the calendar without asking", isOn: $settings.autoRecordCalendarMeetings)
@@ -132,6 +132,18 @@ struct GeneralSettingsView: View {
             Skips the "Record browser meeting?" prompt when the call falls into an event \
             that has other attendees or a conference link. Calls outside the calendar and \
             personal blocks still ask. "Never for this app" wins over the calendar.
+            """,
+        )
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        Toggle("Offer to record in-person meetings from the microphone", isOn: $settings.promptInRoomMeetings)
+            .accessibilityIdentifier(A11yID.promptInRoomMeetingsToggle)
+            .disabled(!settings.calendarTitlesEnabled)
+        Text(
+            """
+            When an event with other attendees but no call link begins while watching is on and \
+            nothing is recording, asks whether to record the microphone. Asked once more if the \
+            first prompt went unanswered; Ignore settles it. Watching resumes when the recording ends.
             """,
         )
         .font(.caption)

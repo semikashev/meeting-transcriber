@@ -4,101 +4,6 @@ import Observation
 import os.log
 import UserNotifications
 
-// MARK: - AppNotifying
-
-/// Notification abstraction that keeps AppKit out of AppState.
-///
-/// Real implementation: `NotificationManager` (AppKit, used in menu bar app).
-/// Test implementation: `RecordingNotifier` (records calls, no side effects).
-protocol AppNotifying {
-    /// The urgency is part of the requirement, not a defaulted convenience, so
-    /// that a conformer which ignores it has to say so. The reverse shape (a
-    /// 2-arg requirement plus a defaulted 3-arg extension) compiles just as
-    /// well and silently downgrades every time-sensitive notification a
-    /// forgetful conformer receives, which is the exact failure this urgency
-    /// exists to prevent. `notify(title:body:)` lives in the extension below.
-    func notify(title: String, body: String, urgency: NotificationUrgency)
-
-    /// Ask the user whether to record a just-detected browser meeting (issue
-    /// #503); true = record. `@MainActor` — the real prompt is UI. Defaults to
-    /// false so a notifier without a prompt never records silently.
-    @MainActor
-    func askToRecord(title: String, body: String) async -> ConsentAnswer
-
-    /// Resolve a parked `askToRecord` prompt programmatically (the debug-RPC
-    /// consent hook, issue #503); returns whether one was waiting. Lives on the
-    /// same seam as `askToRecord` so park + resolve share it. Defaults to false
-    /// (no prompt) for notifiers without a real coordinator.
-    func resolveBrowserConsent(granted: Bool) -> Bool
-
-    /// How a posted notification would be presented. On the same seam as
-    /// `askToRecord` because it answers whether that prompt could be SEEN, which
-    /// decides whether browser meetings work at all (see
-    /// `BrowserConsentReadiness`).
-    ///
-    /// Here rather than as a probe closure on `PermissionsController` because
-    /// `NotificationManager` already owns both the scheduler port and the
-    /// `canDeliver` bundle guard this read needs; a separate closure would
-    /// re-derive that guard and add a second injection point to every test that
-    /// already injects a notifier.
-    ///
-    /// `@MainActor` for the same reason as `askToRecord`: `AppNotifying` is not
-    /// Sendable, so a non-isolated async requirement would force callers to send
-    /// the notifier across an actor boundary.
-    @MainActor
-    func notificationVisibility() async -> NotificationVisibility
-
-    #if !APPSTORE
-        /// Recently posted notifications, oldest first, for the debug RPC
-        /// `/state.notifications` snapshot. Defaults to empty — only the
-        /// production `NotificationManager` keeps a log.
-        var recentNotifications: [NotificationRingBuffer.Entry] {
-            get
-        }
-    #endif
-}
-
-#if !APPSTORE
-    extension AppNotifying {
-        var recentNotifications: [NotificationRingBuffer.Entry] {
-            []
-        }
-    }
-#endif
-
-extension AppNotifying {
-    /// Convenience for the majority of notifications, which have no deadline.
-    /// Static dispatch on purpose: it cannot be witnessed, so it can never
-    /// become a lossy override of the requirement above.
-    func notify(title: String, body: String) {
-        notify(title: title, body: body, urgency: .standard)
-    }
-
-    // swiftlint:disable async_without_await
-    /// Deny by default — only `NotificationManager` shows a real prompt, and
-    /// "we could not ask" must never record.
-    @MainActor
-    func askToRecord(title _: String, body _: String) async -> ConsentAnswer {
-        .declined
-    }
-
-    /// Nothing to report by default. Notably this keeps
-    /// `UNUserNotificationCenter.current()` out of every headless context: it
-    /// raises NSInternalInconsistencyException without a real app bundle, so a
-    /// default that reached for it would abort any test touching the notifier.
-    @MainActor
-    func notificationVisibility() async -> NotificationVisibility {
-        .unread
-    }
-
-    // swiftlint:enable async_without_await
-
-    /// No prompt to resolve by default — only `NotificationManager` parks one.
-    func resolveBrowserConsent(granted _: Bool) -> Bool {
-        false
-    }
-}
-
 // MARK: - AppState
 
 /// Observable ViewModel that composes the app's concern-specific controllers
@@ -156,6 +61,10 @@ final class AppState {
     /// transitions, and the menu-bar icon + RPC snapshot read its flags.
     let channelHealth: ChannelHealthController
 
+    /// Offers to record in-room calendar meetings from the microphone; drives
+    /// `watching` through closures and runs for the app's lifetime.
+    let inRoomMeetings: InRoomMeetingPrompter
+
     /// Observable state for the live caption overlay. Always present (the
     /// `LiveCaptionsOverlay` window observes this); content is only populated
     /// when live transcription is on AND a recording is active. Owned here (read
@@ -208,6 +117,28 @@ final class AppState {
         UpdateChecker()
     }
 
+    /// The in-room prompter's view of the watching controller, as closures:
+    /// it may ask while watching is on and nothing records (and the microphone
+    /// is not switched off), starts the microphone through the same guarded
+    /// path as the menu, and puts watching back through the idempotent start.
+    private static func makeInRoomPrompter(
+        settings: AppSettings, notifier: any AppNotifying, watching: WatchingController,
+    ) -> InRoomMeetingPrompter {
+        InRoomMeetingPrompter(
+            lookup: EventKitMeetingLookup { [settings] in settings.calendarTitlesEnabled },
+            isEnabled: { [settings] in settings.promptInRoomMeetings },
+            notifier: notifier,
+            hooks: InRoomMeetingPrompter.Hooks(
+                mayPrompt: { [settings, watching] in
+                    watching.isWatching && !watching.isRecording && !watching.isManualRecording && !settings.noMic
+                },
+                startRecording: { [watching] in await watching.beginManualRecording(.microphone)?.value == .started },
+                isRecording: { [watching] in watching.isManualRecording },
+                resumeWatching: { [watching] in await watching.startWatching() },
+            ),
+        )
+    }
+
     // MARK: - Init
 
     init(
@@ -255,6 +186,8 @@ final class AppState {
             permissions: permissions,
             liveTranscription: liveTranscription,
         )
+        self.inRoomMeetings = Self.makeInRoomPrompter(settings: settings, notifier: notifier, watching: watching)
+        inRoomMeetings.start()
 
         #if !APPSTORE
             // Not trailing-closure: `isEnabled` is the first param (the other two
@@ -570,11 +503,4 @@ final class AppState {
             pid: Int(ProcessInfo.processInfo.processIdentifier),
         )
     }
-}
-
-// MARK: - SilentNotifier
-
-/// No-op notifier for CLI targets and tests that don't need notifications.
-struct SilentNotifier: AppNotifying {
-    func notify(title _: String, body _: String, urgency _: NotificationUrgency) {}
 }

@@ -33,4 +33,17 @@ final class CalendarTitlesSettingTests: XCTestCase {
         XCTAssertEqual(defaults.object(forKey: "autoRecordCalendarMeetings") as? Bool, true)
         XCTAssertTrue(AppSettings(defaults: defaults).autoRecordCalendarMeetings)
     }
+
+    func testInRoomPromptPersistsAcrossInstances() throws {
+        let defaults = try XCTUnwrap(
+            UserDefaults(suiteName: "in-room-prompt-\(getpid())-\(UUID().uuidString)"),
+        )
+        let settings = AppSettings(defaults: defaults)
+        XCTAssertFalse(settings.promptInRoomMeetings, "opt-in: it posts prompts on a schedule")
+
+        settings.promptInRoomMeetings = true
+
+        XCTAssertEqual(defaults.object(forKey: "promptInRoomMeetings") as? Bool, true)
+        XCTAssertTrue(AppSettings(defaults: defaults).promptInRoomMeetings)
+    }
 }
