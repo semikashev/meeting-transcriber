@@ -13,9 +13,10 @@ private let logger = Logger(subsystem: AppPaths.logSubsystem, category: "InRoomM
 ///
 /// Owned by `AppState` beside the other controllers and running for the app's
 /// lifetime, not tied to the watch loop: starting a microphone recording stops
-/// that loop, and once the recording ends this is what puts watching back. The
-/// controller it drives is reached through `Hooks`, so the whole thing runs in
-/// a test against closures.
+/// that loop (the controller puts it back afterwards, see
+/// `WatchingController.resumeWatchingAfterManualIfNeeded`). The controller it
+/// drives is reached through `Hooks`, so the whole thing runs in a test
+/// against closures.
 @MainActor
 final class InRoomMeetingPrompter {
     struct Hooks {
@@ -23,10 +24,6 @@ final class InRoomMeetingPrompter {
         let mayPrompt: () -> Bool
         /// Start the microphone recording; true when it actually began.
         let startRecording: () async -> Bool
-        /// Whether the recording started here is still running.
-        let isRecording: () -> Bool
-        /// Put meeting watching back once that recording has ended.
-        let resumeWatching: () async -> Void
     }
 
     private let lookup: any CalendarMeetingLookup
@@ -41,9 +38,8 @@ final class InRoomMeetingPrompter {
     /// on every tick. Kept for the process lifetime; the keys are dated, so it
     /// cannot mistake tomorrow's weekly for today's.
     private(set) var history: [InRoomMeetingPolicy.Key: InRoomMeetingPolicy.Record] = [:]
-    /// A recording this prompter started is running; watching goes back on
-    /// when it ends.
-    private(set) var resumeWatchingWhenIdle = false
+    /// Recordings this prompter started, for tests and the log.
+    private(set) var recordingsStarted = 0
     private var task: Task<Void, Never>?
 
     init(
@@ -85,11 +81,6 @@ final class InRoomMeetingPrompter {
     /// One look at the clock and the calendar. Exposed for tests, which drive
     /// it directly instead of waiting on the interval.
     func tick() async {
-        if resumeWatchingWhenIdle, !hooks.isRecording() {
-            resumeWatchingWhenIdle = false
-            logger.info("Microphone recording ended — putting watching back")
-            await hooks.resumeWatching()
-        }
         guard isEnabled(), hooks.mayPrompt() else { return }
         let now = nowProvider()
         guard let event = InRoomMeetingPolicy.candidate(now: now, among: lookup.events(around: now), history: history) else {
@@ -117,7 +108,8 @@ final class InRoomMeetingPrompter {
             return
         }
         if await hooks.startRecording() {
-            resumeWatchingWhenIdle = true
+            recordingsStarted += 1
+            logger.info("Microphone recording started for \(event.title, privacy: .private)")
         }
     }
 

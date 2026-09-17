@@ -153,7 +153,8 @@ State writes to `AppPaths.dataDir`; IPC + queue snapshots to `ipcDir`.
 | `CalendarMeetingMatcher.swift` | Pure choice of the calendar event a recording belongs to (must still be running at recording start; conference link, attendees, closest start break ties) |
 | `CalendarMeetingLookup.swift` | `CalendarMeetingLookup` protocol (`meeting(startingAt:appName:)` for naming, `events(around:)` for callers with their own rule), `NoCalendarLookup` default, `EventKitMeetingLookup` reading the Mac's calendars |
 | `InRoomMeetingPolicy.swift` | Pure choice of the calendar meeting worth an in-room prompt: begun, other attendees, no conference link, not declined; asked at most twice within ten minutes of its start |
-| `InRoomMeetingPrompter.swift` | Owned by `AppState` for the app's lifetime; every 20 s asks the calendar, posts the microphone prompt while watching is on and nothing records, starts the microphone recording on Record and puts watching back when it ends |
+| `InRoomMeetingPrompter.swift` | Owned by `AppState` for the app's lifetime; every 20 s asks the calendar, posts the microphone prompt while watching is on and nothing records, starts the microphone recording on Record |
+| `WatchingController+StateChange.swift` | The state-change handler both recording paths install (channel health, error notifications, live-caption flush) and `resumeWatchingAfterManualIfNeeded`: watching that a manual recording took away comes back when it ends |
 | `AppNotifying.swift` | The notifier seam (`notify`, `askToRecord`, `askToRecordMicrophone`, `resolveBrowserConsent`, `notificationVisibility`), its defaults and `SilentNotifier` — moved out of `AppState.swift` |
 | `DualSourceRecorder.swift` | Orchestrates AudioTapLib capture + mic, mixes tracks |
 | `RecordingProvider.swift` | Protocol abstraction over `DualSourceRecorder` for mock injection in `WatchLoop` tests |

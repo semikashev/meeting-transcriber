@@ -44,12 +44,16 @@ final class WatchingController {
     /// exists.
     var manualStartTask: Task<ManualRecordingStartResult, Never>?
 
+    /// Watching was on when a manual recording took the loop away, so it goes
+    /// back on when that recording ends; see `resumeWatchingAfterManualIfNeeded`.
+    var resumeWatchingAfterManual = false
+
     let settings: AppSettings
-    private let notifier: any AppNotifying
+    let notifier: any AppNotifying
     private let pipeline: PipelineController
-    private let channelHealth: ChannelHealthController
+    let channelHealth: ChannelHealthController
     private let permissions: PermissionsController
-    private let liveTranscription: LiveTranscriptionCoordinator
+    let liveTranscription: LiveTranscriptionCoordinator
 
     /// Microphone-access gate. Injectable so tests skip the real TCC prompt; the
     /// return value is intentionally ignored (the loop is created regardless, and
@@ -449,6 +453,7 @@ final class WatchingController {
             }
             loop.stop()
             watchLoop = nil
+            resumeWatchingAfterManual = true
         }
 
         _ = await ensureMicAccess()
@@ -512,6 +517,7 @@ final class WatchingController {
         } catch {
             notifier.notify(title: "Error", body: error.localizedDescription)
             watchLoop = nil
+            resumeWatchingAfterManualIfNeeded()
             // The permission arm is told apart by the error the gate raises, not
             // by re-asking the health check here: only the loop knows which
             // source it was about to record, and the whole point of that gate is
@@ -545,55 +551,6 @@ final class WatchingController {
                 await self?.liveTranscription.attachSinks(to: dualSource)
             }
             return recorder
-        }
-    }
-
-    // MARK: - State-change handler
-
-    /// Attaches the state-change callback that drives channel-health monitoring
-    /// and post-`.error` notifications. Shared between the auto-detect path
-    /// (`toggleWatching`) and the manual-recording path (`startManualRecording`)
-    /// so the red-tint indicator + asymmetric-silence notification fire in both.
-    /// `notifyOnRecording` only fires "Meeting Detected" notifications for the
-    /// auto-detect path; manual recording emits its own start notification.
-    private func attachStateChangeHandler(to loop: WatchLoop, notifyOnRecording: Bool) {
-        loop.onStateChange = { [weak self, weak loop, notifier] oldState, newState in
-            // Leaving `.recording` (natural meeting end, manual stop, or
-            // mid-recording cancel — all route through this transition) is the
-            // unified stop signal for both the auto-detect and manual paths.
-            // Flush the live pipeline here so the pending tail utterance is
-            // committed before the next recording's prepareForNextRecording() clears state. The
-            // flush runs after `recorder.stop()` (WatchLoop stops the recorder
-            // before this transition fires); the buffered tail lives in the
-            // streaming actors, not the recorder, so it survives the stop.
-            if oldState == .recording {
-                Task { @MainActor in await self?.liveTranscription.flush() }
-            }
-            switch newState {
-            case .recording:
-                if notifyOnRecording, let meeting = loop?.currentMeeting {
-                    notifier.notify(
-                        title: "Meeting Detected",
-                        body: "Recording: \(meeting.windowTitle)",
-                    )
-                }
-                // No source means no live recording, so there are no channels to
-                // watch and starting the monitor would only assume a topology.
-                if let source = self?.watchLoop?.activeRecordingSource {
-                    self?.channelHealth.start(source: source) { [weak self] in
-                        self?.watchLoop?.activeRecorder
-                    }
-                }
-
-            case .error:
-                if let err = loop?.lastError {
-                    notifier.notify(title: "Error", body: err)
-                }
-                self?.channelHealth.stop()
-
-            default:
-                self?.channelHealth.stop()
-            }
         }
     }
 }

@@ -1,9 +1,8 @@
 @testable import MeetingTranscriber
 import XCTest
 
-/// The prompter against closures: what it asks, what it does with the answer,
-/// and that it puts watching back when the recording it started ends. Driven
-/// through `tick()` so no interval is waited on.
+/// The prompter against closures: what it asks and what it does with the
+/// answer. Driven through `tick()` so no interval is waited on.
 @MainActor
 final class InRoomMeetingPrompterTests: XCTestCase {
     private final class StubLookup: CalendarMeetingLookup {
@@ -44,21 +43,16 @@ final class InRoomMeetingPrompterTests: XCTestCase {
     /// The controller's side, as the prompter sees it.
     private final class Harness {
         var mayPrompt = true
-        var isRecording = false
         var startSucceeds = true
         private(set) var starts = 0
-        private(set) var resumes = 0
 
         var hooks: InRoomMeetingPrompter.Hooks {
             InRoomMeetingPrompter.Hooks(
                 mayPrompt: { [self] in mayPrompt },
                 startRecording: { [self] in
                     starts += 1
-                    if startSucceeds { isRecording = true }
                     return startSucceeds
                 },
-                isRecording: { [self] in isRecording },
-                resumeWatching: { [self] in resumes += 1 },
             )
         }
     }
@@ -98,7 +92,7 @@ final class InRoomMeetingPrompterTests: XCTestCase {
         XCTAssertEqual(spy.titles, ["Record \"Design review\" from the microphone?"])
         XCTAssertTrue(spy.lastBody.contains("Anna, Ben"), spy.lastBody)
         XCTAssertEqual(harness.starts, 1)
-        XCTAssertTrue(prompter.resumeWatchingWhenIdle, "the recording it started is what it has to clean up after")
+        XCTAssertEqual(prompter.recordingsStarted, 1)
     }
 
     func testDoesNotAskTwiceAboutOneMeeting() async {
@@ -107,7 +101,6 @@ final class InRoomMeetingPrompterTests: XCTestCase {
         let prompter = makePrompter(events: [meeting()], spy: spy, harness: harness)
 
         await prompter.tick()
-        harness.isRecording = false // the recording ended
         await prompter.tick()
         await prompter.tick()
 
@@ -142,25 +135,6 @@ final class InRoomMeetingPrompterTests: XCTestCase {
         XCTAssertEqual(harness.starts, 0)
     }
 
-    func testPutsWatchingBackOnceTheRecordingEnds() async {
-        let spy = PromptSpy(answer: .granted)
-        let harness = Harness()
-        let prompter = makePrompter(events: [meeting()], spy: spy, harness: harness)
-        await prompter.tick()
-        harness.mayPrompt = false // recording: nothing may be asked meanwhile
-
-        await prompter.tick()
-        XCTAssertEqual(harness.resumes, 0, "not while the recording runs")
-
-        harness.isRecording = false
-        await prompter.tick()
-        XCTAssertEqual(harness.resumes, 1)
-        XCTAssertFalse(prompter.resumeWatchingWhenIdle)
-
-        await prompter.tick()
-        XCTAssertEqual(harness.resumes, 1, "once")
-    }
-
     func testRecordTappedAfterSomethingElseStartedRecordingIsIgnored() async {
         let spy = PromptSpy(answer: .granted)
         let harness = Harness()
@@ -176,7 +150,7 @@ final class InRoomMeetingPrompterTests: XCTestCase {
                     reads += 1
                     return reads == 1
                 },
-                startRecording: hooks.startRecording, isRecording: hooks.isRecording, resumeWatching: hooks.resumeWatching,
+                startRecording: hooks.startRecording,
             ),
             nowProvider: clock,
         )
@@ -187,7 +161,7 @@ final class InRoomMeetingPrompterTests: XCTestCase {
         XCTAssertEqual(harness.starts, 0, "a stale yes must not start a second recording")
     }
 
-    func testAFailedStartLeavesNothingToResume() async {
+    func testAFailedStartIsNotCountedAsARecording() async {
         let spy = PromptSpy(answer: .granted)
         let harness = Harness()
         harness.startSucceeds = false
@@ -196,7 +170,7 @@ final class InRoomMeetingPrompterTests: XCTestCase {
         await prompter.tick()
 
         XCTAssertEqual(harness.starts, 1)
-        XCTAssertFalse(prompter.resumeWatchingWhenIdle)
+        XCTAssertEqual(prompter.recordingsStarted, 0)
     }
 
     func testNothingHappensWhenOffOrWhenItMayNotPrompt() async {
