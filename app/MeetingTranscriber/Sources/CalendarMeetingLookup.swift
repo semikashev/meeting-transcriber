@@ -74,10 +74,15 @@ final class EventKitMeetingLookup: CalendarMeetingLookup {
     }
 
     /// Birthday and subscribed (holiday) calendars never describe a call, and
-    /// a cancelled event is not a meeting anybody attended.
+    /// a cancelled event is not a meeting anybody attended. `calendar`,
+    /// `startDate` and `endDate` are implicitly unwrapped in EventKit; a nil
+    /// here would crash after the audio is finalised and before the job
+    /// exists, losing the recording, so they are unwrapped by hand.
     private static func candidate(_ event: EKEvent) -> CalendarEventCandidate? {
         guard event.status != .canceled,
-              event.calendar.type != .birthday, event.calendar.type != .subscription else { return nil }
+              let calendar = event.calendar as EKCalendar?,
+              calendar.type != .birthday, calendar.type != .subscription,
+              let start = event.startDate as Date?, let end = event.endDate as Date? else { return nil }
         let attendees = (event.attendees ?? []).compactMap { attendee -> String? in
             guard attendee.participantType == .person, !attendee.isCurrentUser else { return nil }
             if let name = attendee.name, !name.isEmpty { return name }
@@ -86,8 +91,8 @@ final class EventKitMeetingLookup: CalendarMeetingLookup {
         }
         return CalendarEventCandidate(
             title: event.title ?? "",
-            start: event.startDate,
-            end: event.endDate,
+            start: start,
+            end: end,
             isAllDay: event.isAllDay,
             attendees: attendees,
             conferenceText: [event.url?.absoluteString, event.location, event.notes].compactMap(\.self).joined(separator: " "),
