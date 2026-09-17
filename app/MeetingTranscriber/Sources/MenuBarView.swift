@@ -21,6 +21,8 @@ struct MenuBarView: View {
     let onOpenLastProtocol: () -> Void
     let onOpenProtocol: (URL) -> Void
     let onOpenProtocolsFolder: () -> Void
+    /// Opens the Protocols window: the folder as a list, with delete.
+    let onOpenProtocols: () -> Void
     let onOpenSettings: () -> Void
     let onNameSpeakers: (() -> Void)?
     let onProcessFiles: () -> Void
@@ -213,6 +215,13 @@ struct MenuBarView: View {
             .keyboardShortcut("o")
             .disabled(protocolPath.isEmpty)
         }
+
+        Button {
+            onOpenProtocols()
+        } label: {
+            Label("Protocols...", systemImage: "list.bullet.rectangle")
+        }
+        .keyboardShortcut("d")
 
         Button {
             onOpenProtocolsFolder()

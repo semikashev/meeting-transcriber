@@ -119,6 +119,8 @@ State writes to `AppPaths.dataDir`; IPC + queue snapshots to `ipcDir`.
 | `LegacyDefaultsMigration.swift` | One-shot carry-over of settings from the pre-rename bundle identifier, since `UserDefaults` is scoped per identifier |
 | `UpdateChecker.swift` | Checks GitHub releases for newer versions, drives the menu bar update badge |
 | `Settings/PickerLanguages.swift` | Language picker entries for WhisperKit and Parakeet language selectors |
+| `ProtocolLibrary.swift` | Scans the output folder into one `ProtocolEntry` per recording (protocol + transcript + `recordings/` audio by stem) and removes an entry's files through an injected `FileRemoving` (Trash in production) |
+| `ProtocolsWindowView.swift` | The Protocols window: rows with open / reveal / delete-audio / delete, busy rows locked; callbacks only, no file access |
 | `LiveCaptionsState.swift` | `@Observable` live-captions state (per-channel hypotheses + finalised utterances) + RPC-wire types |
 | `LiveCaptionsOverlay.swift` | SwiftUI caption-bar content (recent finals + per-channel hypotheses) hosted in `LiveCaptionsWindow` |
 | `LiveCaptionsWindowController.swift` | Borderless click-through NSPanel hosting the caption overlay (⌥-drag to reposition; origin persisted); `LiveCaptionsPanel` moves itself from mouse events because `isMovableByWindowBackground` ignores `NSHostingView` content on macOS 27 |

@@ -77,6 +77,8 @@ private struct WindowAccessor: NSViewRepresentable {
 struct MeetingTranscriberApp: App {
     @State private var appState = AppState(notifier: NotificationManager.shared)
     @State private var captionsWindow: LiveCaptionsWindowController?
+    /// Rows of the Protocols window; rescanned whenever it opens or acts.
+    @State private var protocolEntries: [ProtocolEntry] = []
     @Environment(\.openWindow)
     private var openWindow
 
@@ -124,6 +126,7 @@ struct MeetingTranscriberApp: App {
         speakerNamingWindow
         settingsWindow
         recordAppWindow
+        protocolsWindow
     }
 
     // MARK: - Menu Bar
@@ -145,6 +148,7 @@ struct MeetingTranscriberApp: App {
             onOpenLastProtocol: openLastProtocol,
             onOpenProtocol: { url in NSWorkspace.shared.open(url) },
             onOpenProtocolsFolder: openProtocolsFolder,
+            onOpenProtocols: { bringWindowToFront(id: "protocols") },
             onOpenSettings: {
                 bringWindowToFront(id: "settings")
             },
@@ -279,6 +283,26 @@ struct MeetingTranscriberApp: App {
         .windowResizability(.contentSize)
     }
 
+    private var protocolsWindow: some Scene {
+        Window("Protocols", id: "protocols") {
+            ProtocolsWindowView(
+                entries: protocolEntries,
+                onOpen: { entry in
+                    if let url = entry.protocolURL ?? entry.transcriptURL { NSWorkspace.shared.open(url) }
+                },
+                onReveal: { entry in
+                    let url = entry.protocolURL ?? entry.transcriptURL ?? entry.audioURLs.first
+                    if let url { NSWorkspace.shared.activateFileViewerSelecting([url]) }
+                },
+                onDelete: { entry, scope in
+                    removeProtocolEntry(entry, scope: scope)
+                    rescanProtocols()
+                },
+                onRefresh: rescanProtocols,
+            )
+        }
+    }
+
     private var recordAppWindow: some Scene {
         Window("Record App", id: "record-app") {
             AppPickerView(
@@ -397,6 +421,30 @@ struct MeetingTranscriberApp: App {
     private func closeWindow(id: String) {
         for window in NSApp.windows where window.identifier?.rawValue == id {
             window.close()
+        }
+    }
+
+    /// Stems a pipeline job still refers to: anything not finished, plus the
+    /// jobs parked on speaker naming, whose 16 kHz sidecar the naming session
+    /// reads back. Deleting under those would break the job.
+    private func rescanProtocols() {
+        let busy = Set(appState.pipeline.queue.jobs
+            .filter { $0.state != .done && $0.state != .error }
+            .compactMap(\.namingSlug))
+        let dir = appState.settings.effectiveOutputDir
+        let accessing = dir.startAccessingSecurityScopedResource()
+        defer { if accessing { dir.stopAccessingSecurityScopedResource() } }
+        protocolEntries = ProtocolLibrary.scan(outputDir: dir, busyStems: busy)
+    }
+
+    private func removeProtocolEntry(_ entry: ProtocolEntry, scope: ProtocolRemovalScope) {
+        let dir = appState.settings.effectiveOutputDir
+        let accessing = dir.startAccessingSecurityScopedResource()
+        defer { if accessing { dir.stopAccessingSecurityScopedResource() } }
+        do {
+            try ProtocolLibrary.remove(entry, scope: scope, using: TrashFileRemover())
+        } catch {
+            appState.notifier.notify(title: "Could not delete recording", body: error.localizedDescription)
         }
     }
 

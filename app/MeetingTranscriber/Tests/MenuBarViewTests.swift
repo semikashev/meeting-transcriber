@@ -41,6 +41,7 @@ final class MenuBarViewTests: XCTestCase {
         manualRecordingPendingOrActive: Bool = false,
         captionOverlay: CaptionOverlayItem = .unavailable,
         onToggleCaptionOverlay: @escaping () -> Void = {},
+        onOpenProtocols: @escaping () -> Void = {},
     ) -> MenuBarView {
         MenuBarView(
             status: status,
@@ -56,6 +57,7 @@ final class MenuBarViewTests: XCTestCase {
             onOpenLastProtocol: {},
             onOpenProtocol: { _ in },
             onOpenProtocolsFolder: {},
+            onOpenProtocols: onOpenProtocols,
             onOpenSettings: {},
             onNameSpeakers: onNameSpeakers,
             onProcessFiles: {},
@@ -160,6 +162,16 @@ final class MenuBarViewTests: XCTestCase {
         XCTAssertNoThrow(try body.find(text: "Settings..."))
     }
 
+    func testProtocolsButtonCallsCallback() throws {
+        var called = false
+        let onProtocols: () -> Void = { called = true }
+        let sut = makeView(status: makeStatus(state: .idle), onOpenProtocols: onProtocols)
+
+        try sut.inspect().find(button: "Protocols...").tap()
+
+        XCTAssertTrue(called)
+    }
+
     func testOpenProtocolsFolderButtonExists() throws {
         let sut = makeView(status: makeStatus())
         let body = try sut.inspect()
@@ -244,6 +256,7 @@ final class MenuBarViewTests: XCTestCase {
             onOpenLastProtocol: {},
             onOpenProtocol: { _ in },
             onOpenProtocolsFolder: {},
+            onOpenProtocols: {},
             onOpenSettings: {},
             onNameSpeakers: nil,
             onProcessFiles: {},
@@ -273,6 +286,7 @@ final class MenuBarViewTests: XCTestCase {
             onOpenLastProtocol: {},
             onOpenProtocol: { _ in },
             onOpenProtocolsFolder: {},
+            onOpenProtocols: {},
             onOpenSettings: {},
             onNameSpeakers: nil,
             onProcessFiles: {},
@@ -302,6 +316,7 @@ final class MenuBarViewTests: XCTestCase {
             onOpenLastProtocol: {},
             onOpenProtocol: { _ in },
             onOpenProtocolsFolder: {},
+            onOpenProtocols: {},
             onOpenSettings: { called = true },
             onNameSpeakers: nil,
             onProcessFiles: {},
@@ -331,6 +346,7 @@ final class MenuBarViewTests: XCTestCase {
             onOpenLastProtocol: {},
             onOpenProtocol: { _ in },
             onOpenProtocolsFolder: { called = true },
+            onOpenProtocols: {},
             onOpenSettings: {},
             onNameSpeakers: nil,
             onProcessFiles: {},
@@ -360,6 +376,7 @@ final class MenuBarViewTests: XCTestCase {
             onOpenLastProtocol: { called = true },
             onOpenProtocol: { _ in },
             onOpenProtocolsFolder: {},
+            onOpenProtocols: {},
             onOpenSettings: {},
             onNameSpeakers: nil,
             onProcessFiles: {},
@@ -389,6 +406,7 @@ final class MenuBarViewTests: XCTestCase {
             onOpenLastProtocol: {},
             onOpenProtocol: { _ in },
             onOpenProtocolsFolder: {},
+            onOpenProtocols: {},
             onOpenSettings: {},
             onNameSpeakers: { called = true },
             onProcessFiles: {},
@@ -454,6 +472,7 @@ final class MenuBarViewTests: XCTestCase {
             onOpenLastProtocol: {},
             onOpenProtocol: { _ in },
             onOpenProtocolsFolder: {},
+            onOpenProtocols: {},
             onOpenSettings: {},
             onNameSpeakers: nil,
             onProcessFiles: {},
@@ -495,6 +514,7 @@ final class MenuBarViewTests: XCTestCase {
             onOpenLastProtocol: {},
             onOpenProtocol: { _ in },
             onOpenProtocolsFolder: {},
+            onOpenProtocols: {},
             onOpenSettings: {},
             onNameSpeakers: nil,
             onProcessFiles: {},
@@ -523,6 +543,7 @@ final class MenuBarViewTests: XCTestCase {
             onOpenLastProtocol: {},
             onOpenProtocol: { _ in },
             onOpenProtocolsFolder: {},
+            onOpenProtocols: {},
             onOpenSettings: {},
             onNameSpeakers: nil,
             onProcessFiles: { called = true },
@@ -564,6 +585,7 @@ final class MenuBarViewTests: XCTestCase {
             onOpenLastProtocol: {},
             onOpenProtocol: { _ in },
             onOpenProtocolsFolder: {},
+            onOpenProtocols: {},
             onOpenSettings: {},
             onNameSpeakers: nil,
             onProcessFiles: {},
@@ -604,6 +626,7 @@ final class MenuBarViewTests: XCTestCase {
             onOpenLastProtocol: {},
             onOpenProtocol: { _ in },
             onOpenProtocolsFolder: {},
+            onOpenProtocols: {},
             onOpenSettings: {},
             onNameSpeakers: nil,
             onProcessFiles: {},
@@ -646,6 +669,7 @@ final class MenuBarViewTests: XCTestCase {
             onOpenLastProtocol: {},
             onOpenProtocol: { _ in },
             onOpenProtocolsFolder: {},
+            onOpenProtocols: {},
             onOpenSettings: {},
             onNameSpeakers: nil,
             onProcessFiles: {},
@@ -688,6 +712,7 @@ final class MenuBarViewTests: XCTestCase {
             onOpenLastProtocol: {},
             onOpenProtocol: { _ in },
             onOpenProtocolsFolder: {},
+            onOpenProtocols: {},
             onOpenSettings: {},
             onNameSpeakers: nil,
             onProcessFiles: {},
@@ -732,6 +757,7 @@ final class MenuBarViewTests: XCTestCase {
             onOpenLastProtocol: {},
             onOpenProtocol: { _ in },
             onOpenProtocolsFolder: {},
+            onOpenProtocols: {},
             onOpenSettings: {},
             onNameSpeakers: nil,
             onProcessFiles: {},
@@ -811,6 +837,7 @@ final class MenuBarViewTests: XCTestCase {
             onOpenLastProtocol: {},
             onOpenProtocol: { _ in },
             onOpenProtocolsFolder: {},
+            onOpenProtocols: {},
             onOpenSettings: {},
             onNameSpeakers: nil,
             onProcessFiles: {},
@@ -997,6 +1024,7 @@ final class MenuBarViewTests: XCTestCase {
             onOpenLastProtocol: {},
             onOpenProtocol: { _ in },
             onOpenProtocolsFolder: {},
+            onOpenProtocols: {},
             onOpenSettings: {},
             onNameSpeakers: nil,
             onProcessFiles: {},
