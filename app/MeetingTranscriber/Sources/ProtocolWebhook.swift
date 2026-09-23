@@ -39,6 +39,11 @@ enum ProtocolWebhook {
         let app: String
         let meetingStart: String?
         let participants: [String]
+        /// Calendar attendees' addresses. Left out when there are none, as
+        /// payloads sent before the field existed leave it out, so a receiver
+        /// has one case to handle. Added within version 1: no existing field
+        /// changed.
+        let participantEmails: [String]? // swiftlint:disable:this discouraged_optional_collection
         let protocolFilename: String
         let protocolMarkdown: String
         /// The markdown was cut to `maxMarkdownBytes`; the full file stays on
@@ -49,6 +54,7 @@ enum ProtocolWebhook {
             case event, version, title, app, participants, truncated
             case jobID = "job_id"
             case meetingStart = "meeting_start"
+            case participantEmails = "participant_emails"
             case protocolFilename = "protocol_filename"
             case protocolMarkdown = "protocol_markdown"
         }
@@ -60,6 +66,7 @@ enum ProtocolWebhook {
         let appName: String
         let meetingStartTime: Date?
         let participants: [String]
+        var participantEmails: [String] = []
     }
 
     static func configuredURL(read: (String) -> String? = KeychainHelper.read(key:)) -> URL? {
@@ -82,6 +89,7 @@ enum ProtocolWebhook {
             app: job.appName,
             meetingStart: start,
             participants: job.participants,
+            participantEmails: job.participantEmails.isEmpty ? nil : job.participantEmails,
             protocolFilename: protocolFilename,
             protocolMarkdown: body,
             truncated: truncated,

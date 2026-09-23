@@ -76,6 +76,24 @@ final class ProtocolWebhookTests: XCTestCase {
         XCTAssertNotNil(json["meeting_start"] as? String)
     }
 
+    func testPayloadCarriesParticipantEmailsWhenKnown() throws {
+        var withEmails = job
+        withEmails.participantEmails = ["anna@example.com", "boris@example.org"]
+        let payload = ProtocolWebhook.makePayload(job: withEmails, markdown: "ok", protocolFilename: "a.md")
+        let request = try ProtocolWebhook.makeRequest(url: XCTUnwrap(URL(string: "https://h/x")), payload: payload)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(request.httpBody)) as? [String: Any])
+        XCTAssertEqual(json["participant_emails"] as? [String], ["anna@example.com", "boris@example.org"])
+        XCTAssertEqual(json["participants"] as? [String], ["Anna", "Boris"])
+        XCTAssertEqual(json["version"] as? Int, 1, "an added field does not bump the version")
+    }
+
+    func testPayloadLeavesParticipantEmailsOutWhenUnknown() throws {
+        let payload = ProtocolWebhook.makePayload(job: job, markdown: "ok", protocolFilename: "a.md")
+        let request = try ProtocolWebhook.makeRequest(url: XCTUnwrap(URL(string: "https://h/x")), payload: payload)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(request.httpBody)) as? [String: Any])
+        XCTAssertNil(json["participant_emails"], "same shape as a payload sent before the field existed")
+    }
+
     func testFitDropsFullTranscriptBeforeCutting() {
         let head = "## Summary\nshort"
         let markdown = head + ProtocolWebhook.fullTranscriptMarker + String(repeating: "x", count: 500)

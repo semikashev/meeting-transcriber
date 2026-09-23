@@ -172,4 +172,11 @@ final class CalendarMeetingMatcherTests: XCTestCase {
         XCTAssertFalse(match.meeting.hasConferenceLink)
         XCTAssertTrue(match.meeting.involvesOthers, "but the invitees still make it a meeting")
     }
+
+    func testMatchCarriesTheAttendeeAddresses() throws {
+        var candidate = event("Sync", from: -5, to: 25, attendees: ["Anna"])
+        candidate.attendeeEmails = ["anna@example.com"]
+        let match = try XCTUnwrap(CalendarMeetingMatcher.bestMatch(recordingStart: at(0), appName: "Microsoft Teams", among: [candidate]))
+        XCTAssertEqual(match.meeting.attendeeEmails, ["anna@example.com"])
+    }
 }

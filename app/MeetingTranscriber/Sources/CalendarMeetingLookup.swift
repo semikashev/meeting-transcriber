@@ -113,6 +113,10 @@ final class EventKitMeetingLookup: CalendarMeetingLookup {
             let address = attendee.url.absoluteString.replacingOccurrences(of: "mailto:", with: "")
             return address.isEmpty ? nil : ParticipantDisplayName.resolve(address, aliases: aliases)
         }
+        let emails = (event.attendees ?? []).compactMap { attendee -> String? in
+            guard attendee.participantType == .person, !attendee.isCurrentUser else { return nil }
+            return CalendarAttendeeEmail.address(from: attendee.url)
+        }
         let me = (event.attendees ?? []).first(where: \.isCurrentUser)
         return CalendarEventCandidate(
             title: event.title ?? "",
@@ -122,6 +126,30 @@ final class EventKitMeetingLookup: CalendarMeetingLookup {
             attendees: attendees,
             conferenceText: [event.url?.absoluteString, event.location, event.notes].compactMap(\.self).joined(separator: " "),
             isDeclined: me?.participantStatus == .declined,
+            attendeeEmails: CalendarAttendeeEmail.unique(emails),
         )
+    }
+}
+
+/// The address behind an attendee's `mailto:` URL. EventKit gives every
+/// attendee a URL; for an Exchange or Google invite it is `mailto:`, for
+/// others it can be a `urn:` or a principal path, which carry no address.
+enum CalendarAttendeeEmail {
+    static func address(from url: URL) -> String? {
+        guard url.scheme?.lowercased() == "mailto" else { return nil }
+        let raw = url.absoluteString.dropFirst("mailto:".count)
+        let address = (raw.removingPercentEncoding ?? String(raw))
+            .split(separator: "?").first.map(String.init)?
+            .trimmingCharacters(in: .whitespaces)
+            .lowercased() ?? ""
+        let parts = address.split(separator: "@", omittingEmptySubsequences: false)
+        guard parts.count == 2, !parts[0].isEmpty, parts[1].contains(".") else { return nil }
+        return address
+    }
+
+    /// First occurrence wins, so the order follows the invitation.
+    static func unique(_ addresses: [String]) -> [String] {
+        var seen = Set<String>()
+        return addresses.filter { seen.insert($0).inserted }
     }
 }

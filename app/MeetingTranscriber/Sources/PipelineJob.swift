@@ -72,6 +72,10 @@ struct PipelineJob: Identifiable, Codable {
     private(set) var micPath: URL?
     let micDelay: TimeInterval
     let participants: [String]
+    /// Addresses of the calendar event's attendees, for the protocol webhook.
+    /// Optional so snapshots saved before the field existed still decode; nil
+    /// also when no calendar event matched or it listed no addresses.
+    var participantEmails: [String]? // swiftlint:disable:this discouraged_optional_collection
     let enqueuedAt: Date
     /// Wall-clock time the recording started (meeting start), captured directly
     /// by the recorder at start (`RecordingResult.recordingStartDate`), not
@@ -174,6 +178,8 @@ struct PipelineJob: Identifiable, Codable {
         micPath: URL?,
         micDelay: TimeInterval,
         participants: [String] = [],
+        // swiftlint:disable:next discouraged_optional_collection
+        participantEmails: [String]? = nil,
         meetingStartTime: Date? = nil,
         autoSkipNaming: Bool = false,
         // swiftlint:disable:next discouraged_optional_boolean
@@ -189,6 +195,7 @@ struct PipelineJob: Identifiable, Codable {
         self.micPath = micPath
         self.micDelay = micDelay
         self.participants = participants
+        self.participantEmails = participantEmails
         self.enqueuedAt = Date()
         self.meetingStartTime = meetingStartTime
         self.state = .waiting
