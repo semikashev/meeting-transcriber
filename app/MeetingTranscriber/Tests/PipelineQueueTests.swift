@@ -1770,8 +1770,10 @@ final class PipelineQueueTests: XCTestCase {
         micLabel: String = "Me",
         stagingDir: URL? = nil,
         beforeDiarizing: (() -> Void)? = nil,
+        terminologyRules: String = "",
     ) -> PipelineQueue {
-        PipelineQueue(
+        let terminologyNormalizer = { TerminologyNormalizer(rulesText: terminologyRules) }
+        return PipelineQueue(
             engine: engine,
             diarizationFactory: {
                 beforeDiarizing?()
@@ -1787,6 +1789,7 @@ final class PipelineQueueTests: XCTestCase {
             diarizeEnabled: true,
             numSpeakers: 0,
             micLabel: micLabel,
+            terminologyNormalizer: terminologyNormalizer,
         )
     }
 
@@ -1864,6 +1867,73 @@ final class PipelineQueueTests: XCTestCase {
             transcript.contains("Alice: Hello world"),
             "single-source: SPEAKER_0 should map to Alice — got: \(transcript)",
         )
+    }
+
+    // MARK: - Terminology on merged speaker lines
+
+    /// Runs one single-source job whose segments all belong to one speaker
+    /// ("Alice") and returns the transcript handed to protocol generation.
+    private func labeledTranscript(segments: [TimestampedSegment], rules: String) async throws -> String {
+        let engine = MockEngine()
+        engine.segmentsToReturn = segments
+        let span = segments.last?.end ?? 0
+        let diar = MockDiarization()
+        diar.resultToReturn = DiarizationResult(
+            segments: [.init(start: 0, end: span, speaker: "SPEAKER_0")],
+            speakingTimes: ["SPEAKER_0": span],
+            autoNames: ["SPEAKER_0": "Alice"],
+            embeddings: nil,
+        )
+        let protocolGen = MockProtocolGen()
+        let q = makeCapturingQueue(engine: engine, diar: diar, protocolGen: protocolGen, terminologyRules: rules)
+        try q.enqueue(PipelineJob(
+            meetingTitle: "Terminology", appName: "Teams",
+            mixPath: createTestAudioFile(in: tmpDir), appPath: nil, micPath: nil, micDelay: 0,
+        ))
+        await q.processNext()
+        return try XCTUnwrap(protocolGen.capturedTranscript)
+    }
+
+    /// ASR segments end at sentence punctuation and every 20 tokens, so a
+    /// spoken phrase can straddle two of them. Once they are one speaker line
+    /// the rule has to see the whole phrase.
+    func testTerminologyRuleMatchesAPhraseSplitAcrossSegments() async throws {
+        let transcript = try await labeledTranscript(
+            segments: [
+                TimestampedSegment(start: 0, end: 2, text: "I read hacker"),
+                TimestampedSegment(start: 2, end: 4, text: "nuz every day."),
+            ],
+            rules: "Hacker News => hacker nuz",
+        )
+
+        XCTAssertTrue(transcript.contains("Alice: I read Hacker News every day."), transcript)
+    }
+
+    /// Normalizing the merged line runs the rules over text they already
+    /// rewrote once. An expansion rule must not grow a second time.
+    func testMergedLinePassDoesNotExpandCanonicalTextAgain() async throws {
+        let transcript = try await labeledTranscript(
+            segments: [
+                TimestampedSegment(start: 0, end: 2, text: "The cluster"),
+                TimestampedSegment(start: 2, end: 4, text: "runs fine."),
+            ],
+            rules: "Kubernetes Cluster => cluster",
+        )
+
+        XCTAssertTrue(transcript.contains("Alice: The Kubernetes Cluster runs fine."), transcript)
+    }
+
+    /// Rules rewrite what was said, never who said it.
+    func testTerminologyRuleLeavesTheSpeakerLabelAlone() async throws {
+        let transcript = try await labeledTranscript(
+            segments: [
+                TimestampedSegment(start: 0, end: 2, text: "Alice said"),
+                TimestampedSegment(start: 2, end: 4, text: "hi."),
+            ],
+            rules: "Alyssa => alice",
+        )
+
+        XCTAssertTrue(transcript.contains("Alice: Alyssa said hi."), transcript)
     }
 
     // MARK: - One meeting-start-anchored basename per job

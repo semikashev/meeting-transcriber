@@ -775,6 +775,7 @@ extension PipelineQueue {
             run: run, cachedSegments: cachedSegments,
             isDualSource: transcription.isDualSource, autoNames: autoNames,
             note: transcription.note,
+            normalizer: transcription.terminologyNormalizer,
         )
     }
 
@@ -789,6 +790,20 @@ extension PipelineQueue {
     func renderLabeledTranscript(
         run: DiarizationRun, cachedSegments: [TimestampedSegment],
         isDualSource: Bool, autoNames: [String: String], note: String?,
+    ) -> String? {
+        // A late re-run has no job snapshot of the rules; it applies the
+        // current ones, like a new job would.
+        renderLabeledTranscript(
+            run: run, cachedSegments: cachedSegments,
+            isDualSource: isDualSource, autoNames: autoNames, note: note,
+            normalizer: terminologyNormalizer(),
+        )
+    }
+
+    private func renderLabeledTranscript(
+        run: DiarizationRun, cachedSegments: [TimestampedSegment],
+        isDualSource: Bool, autoNames: [String: String], note: String?,
+        normalizer: TerminologyNormalizer,
     ) -> String? {
         // Suppressed copies leave before anything gets a speaker. Left in,
         // they would be labeled like real speech and merged into adjacent
@@ -818,7 +833,13 @@ extension PipelineQueue {
         }
         guard let topology else { return nil }
         let labeled = DiarizationProcess.labelSegments(topology, autoNames: autoNames)
-        return DiarizationProcess.mergeConsecutiveSpeakers(labeled).transcriptText(note: note)
+        // ASR segments end at `. ! ?` and every 20 tokens, so a phrase can
+        // straddle two of them and slip past the per-segment rules. The merged
+        // speaker line is the first text that holds it whole. Rules run over
+        // the text only, never the speaker label; a second pass over text they
+        // already rewrote is a no-op as long as the rule set is idempotent.
+        let merged = DiarizationProcess.mergeConsecutiveSpeakers(labeled)
+        return normalize(merged, with: normalizer).transcriptText(note: note)
     }
 
     /// Stage 3 — persist the transcript + audio, run protocol generation
