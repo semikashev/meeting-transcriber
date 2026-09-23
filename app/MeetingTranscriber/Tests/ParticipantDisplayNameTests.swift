@@ -40,14 +40,21 @@ final class ParticipantDisplayNameTests: XCTestCase {
         let file = FileManager.default.temporaryDirectory.appendingPathComponent("aliases-\(UUID().uuidString).txt")
         try "Bob Stone => robert.stone@example.com".write(to: file, atomically: true, encoding: .utf8)
         defer { try? FileManager.default.removeItem(at: file) }
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: "ParticipantDisplayNameTests-\(UUID().uuidString)"))
+        let defaults = try scratchDefaults()
         defaults.set(file.path, forKey: ParticipantDisplayName.aliasesPathKey)
 
         XCTAssertEqual(ParticipantDisplayName.aliasesFromDefaults(defaults), ["robert.stone@example.com": "Bob Stone"])
     }
 
     func testAliasesFromDefaultsIsEmptyWhenUnset() throws {
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: "ParticipantDisplayNameTests-\(UUID().uuidString)"))
+        let defaults = try scratchDefaults()
         XCTAssertTrue(ParticipantDisplayName.aliasesFromDefaults(defaults).isEmpty)
+    }
+
+    private func scratchDefaults() throws -> UserDefaults {
+        let name = "ParticipantDisplayNameTests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: name))
+        addTeardownBlock { DefaultsSuite.remove(name) }
+        return defaults
     }
 }

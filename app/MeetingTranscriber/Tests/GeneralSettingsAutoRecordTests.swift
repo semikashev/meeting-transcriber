@@ -12,7 +12,7 @@ final class GeneralSettingsAutoRecordTests: XCTestCase {
     private func makeSettings(calendarTitles: Bool) throws -> AppSettings {
         let suiteName = "GeneralSettingsAutoRecordTests.\(UUID().uuidString)"
         let suite = try XCTUnwrap(UserDefaults(suiteName: suiteName))
-        addTeardownBlock { suite.removePersistentDomain(forName: suiteName) }
+        addTeardownBlock { DefaultsSuite.remove(suiteName) }
         let settings = AppSettings(defaults: suite)
         settings.calendarTitlesEnabled = calendarTitles
         return settings

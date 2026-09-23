@@ -5,10 +5,15 @@ import XCTest
 /// reason as `LiveCaptionsOverlaySettingTests`: `AppSettingsTests` pins only
 /// the default.
 final class CalendarTitlesSettingTests: XCTestCase {
+    private func scratchDefaults(_ prefix: String) throws -> UserDefaults {
+        let name = "\(prefix)-\(getpid())-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: name))
+        addTeardownBlock { DefaultsSuite.remove(name) }
+        return defaults
+    }
+
     func testPersistsAcrossInstances() throws {
-        let defaults = try XCTUnwrap(
-            UserDefaults(suiteName: "calendar-titles-\(getpid())-\(UUID().uuidString)"),
-        )
+        let defaults = try scratchDefaults("calendar-titles")
         let settings = AppSettings(defaults: defaults)
         XCTAssertFalse(settings.calendarTitlesEnabled, "opt-in: it asks for a Calendar permission")
 
@@ -22,9 +27,7 @@ final class CalendarTitlesSettingTests: XCTestCase {
     }
 
     func testAutoRecordPersistsAcrossInstances() throws {
-        let defaults = try XCTUnwrap(
-            UserDefaults(suiteName: "calendar-auto-record-\(getpid())-\(UUID().uuidString)"),
-        )
+        let defaults = try scratchDefaults("calendar-auto-record")
         let settings = AppSettings(defaults: defaults)
         XCTAssertFalse(settings.autoRecordCalendarMeetings, "opt-in: it starts recordings nobody clicked for")
 
@@ -35,9 +38,7 @@ final class CalendarTitlesSettingTests: XCTestCase {
     }
 
     func testInRoomPromptPersistsAcrossInstances() throws {
-        let defaults = try XCTUnwrap(
-            UserDefaults(suiteName: "in-room-prompt-\(getpid())-\(UUID().uuidString)"),
-        )
+        let defaults = try scratchDefaults("in-room-prompt")
         let settings = AppSettings(defaults: defaults)
         XCTAssertFalse(settings.promptInRoomMeetings, "opt-in: it posts prompts on a schedule")
 
