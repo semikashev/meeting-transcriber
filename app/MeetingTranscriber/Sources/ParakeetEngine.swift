@@ -63,6 +63,8 @@ final class ParakeetEngine: TranscribingEngine, StreamingTranscribingEngine {
         let context: CustomVocabularyContext
         let spotter: CtcKeywordSpotter
         let rescorer: VocabularyRescorer
+        /// Characters the CTC model can spell (its models are English-only).
+        let alphabet: Set<Character>
     }
 
     private var vocabularyBooster: VocabularyBooster?
@@ -214,7 +216,7 @@ final class ParakeetEngine: TranscribingEngine, StreamingTranscribingEngine {
             logProbs: spotResult.logProbs,
             frameDuration: spotResult.frameDuration,
         )
-        let rescored = ParakeetVocabularyRescoring.applying(evidence, to: result)
+        let rescored = ParakeetVocabularyRescoring.applying(evidence, to: result, alphabet: booster.alphabet)
         let applied = rescored.ctcAppliedTerms?.count ?? 0
         let decided = evidence.candidates.count { $0.legacyOutcome == .applied }
         logger.info(
@@ -328,7 +330,10 @@ final class ParakeetEngine: TranscribingEngine, StreamingTranscribingEngine {
             guard canAdoptVocabulary(
                 configuration, attempt: attempt, requiresCurrentSelection: requiresCurrentSelection,
             ) else { return }
-            vocabularyBooster = VocabularyBooster(context: vocab, spotter: spotter, rescorer: rescorer)
+            vocabularyBooster = VocabularyBooster(
+                context: vocab, spotter: spotter, rescorer: rescorer,
+                alphabet: ParakeetVocabularyRescoring.alphabet(ofTokens: ctcModels.vocabulary.values),
+            )
             vocabularyPreparationState = .ready(configuration)
             logger.info("Parakeet: custom vocabulary loaded: \(vocab.terms.count) terms")
         } catch {

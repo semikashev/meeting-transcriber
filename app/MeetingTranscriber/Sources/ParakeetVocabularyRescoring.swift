@@ -11,13 +11,24 @@ import Foundation
 enum ParakeetVocabularyRescoring {
     private static let wordBoundary: Set<Character> = [" ", "▁"]
 
+    /// The characters a CTC model can spell: everything its tokens are made of.
+    static func alphabet(ofTokens tokens: some Sequence<String>) -> Set<Character> {
+        Set(tokens.joined())
+    }
+
+    /// - Parameter alphabet: characters the CTC model can spell. FluidAudio's
+    ///   CTC models are English-only; for a phrase or term with letters
+    ///   outside that alphabet the acoustic comparison has nothing to score,
+    ///   yet can still "pass". Such candidates are left out.
     static func applying(
         _ evidence: VocabularyRescorer.CandidateEvidenceOutput,
         to result: ASRResult,
+        alphabet: Set<Character>,
     ) -> ASRResult {
         guard var timings = result.tokenTimings else { return result }
         let applied = evidence.candidates
             .filter { $0.legacyOutcome == .applied }
+            .filter { canSpell($0.basePhrase, in: alphabet) && canSpell($0.canonicalTerm, in: alphabet) }
             .compactMap { candidate in
                 candidate.tokenRange.map { (range: $0, candidate: candidate) }
             }
@@ -77,6 +88,10 @@ enum ParakeetVocabularyRescoring {
     private static func capitalized(_ term: String, like original: String) -> String {
         guard original.first?.isUppercase == true, term.first?.isLowercase == true else { return term }
         return term.prefix(1).uppercased() + term.dropFirst()
+    }
+
+    private static func canSpell(_ text: String, in alphabet: Set<Character>) -> Bool {
+        text.allSatisfy { !$0.isLetter || alphabet.contains($0) }
     }
 
     private static func isPunctuation(_ token: String) -> Bool {

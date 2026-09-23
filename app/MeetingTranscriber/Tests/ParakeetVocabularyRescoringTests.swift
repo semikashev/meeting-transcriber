@@ -6,88 +6,123 @@ import XCTest
 /// from. Segments are grouped from token timings, so a replacement that only
 /// rewrites `ASRResult.text` is silently dropped.
 final class ParakeetVocabularyRescoringTests: XCTestCase {
+    /// What an English-only CTC tokenizer can spell.
+    private let english = ParakeetVocabularyRescoring.alphabet(
+        ofTokens: ["<unk>", "▁the", "abcdefghijklmnopqrstuvwxyz", "ABCDEFGHIJKLMNOPQRSTUVWXYZ"],
+    )
+
     func testAppliedTermsReachTheSegmentText() throws {
         let result = asrResult([
-            timing("Мы", 0.0, 0.3),
-            timing(" подня", 0.3, 0.5),
-            timing("ли", 0.5, 0.7),
-            timing(" кубер", 0.8, 1.0),
-            timing("нетис", 1.0, 1.2),
+            timing("We", 0.0, 0.3),
+            timing(" moved", 0.3, 0.7),
+            timing(" to", 0.7, 0.8),
+            timing(" kuber", 0.8, 1.0),
+            timing("netis", 1.0, 1.2),
             timing(".", 1.2, 1.3),
-            timing(" Потом", 2.0, 2.4),
-            timing(" джи", 2.4, 2.6),
-            timing("ра", 2.6, 2.8),
+            timing(" Then", 2.0, 2.4),
+            timing(" gi", 2.4, 2.6),
+            timing("ra", 2.6, 2.8),
         ])
         let evidence = evidenceOutput([
-            candidate(tokens: 3 ..< 6, base: "кубернетис.", term: "Kubernetes"),
-            candidate(tokens: 7 ..< 9, base: "джира", term: "Jira"),
+            candidate(tokens: 3 ..< 6, base: "kubernetis.", term: "Kubernetes"),
+            candidate(tokens: 7 ..< 9, base: "gira", term: "Jira"),
         ])
 
-        let rescored = ParakeetVocabularyRescoring.applying(evidence, to: result)
+        let rescored = ParakeetVocabularyRescoring.applying(evidence, to: result, alphabet: english)
 
         let segments = try ParakeetTokenGrouping.groupIntoSegments(XCTUnwrap(rescored.tokenTimings))
-        XCTAssertEqual(segments.map(\.text), ["Мы подняли Kubernetes.", "Потом Jira"])
+        XCTAssertEqual(segments.map(\.text), ["We moved to Kubernetes.", "Then Jira"])
         XCTAssertEqual(segments.map(\.start), [0.0, 2.0])
         XCTAssertEqual(segments.map(\.end), [1.3, 2.8])
     }
 
     func testMultiWordTermTakesTheWholeSpanTiming() throws {
         let result = asrResult([
-            timing(" гит", 0.0, 0.2),
-            timing("х", 0.2, 0.4),
-            timing(" аб", 0.4, 0.6),
-            timing("ом", 0.6, 0.8),
-            timing(" пользуемся", 0.9, 1.3),
+            timing(" get", 0.0, 0.2),
+            timing(" h", 0.2, 0.4),
+            timing("ub", 0.4, 0.6),
+            timing(" works", 0.7, 1.1),
         ])
         let evidence = evidenceOutput([
-            candidate(tokens: 0 ..< 4, base: "гитх абом", term: "GitHub"),
+            candidate(tokens: 0 ..< 3, base: "get hub", term: "GitHub"),
         ])
 
-        let timings = try XCTUnwrap(ParakeetVocabularyRescoring.applying(evidence, to: result).tokenTimings)
+        let timings = try XCTUnwrap(
+            ParakeetVocabularyRescoring.applying(evidence, to: result, alphabet: english).tokenTimings,
+        )
 
-        XCTAssertEqual(timings.map(\.token), [" GitHub", " пользуемся"])
+        XCTAssertEqual(timings.map(\.token), [" GitHub", " works"])
         XCTAssertEqual(timings[0].startTime, 0.0)
-        XCTAssertEqual(timings[0].endTime, 0.8)
+        XCTAssertEqual(timings[0].endTime, 0.6)
     }
 
     func testCandidatesTheRescorerDidNotApplyLeaveTheTranscriptAlone() throws {
-        let tokens = [timing(" джи", 0.0, 0.2), timing("ра", 0.2, 0.4), timing(" пост", 0.5, 0.7), timing("грес", 0.7, 0.9)]
+        let tokens = [timing(" gi", 0.0, 0.2), timing("ra", 0.2, 0.4), timing(" post", 0.5, 0.7), timing("gress", 0.7, 0.9)]
         let evidence = evidenceOutput([
-            candidate(tokens: 0 ..< 2, base: "джира", term: "Jira", outcome: .rejectedByComparison),
-            candidate(tokens: 0 ..< 2, base: "джира", term: "Gira", outcome: .supersededByOverlap),
-            candidate(tokens: 2 ..< 4, base: "постгрес", term: "Postgres", outcome: .unavailableEvidence),
+            candidate(tokens: 0 ..< 2, base: "gira", term: "Jira", outcome: .rejectedByComparison),
+            candidate(tokens: 0 ..< 2, base: "gira", term: "Gitea", outcome: .supersededByOverlap),
+            candidate(tokens: 2 ..< 4, base: "postgress", term: "Postgres", outcome: .unavailableEvidence),
             // Applied, but without contiguous token provenance there is no
             // span to put it in.
-            candidate(tokens: nil, base: "постгрес", term: "Postgres"),
+            candidate(tokens: nil, base: "postgress", term: "Postgres"),
         ])
 
-        let timings = try XCTUnwrap(ParakeetVocabularyRescoring.applying(evidence, to: asrResult(tokens)).tokenTimings)
+        let timings = try XCTUnwrap(
+            ParakeetVocabularyRescoring.applying(evidence, to: asrResult(tokens), alphabet: english).tokenTimings,
+        )
 
-        XCTAssertEqual(timings.map(\.token), [" джи", "ра", " пост", "грес"])
+        XCTAssertEqual(timings.map(\.token), [" gi", "ra", " post", "gress"])
+    }
+
+    func testCandidatesTheCtcModelCannotSpellAreSkipped() throws {
+        // FluidAudio's CTC models are English-only: a phrase or term in
+        // another script tokenizes to nothing, and the comparison that
+        // "passes" is noise. Measured on a Russian meeting it turned
+        // "как" into "калк" and "например" into a product term.
+        let tokens = [
+            timing(" как", 0.0, 0.2), timing(" кофе", 0.3, 0.6), timing(" sport", 0.6, 0.7),
+            timing(" red", 0.7, 0.9), timing("dis", 0.9, 1.1),
+        ]
+        let evidence = evidenceOutput([
+            candidate(tokens: 0 ..< 1, base: "как", term: "калк"),
+            candidate(tokens: 1 ..< 2, base: "кофе", term: "Coffee"),
+            candidate(tokens: 2 ..< 3, base: "sport", term: "Спорт"),
+            candidate(tokens: 3 ..< 5, base: "reddis", term: "Redis"),
+        ])
+
+        let timings = try XCTUnwrap(
+            ParakeetVocabularyRescoring.applying(evidence, to: asrResult(tokens), alphabet: english).tokenTimings,
+        )
+
+        XCTAssertEqual(timings.map(\.token), [" как", " кофе", " sport", " Redis"])
     }
 
     func testOverlappingAppliedSpansWriteOnlyOneTerm() throws {
         // The rescorer's arbitration never applies overlapping spans. If a
         // future version did, the second write must not index past a span
         // the first one already shrank and take the whole job down.
-        let tokens = [timing(" гит", 0.0, 0.2), timing("х", 0.2, 0.4), timing(" аб", 0.4, 0.6), timing("ом", 0.6, 0.8)]
+        let tokens = [timing(" get", 0.0, 0.2), timing(" h", 0.2, 0.4), timing("ub", 0.4, 0.6), timing(" ac", 0.6, 0.8)]
         let evidence = evidenceOutput([
-            candidate(tokens: 0 ..< 4, base: "гитх абом", term: "GitHub"),
-            candidate(tokens: 1 ..< 3, base: "х аб", term: "Hub"),
+            candidate(tokens: 0 ..< 4, base: "get hub ac", term: "GitHub Actions"),
+            candidate(tokens: 1 ..< 3, base: "hub", term: "Hub"),
         ])
 
-        let timings = try XCTUnwrap(ParakeetVocabularyRescoring.applying(evidence, to: asrResult(tokens)).tokenTimings)
+        let timings = try XCTUnwrap(
+            ParakeetVocabularyRescoring.applying(evidence, to: asrResult(tokens), alphabet: english).tokenTimings,
+        )
 
-        XCTAssertEqual(timings.map(\.token), [" гит", "Hub", "ом"])
+        XCTAssertEqual(timings.map(\.token), [" get", " Hub", " ac"])
     }
 
     func testCapitalizedWordCapitalizesLowercaseTerm() throws {
         // Mirrors the rescorer's own text output: a sentence-initial word keeps
         // its capital when the term is spelled lowercase.
-        let result = asrResult([timing("Эй", 0.0, 0.2), timing("пи", 0.2, 0.4), timing("ай", 0.4, 0.6)])
-        let evidence = evidenceOutput([candidate(tokens: 0 ..< 3, base: "Эйпиай", term: "api")])
+        let result = asrResult([timing("Ay", 0.0, 0.2), timing("pee", 0.2, 0.4), timing("eye", 0.4, 0.6)])
+        let evidence = evidenceOutput([candidate(tokens: 0 ..< 3, base: "Aypeeeye", term: "api")])
 
-        let timings = try XCTUnwrap(ParakeetVocabularyRescoring.applying(evidence, to: result).tokenTimings)
+        let timings = try XCTUnwrap(
+            ParakeetVocabularyRescoring.applying(evidence, to: result, alphabet: english).tokenTimings,
+        )
 
         XCTAssertEqual(timings.map(\.token), ["Api"])
     }
