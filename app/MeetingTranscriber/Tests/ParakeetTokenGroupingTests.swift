@@ -109,8 +109,8 @@ final class ParakeetTokenGroupingTests: XCTestCase {
     }
 
     func testGroupIntoSegmentsSkipsBlankTokensInsideGroup() {
-        // Whitespace-only tokens must not count toward the 20-cap and must
-        // not appear in the joined text. They're stripped before grouping.
+        // Whitespace-only tokens must not count toward the 20-cap, and a run
+        // of them collapses to the single space it stands for.
         let segments = ParakeetTokenGrouping.groupIntoSegments([
             timing("Hello", start: 0, end: 1),
             timing("   ", start: 1, end: 1.5),
@@ -119,6 +119,38 @@ final class ParakeetTokenGroupingTests: XCTestCase {
         ])
         XCTAssertEqual(segments.count, 1)
         XCTAssertEqual(segments[0].text, "Hello world.")
+    }
+
+    func testGroupIntoSegmentsKeepsStandaloneSpaceTokenBetweenWords() {
+        // Parakeet emits the word boundary as its own token before a piece it
+        // has no merged form for; dropping it produced "тамЖук" and "за100".
+        let segments = ParakeetTokenGrouping.groupIntoSegments([
+            timing("там", start: 0, end: 0.3),
+            timing(" ", start: 0.3, end: 0.35),
+            timing("Жу", start: 0.35, end: 0.5),
+            timing("к", start: 0.5, end: 0.6),
+            timing(" за", start: 0.6, end: 0.8),
+            timing(" ", start: 0.8, end: 0.85),
+            timing("1", start: 0.85, end: 0.9),
+            timing("0", start: 0.9, end: 0.95),
+            timing("0.", start: 0.95, end: 1.0),
+        ])
+        XCTAssertEqual(segments.count, 1)
+        XCTAssertEqual(segments[0].text, "там Жук за 100.")
+    }
+
+    func testGroupIntoSegmentsIgnoresBlankTokensAtSegmentEdges() {
+        // A space token right after a split must not open the next segment,
+        // and a trailing one must not stretch the last segment's end time.
+        let segments = ParakeetTokenGrouping.groupIntoSegments([
+            timing("One.", start: 0, end: 1),
+            timing(" ", start: 1, end: 1.5),
+            timing("Two", start: 1.5, end: 2),
+            timing(" ", start: 2, end: 9),
+        ])
+        XCTAssertEqual(segments.map(\.text), ["One.", "Two"])
+        XCTAssertEqual(segments[1].start, 1.5)
+        XCTAssertEqual(segments[1].end, 2)
     }
 
     func testGroupIntoSegmentsPreservesFirstAndLastTimestamps() {

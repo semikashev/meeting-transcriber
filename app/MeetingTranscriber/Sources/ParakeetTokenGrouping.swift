@@ -19,19 +19,27 @@ enum ParakeetTokenGrouping {
     ///
     /// Ends a segment at sentence-terminating punctuation (`. ! ?`) or
     /// after `maxTokensPerSegment` tokens once a word boundary is reached.
-    /// Tokens that are blank after whitespace-trimming are skipped entirely.
+    /// Blank tokens never start a segment and do not count toward the cap,
+    /// but inside a segment they stay: Parakeet emits the word boundary as a
+    /// standalone space token before pieces it has no merged form for (a
+    /// capital `Ж`, a digit), and dropping it glued `там Жук` into `тамЖук`.
     static func groupIntoSegments(_ timings: [TokenTiming]) -> [TimestampedSegment] {
         var segments: [TimestampedSegment] = []
         var group: [TokenTiming] = []
+        var wordTokenCount = 0
 
         for (index, timing) in timings.enumerated() {
             let token = timing.token
-            guard !isBlank(token) else { continue }
+            guard !isBlank(token) else {
+                if !group.isEmpty { group.append(timing) }
+                continue
+            }
             group.append(timing)
+            wordTokenCount += 1
 
             let endsWithPunct = token.hasSuffix(".") || token.hasSuffix("!") || token.hasSuffix("?")
             let nextBoundary = nextTokenBoundary(after: index, in: timings)
-            let canSplitAtTokenCap = group.count >= maxTokensPerSegment
+            let canSplitAtTokenCap = wordTokenCount >= maxTokensPerSegment
                 && isWordBoundary(
                     after: token,
                     before: nextBoundary.token,
@@ -40,6 +48,7 @@ enum ParakeetTokenGrouping {
             if endsWithPunct || canSplitAtTokenCap {
                 if let seg = makeSegment(from: group) { segments.append(seg) }
                 group = []
+                wordTokenCount = 0
             }
         }
         if let seg = makeSegment(from: group) { segments.append(seg) }
@@ -49,12 +58,18 @@ enum ParakeetTokenGrouping {
 
     /// Build a `TimestampedSegment` from a contiguous group of token timings.
     /// Returns nil if `timings` is empty or yields an all-whitespace text.
+    /// Runs of whitespace collapse to one space, and the span is taken from
+    /// the first and last non-blank tokens so a trailing space token cannot
+    /// stretch the segment.
     static func makeSegment(from timings: [TokenTiming]) -> TimestampedSegment? {
-        guard !timings.isEmpty else { return nil }
-        let text = timings.map(\.token).joined().trimmingCharacters(in: whitespace)
+        guard let first = timings.first(where: { !isBlank($0.token) }),
+              let last = timings.last(where: { !isBlank($0.token) }) else { return nil }
+        let text = timings.map(\.token).joined()
+            .components(separatedBy: whitespace)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
         guard !text.isEmpty else { return nil }
-        // swiftlint:disable:next force_unwrapping
-        return TimestampedSegment(start: timings.first!.startTime, end: timings.last!.endTime, text: text)
+        return TimestampedSegment(start: first.startTime, end: last.endTime, text: text)
     }
 
     private static func isBlank(_ token: String) -> Bool {
