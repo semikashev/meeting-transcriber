@@ -205,29 +205,22 @@ final class ParakeetEngine: TranscribingEngine, StreamingTranscribingEngine {
         )
         guard !spotResult.logProbs.isEmpty else { return result }
 
-        let rescoreOutput = booster.rescorer.ctcTokenRescore(
+        // The same evaluation as `ctcTokenRescore`, which returns only rewritten
+        // text. Segments are grouped from token timings, so the replacements
+        // need the token span each one was decided for.
+        let evidence = booster.rescorer.ctcTokenEvaluateCandidates(
             transcript: result.text,
             tokenTimings: timings,
             logProbs: spotResult.logProbs,
             frameDuration: spotResult.frameDuration,
         )
-
-        guard rescoreOutput.wasModified else { return result }
-
-        let detected = rescoreOutput.replacements.compactMap(\.replacementWord)
-        let applied = rescoreOutput.replacements.filter(\.shouldReplace).compactMap(\.replacementWord)
-        logger.info("Parakeet: vocabulary rescoring applied \(applied.count) replacement(s)")
-        // RescoreOutput only provides updated text — token timings are unchanged because
-        // rescoring performs word-level text substitution without altering timing boundaries.
-        return ASRResult(
-            text: rescoreOutput.text,
-            confidence: result.confidence,
-            duration: result.duration,
-            processingTime: result.processingTime,
-            tokenTimings: timings,
-            ctcDetectedTerms: detected.isEmpty ? nil : detected,
-            ctcAppliedTerms: applied.isEmpty ? nil : applied,
+        let rescored = ParakeetVocabularyRescoring.applying(evidence, to: result)
+        let applied = rescored.ctcAppliedTerms?.count ?? 0
+        let decided = evidence.candidates.count { $0.legacyOutcome == .applied }
+        logger.info(
+            "Parakeet: vocabulary rescoring applied \(applied, privacy: .public) of \(decided, privacy: .public) replacement(s)",
         )
+        return rescored
     }
 
     // MARK: - Custom Vocabulary
