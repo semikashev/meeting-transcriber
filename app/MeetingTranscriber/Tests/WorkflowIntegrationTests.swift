@@ -39,6 +39,7 @@ final class WorkflowIntegrationTests: XCTestCase {
         transcriptOutputOptionsProvider: (() -> TranscriptOutputOptions)? = nil,
         echoCancellationEnabled: Bool = false,
         echoCancellerFactory: (() -> (any EchoCancelling)?)? = nil,
+        terminologyRules: String = "",
     ) throws -> (Harness, TransitionCollector) {
         let engine = MockEngine()
         engine.segmentsToReturn = [
@@ -60,6 +61,7 @@ final class WorkflowIntegrationTests: XCTestCase {
         let protocolGen = MockProtocolGen()
         let collector = TransitionCollector()
 
+        let terminologyNormalizer = { TerminologyNormalizer(rulesText: terminologyRules) }
         let queue = PipelineQueue(
             engine: engine,
             diarizationFactory: { diarization },
@@ -75,6 +77,7 @@ final class WorkflowIntegrationTests: XCTestCase {
             includeFullTranscriptInProtocol: includeFullTranscriptInProtocol,
             saveRawTranscriptSeparately: saveRawTranscriptSeparately,
             transcriptOutputOptionsProvider: transcriptOutputOptionsProvider,
+            terminologyNormalizer: terminologyNormalizer,
         )
 
         queue.onJobStateChange = { [collector] _, old, new in
@@ -1012,6 +1015,31 @@ final class WorkflowIntegrationTests: XCTestCase {
         XCTAssertEqual(
             h.queue.jobs.first?.echo?.suppressedSegments, 1,
             "the count is the only machine-readable evidence that anything was removed",
+        )
+    }
+
+    /// Terminology rules rewrite every segment's text. The rewrite must not
+    /// clear the mark on a loudspeaker copy, or with any rule configured the
+    /// far end is written twice again while the job reports it removed.
+    @MainActor
+    func testBleedIsWrittenOnceWithTerminologyRules() async throws {
+        let (h, _) = try makeHarness(terminologyRules: "Local Sentence => local sentense")
+        h.engine.segmentsToReturn = [
+            TimestampedSegment(start: 2, end: 28, text: "far end talking"),
+            TimestampedSegment(start: 32, end: 58, text: "local sentense"),
+        ]
+        let pair = try writeDedupPair(tmpDir.appendingPathComponent("dedup-terminology"), bleed: true)
+
+        await runDualSource(h, app: pair.app, mic: pair.mic)
+
+        let transcript = try String(
+            contentsOf: XCTUnwrap(h.queue.jobs.first?.transcriptPath), encoding: .utf8,
+        )
+        let kept = micLines(transcript)
+        XCTAssertEqual(kept.count, 1, "the echoed half must not be written a second time, got:\n\(transcript)")
+        XCTAssertTrue(
+            kept.first?.contains("Local Sentence") ?? false,
+            "the rule still applies to the line that stays, got: \(kept)",
         )
     }
 

@@ -514,12 +514,11 @@ extension PipelineQueue {
     ) -> [TimestampedSegment] {
         guard !normalizer.isEmpty else { return segments }
         return segments.map { segment in
-            TimestampedSegment(
-                start: segment.start,
-                end: segment.end,
-                text: normalizer.normalize(segment.text),
-                speaker: segment.speaker,
-            )
+            // A copy, not a rebuild: a rebuild dropped `suppressed` and put
+            // every loudspeaker copy back as soon as any rule was configured.
+            var normalized = segment
+            normalized.text = normalizer.normalize(segment.text)
+            return normalized
         }
     }
 
