@@ -40,6 +40,9 @@ struct NoCalendarLookup: CalendarMeetingLookup {
 /// rebuilding the loop.
 final class EventKitMeetingLookup: CalendarMeetingLookup {
     private let isEnabled: () -> Bool
+    /// Attendee spelling → the name speaker labels use; see
+    /// `ParticipantDisplayName`. Read per lookup, like `isEnabled`.
+    private let attendeeAliases: () -> [String: String]
     private let store = EKEventStore()
 
     /// The window scanned either side of the recording start. Wide enough for
@@ -47,8 +50,12 @@ final class EventKitMeetingLookup: CalendarMeetingLookup {
     /// that actually cover the start.
     private static let scanWindow: TimeInterval = 4 * 3600
 
-    init(isEnabled: @escaping () -> Bool) {
+    init(
+        isEnabled: @escaping () -> Bool,
+        attendeeAliases: @escaping () -> [String: String] = { ParticipantDisplayName.aliasesFromDefaults() },
+    ) {
         self.isEnabled = isEnabled
+        self.attendeeAliases = attendeeAliases
     }
 
     static var hasAccess: Bool {
@@ -73,7 +80,8 @@ final class EventKitMeetingLookup: CalendarMeetingLookup {
             end: now.addingTimeInterval(Self.scanWindow),
             calendars: nil,
         )
-        return store.events(matching: predicate).compactMap(Self.candidate)
+        let aliases = attendeeAliases()
+        return store.events(matching: predicate).compactMap { Self.candidate($0, aliases: aliases) }
     }
 
     func meeting(startingAt start: Date, appName: String) -> CalendarMeeting? {
@@ -94,16 +102,16 @@ final class EventKitMeetingLookup: CalendarMeetingLookup {
     /// `startDate` and `endDate` are implicitly unwrapped in EventKit; a nil
     /// here would crash after the audio is finalised and before the job
     /// exists, losing the recording, so they are unwrapped by hand.
-    private static func candidate(_ event: EKEvent) -> CalendarEventCandidate? {
+    private static func candidate(_ event: EKEvent, aliases: [String: String]) -> CalendarEventCandidate? {
         guard event.status != .canceled,
               let calendar = event.calendar as EKCalendar?,
               calendar.type != .birthday, calendar.type != .subscription,
               let start = event.startDate as Date?, let end = event.endDate as Date? else { return nil }
         let attendees = (event.attendees ?? []).compactMap { attendee -> String? in
             guard attendee.participantType == .person, !attendee.isCurrentUser else { return nil }
-            if let name = attendee.name, !name.isEmpty { return name }
+            if let name = attendee.name, !name.isEmpty { return ParticipantDisplayName.resolve(name, aliases: aliases) }
             let address = attendee.url.absoluteString.replacingOccurrences(of: "mailto:", with: "")
-            return address.isEmpty ? nil : address
+            return address.isEmpty ? nil : ParticipantDisplayName.resolve(address, aliases: aliases)
         }
         let me = (event.attendees ?? []).first(where: \.isCurrentUser)
         return CalendarEventCandidate(
