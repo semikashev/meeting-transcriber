@@ -986,6 +986,7 @@ extension PipelineQueue {
                     appName: job?.appName ?? "",
                     meetingStartTime: meetingStartTime,
                     participants: job?.participants ?? [],
+                    participantEmails: job?.participantEmails ?? [],
                 ),
                 protocolPath: mdPath,
                 warn: { [weak self] message in self?.addWarning(id: jobID, message) },

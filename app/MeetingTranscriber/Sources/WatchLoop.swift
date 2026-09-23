@@ -469,7 +469,7 @@ class WatchLoop {
         participants: [String] = [],
         calendarMayName: Bool = true,
     ) {
-        let (title, participants) = calendarNamed(
+        let (title, participants, participantEmails) = calendarNamed(
             title: title, participants: participants, appName: appName,
             recording: recording, calendarMayName: calendarMayName,
         )
@@ -511,6 +511,7 @@ class WatchLoop {
             micPath: recording.micPath,
             micDelay: recording.micDelay,
             participants: participants,
+            participantEmails: participantEmails.isEmpty ? nil : participantEmails,
             meetingStartTime: recording.recordingStartDate,
         )
         pipelineQueue?.enqueue(job)

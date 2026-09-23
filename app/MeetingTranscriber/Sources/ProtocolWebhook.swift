@@ -12,8 +12,9 @@ private let logger = Logger(subsystem: AppPaths.logSubsystem, category: "Protoco
 /// Keychain, because webhook URLs usually embed their token (a Multica
 /// autopilot webhook does). No URL stored — nothing is sent.
 ///
-/// Delivery is best-effort and off the pipeline's critical path: a failure is
-/// logged and surfaced as a job warning, never as a failed job. Retries share
+/// Delivery is off the pipeline's critical path: a failure is logged and
+/// surfaced as a job warning, never as a failed job, and the payload waits in
+/// `ProtocolWebhookOutbox` for a later attempt. Retries share
 /// one `Idempotency-Key` per job, so a receiver that honours it (Multica
 /// does) turns a retry or a late-naming regeneration into the same delivery
 /// instead of a second one.
@@ -31,7 +32,7 @@ enum ProtocolWebhook {
 
     static let fullTranscriptMarker = "\n\n---\n\n## Full Transcript\n\n"
 
-    struct Payload: Encodable, Equatable {
+    struct Payload: Codable, Equatable {
         var event = "protocol.ready"
         var version = 1
         let jobID: String
@@ -39,6 +40,11 @@ enum ProtocolWebhook {
         let app: String
         let meetingStart: String?
         let participants: [String]
+        /// Calendar attendees' addresses. Left out when there are none, as
+        /// payloads sent before the field existed leave it out, so a receiver
+        /// has one case to handle. Added within version 1: no existing field
+        /// changed.
+        let participantEmails: [String]? // swiftlint:disable:this discouraged_optional_collection
         let protocolFilename: String
         let protocolMarkdown: String
         /// The markdown was cut to `maxMarkdownBytes`; the full file stays on
@@ -49,6 +55,7 @@ enum ProtocolWebhook {
             case event, version, title, app, participants, truncated
             case jobID = "job_id"
             case meetingStart = "meeting_start"
+            case participantEmails = "participant_emails"
             case protocolFilename = "protocol_filename"
             case protocolMarkdown = "protocol_markdown"
         }
@@ -60,6 +67,7 @@ enum ProtocolWebhook {
         let appName: String
         let meetingStartTime: Date?
         let participants: [String]
+        var participantEmails: [String] = []
     }
 
     static func configuredURL(read: (String) -> String? = KeychainHelper.read(key:)) -> URL? {
@@ -73,8 +81,8 @@ enum ProtocolWebhook {
 
     static func makePayload(job: JobInfo, markdown: String, protocolFilename: String) -> Payload {
         let (body, truncated) = fit(markdown, limit: maxMarkdownBytes)
-        let start = job.meetingStartTime.map {
-            ISO8601DateFormatter.string(from: $0, timeZone: .current, formatOptions: [.withInternetDateTime])
+        let start = job.meetingStartTime.map { date in
+            ISO8601DateFormatter.string(from: date, timeZone: .current, formatOptions: [.withInternetDateTime])
         }
         return Payload(
             jobID: job.jobID.uuidString,
@@ -82,6 +90,7 @@ enum ProtocolWebhook {
             app: job.appName,
             meetingStart: start,
             participants: job.participants,
+            participantEmails: job.participantEmails.isEmpty ? nil : job.participantEmails,
             protocolFilename: protocolFilename,
             protocolMarkdown: body,
             truncated: truncated,
@@ -151,8 +160,10 @@ enum ProtocolWebhook {
                 switch http.statusCode {
                 case 200 ..< 300:
                     return .delivered(status: http.statusCode)
+
                 case 408, 429, 500...:
                     lastFailure = "HTTP \(http.statusCode)"
+
                 default:
                     return .rejected(status: http.statusCode)
                 }
@@ -161,6 +172,46 @@ enum ProtocolWebhook {
             }
         }
         return .failed(lastFailure)
+    }
+
+    static let defaultRetryDelays: [Duration] = [.seconds(5), .seconds(30), .seconds(120)]
+
+    /// Send one payload and settle its place in the outbox: queued when it
+    /// could not be delivered, removed when it was delivered or rejected. A
+    /// delivery proves the receiver is reachable again, so whatever waited in
+    /// the outbox goes next; what that flush gave up on goes to `notify`.
+    static func deliver(
+        _ payload: Payload,
+        to url: URL,
+        outbox: ProtocolWebhookOutbox,
+        session: URLSession = .shared,
+        retryDelays: [Duration] = defaultRetryDelays,
+        sleep: (Duration) async throws -> Void = { try await Task.sleep(for: $0) },
+        notify: @Sendable (String) -> Void = { _ in },
+    ) async -> Outcome {
+        let outcome: Outcome
+        do {
+            outcome = try await send(
+                makeRequest(url: url, payload: payload), session: session, retryDelays: retryDelays, sleep: sleep,
+            )
+        } catch {
+            // Encoding a plain struct of strings does not fail in practice;
+            // if it ever did, a retry would fail the same way.
+            outcome = .rejected(status: 0)
+        }
+        switch outcome {
+        case .delivered:
+            await outbox.remove(jobID: payload.jobID)
+            let report = await outbox.flush(url: url, session: session)
+            if let message = ProtocolWebhookOutbox.notice(for: report) { notify(message) }
+
+        case .rejected:
+            await outbox.remove(jobID: payload.jobID)
+
+        case .failed:
+            await outbox.save(payload)
+        }
+        return outcome
     }
 
     /// Fire-and-forget entry point for the pipeline. `warn` runs on the main
@@ -179,21 +230,29 @@ enum ProtocolWebhook {
                 let payload = makePayload(
                     job: job, markdown: markdown, protocolFilename: protocolPath.lastPathComponent,
                 )
-                outcome = try await send(makeRequest(url: url, payload: payload))
+                outcome = await deliver(payload, to: url, outbox: .shared, notify: notifyUser)
             } catch {
                 outcome = .failed("could not read protocol")
             }
             switch outcome {
             case let .delivered(status):
                 logger.info("[\(shortID, privacy: .public)] protocol_webhook_delivered status=\(status, privacy: .public)")
+
             case let .rejected(status):
                 logger.error("[\(shortID, privacy: .public)] protocol_webhook_rejected status=\(status, privacy: .public)")
                 await warn("Protocol webhook rejected (HTTP \(status))")
+
             case let .failed(reason):
                 logger.error("[\(shortID, privacy: .public)] protocol_webhook_failed reason=\(reason, privacy: .public)")
-                await warn("Protocol webhook not delivered")
+                await warn("Protocol webhook not delivered yet; queued for retry")
             }
         }
+    }
+
+    /// Where outbox notices go: they concern protocols whose jobs may be long
+    /// gone, so a notification rather than a job warning.
+    static let notifyUser: @Sendable (String) -> Void = { message in
+        NotificationManager.shared.notify(title: "Protocol webhook", body: message)
     }
 }
 

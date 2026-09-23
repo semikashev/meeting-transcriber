@@ -17,20 +17,21 @@ extension WatchLoop {
     /// `calendarMayName` is false for a title the user typed: that is a
     /// decision, not a fallback. Participants the app read from the call
     /// (Teams) are what was actually said, so the invite list only fills in
-    /// when there is nothing.
+    /// when there is nothing. Attendee emails come from the invite whatever
+    /// the participants' source: they only feed the protocol webhook.
     func calendarNamed(
         title: String,
         participants: [String],
         appName: String,
         recording: RecordingResult,
         calendarMayName: Bool,
-    ) -> (title: String, participants: [String]) {
-        guard calendarMayName else { return (title, participants) }
+    ) -> (title: String, participants: [String], participantEmails: [String]) {
+        guard calendarMayName else { return (title, participants, []) }
         let start = recording.recordingStartDate == .distantPast ? nowProvider() : recording.recordingStartDate
         guard let meeting = calendarLookup.meeting(startingAt: start, appName: appName) else {
-            return (title, participants)
+            return (title, participants, [])
         }
         logger.info("Recording named after calendar event: \(meeting.title, privacy: .private)")
-        return (meeting.title, participants.isEmpty ? meeting.attendees : participants)
+        return (meeting.title, participants.isEmpty ? meeting.attendees : participants, meeting.attendeeEmails)
     }
 }

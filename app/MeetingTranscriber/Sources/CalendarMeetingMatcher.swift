@@ -16,6 +16,10 @@ struct CalendarEventCandidate: Equatable, Sendable {
     /// in-room prompt cares: a recording is still named after the event it
     /// happens to fall into.
     var isDeclined = false
+    /// Email addresses of the same attendees, where the invitation carries
+    /// one. Defaulted for the same reason as `isDeclined`: only the protocol
+    /// webhook reads them.
+    var attendeeEmails: [String] = []
 }
 
 /// What the pipeline learns from a calendar match: the title the recording is
@@ -27,6 +31,8 @@ struct CalendarMeeting: Equatable, Sendable {
     /// The event carries a link to a conference the app in use could be
     /// showing. Defaulted because most readers only want the name.
     var hasConferenceLink = false
+    /// See `CalendarEventCandidate.attendeeEmails`.
+    var attendeeEmails: [String] = []
 
     /// A meeting with other people in it, as opposed to a block the user put
     /// on their own calendar: somebody was invited, or there is a call to
@@ -102,6 +108,7 @@ enum CalendarMeetingMatcher {
             title: top.0.title.trimmingCharacters(in: .whitespacesAndNewlines),
             attendees: top.0.attendees,
             hasConferenceLink: hasConferenceLink(top.0, forApp: appName),
+            attendeeEmails: top.0.attendeeEmails,
         )
         return Match(meeting: meeting, isAmbiguous: scored.filter { $0.1 == top.1 }.count > 1)
     }

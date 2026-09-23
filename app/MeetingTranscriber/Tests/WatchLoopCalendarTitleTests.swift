@@ -72,6 +72,27 @@ final class WatchLoopCalendarTitleTests: XCTestCase {
         XCTAssertEqual(lookup.askedAppName, "Microsoft Teams")
     }
 
+    func testCalendarAddressesReachTheJobEvenWhenTheAppReadNames() async throws {
+        var meeting = CalendarMeeting(title: "Weekly sync", attendees: ["Anna", "Ben"])
+        meeting.attendeeEmails = ["anna@example.com", "ben@example.org"]
+        let queue = PipelineQueue()
+        let (loop, _) = makeLoop(lookup: StubCalendarLookup(answer: meeting), queue: queue)
+
+        try await loop.handleMeeting(teamsMeeting)
+
+        let job = try XCTUnwrap(queue.jobs.first)
+        XCTAssertEqual(job.participantEmails, ["anna@example.com", "ben@example.org"])
+    }
+
+    func testNoCalendarMatchLeavesNoAddresses() async throws {
+        let queue = PipelineQueue()
+        let (loop, _) = makeLoop(lookup: StubCalendarLookup(answer: nil), queue: queue)
+
+        try await loop.handleMeeting(teamsMeeting)
+
+        XCTAssertNil(try XCTUnwrap(queue.jobs.first).participantEmails)
+    }
+
     func testWithoutACalendarMatchTheWindowTitleStays() async throws {
         let queue = PipelineQueue()
         let (loop, _) = makeLoop(lookup: StubCalendarLookup(answer: nil), queue: queue)
