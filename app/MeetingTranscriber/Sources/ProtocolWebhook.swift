@@ -23,7 +23,11 @@ enum ProtocolWebhook {
     /// Protocols run to tens of kilobytes; a long meeting with the full
     /// transcript appended can pass half a megabyte. Receivers cap request
     /// bodies, so past this size the transcript goes first, then the tail.
-    static let maxMarkdownBytes = 256 * 1024
+    /// Multica caps the whole body at 256 KiB and answers 413, which is not
+    /// retried; the margin covers JSON escaping (a newline or a quote takes
+    /// two bytes) and the other fields.
+    static let maxMarkdownBytes = 200 * 1024
+    static let maxBodyBytes = 256 * 1024
 
     static let fullTranscriptMarker = "\n\n---\n\n## Full Transcript\n\n"
 
@@ -175,7 +179,7 @@ enum ProtocolWebhook {
                 let payload = makePayload(
                     job: job, markdown: markdown, protocolFilename: protocolPath.lastPathComponent,
                 )
-                outcome = await send(try makeRequest(url: url, payload: payload))
+                outcome = try await send(makeRequest(url: url, payload: payload))
             } catch {
                 outcome = .failed("could not read protocol")
             }

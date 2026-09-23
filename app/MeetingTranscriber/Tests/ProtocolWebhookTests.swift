@@ -48,8 +48,8 @@ final class ProtocolWebhookTests: XCTestCase {
         XCTAssertNil(ProtocolWebhook.configuredURL { _ in "not a url" })
     }
 
-    func testFingerprintNeverContainsThePath() {
-        let url = URL(string: "https://multica.example/api/webhooks/autopilots/secret-token")!
+    func testFingerprintNeverContainsThePath() throws {
+        let url = try XCTUnwrap(URL(string: "https://multica.example/api/webhooks/autopilots/secret-token"))
         let fingerprint = ProtocolWebhook.fingerprint(of: url)
         XCTAssertTrue(fingerprint.hasPrefix("multica.example · "))
         XCTAssertFalse(fingerprint.contains("secret"))
@@ -59,7 +59,7 @@ final class ProtocolWebhookTests: XCTestCase {
 
     func testPayloadCarriesMeetingFieldsAndProtocol() throws {
         let payload = ProtocolWebhook.makePayload(job: job, markdown: "## Summary\nok", protocolFilename: "a.md")
-        let request = try ProtocolWebhook.makeRequest(url: URL(string: "https://h/x")!, payload: payload)
+        let request = try ProtocolWebhook.makeRequest(url: XCTUnwrap(URL(string: "https://h/x")), payload: payload)
         XCTAssertEqual(request.httpMethod, "POST")
         XCTAssertEqual(request.value(forHTTPHeaderField: "Content-Type"), "application/json")
         XCTAssertEqual(request.value(forHTTPHeaderField: "Idempotency-Key"), job.jobID.uuidString)
@@ -82,6 +82,16 @@ final class ProtocolWebhookTests: XCTestCase {
         let (text, truncated) = ProtocolWebhook.fit(markdown, limit: 100)
         XCTAssertEqual(text, head)
         XCTAssertTrue(truncated)
+    }
+
+    func testCutProtocolStaysUnderReceiverBodyCap() throws {
+        // No transcript marker, so the text itself is cut; short lines with
+        // quotes are the worst realistic case for JSON escaping.
+        let markdown = String(repeating: "[Анна] Проверим \"квоту\".\n", count: 20000)
+        let payload = ProtocolWebhook.makePayload(job: job, markdown: markdown, protocolFilename: "a.md")
+        let request = try ProtocolWebhook.makeRequest(url: XCTUnwrap(URL(string: "https://h/x")), payload: payload)
+        XCTAssertTrue(payload.truncated)
+        XCTAssertLessThanOrEqual(try XCTUnwrap(request.httpBody).count, ProtocolWebhook.maxBodyBytes)
     }
 
     func testFitCutsOnCharacterBoundary() {
