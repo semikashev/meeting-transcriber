@@ -93,6 +93,9 @@ struct MeetingTranscriberApp: App {
         // (`PipelineController.makeQueue`): a crashed `_app_raw.tmp` must be
         // re-mixed by `recoverCrashedRecordings` BEFORE it's cleaned up, so the
         // delete can no longer run first here (issue #379).
+        // Edit shortcuts in text fields must not depend on the main menu of
+        // an agent app; see `TextEditingShortcuts`.
+        TextEditingShortcuts.install()
         // Protocols the webhook could not deliver wait on disk; retry them now
         // and then periodically. Here rather than in `AppState`, which unit
         // tests construct.
