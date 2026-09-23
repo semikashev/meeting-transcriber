@@ -41,6 +41,12 @@ struct OutputSettingsView: View {
     @State private var didAttemptConnectionTest = false
     @State private var showResetPromptConfirmation = false
     @State private var hasCustomPrompt = false
+    @State private var webhookDraft = ""
+    @State private var webhookStatus: String?
+
+    private func refreshWebhookStatus() {
+        webhookStatus = ProtocolWebhook.configuredURL().map(ProtocolWebhook.fingerprint(of:))
+    }
 
     enum ConnectionTestResult {
         case success(String)
@@ -76,6 +82,27 @@ struct OutputSettingsView: View {
                 }
             }
             .accessibilityIdentifier(A11yID.outputFolderSection)
+
+            Section("Protocol Webhook") {
+                HStack {
+                    SecureField("https://… (stored in Keychain)", text: $webhookDraft)
+                    Button("Save") {
+                        KeychainHelper.save(key: ProtocolWebhook.keychainKey, value: webhookDraft)
+                        webhookDraft = ""
+                        refreshWebhookStatus()
+                    }
+                    .disabled(webhookDraft.isEmpty)
+                    Button("Clear") {
+                        KeychainHelper.delete(key: ProtocolWebhook.keychainKey)
+                        refreshWebhookStatus()
+                    }
+                    .disabled(webhookStatus == nil)
+                }
+                Text(webhookStatus.map { "POST each saved protocol to \($0)" } ?? "Off — no URL saved")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .onAppear(perform: refreshWebhookStatus)
 
             Section("Protocol Generation") {
                 Toggle("Include full transcript in protocol", isOn: $settings.includeFullTranscriptInProtocol)

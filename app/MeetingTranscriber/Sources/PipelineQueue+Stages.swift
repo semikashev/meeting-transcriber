@@ -975,6 +975,21 @@ extension PipelineQueue {
             if let idx = jobs.firstIndex(where: { $0.id == jobID }) {
                 jobs[idx].protocolPath = mdPath
             }
+            // Every path that produces a protocol ends here (pipeline, naming
+            // confirm/skip, late rerun, resume), so this is the one place the
+            // webhook needs. Same job id on a regeneration → same
+            // Idempotency-Key, and the receiver keeps the first delivery.
+            ProtocolWebhook.deliverIfConfigured(
+                job: .init(
+                    jobID: jobID,
+                    title: job?.meetingTitle ?? title,
+                    appName: job?.appName ?? "",
+                    meetingStartTime: meetingStartTime,
+                    participants: job?.participants ?? [],
+                ),
+                protocolPath: mdPath,
+                warn: { [weak self] message in self?.addWarning(id: jobID, message) },
+            )
             stopElapsedTimer()
         } catch {
             // Every ProtocolGenerating error's message is now guaranteed
