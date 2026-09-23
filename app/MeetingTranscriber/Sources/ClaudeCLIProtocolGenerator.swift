@@ -18,10 +18,33 @@
         /// previously-working install (both measured — see PR #692 review).
         let anthropicAPIKey: String?
 
-        init(claudeBin: String, language: String, anthropicAPIKey: String? = nil) {
+        /// Extra system-prompt text (glossary of names, products and terms),
+        /// passed via `--append-system-prompt`. Nil or empty — nothing appended.
+        let protocolContext: String?
+
+        init(claudeBin: String, language: String, anthropicAPIKey: String? = nil, protocolContext: String? = nil) {
             self.claudeBin = claudeBin
             self.language = language
             self.anthropicAPIKey = anthropicAPIKey
+            self.protocolContext = protocolContext
+        }
+
+        /// Protocol generation is a single text-in/text-out turn: no tools,
+        /// skills or MCP servers are needed. Dropping their definitions cut the
+        /// fixed input of a run from ~45.5k to ~15.2k tokens (measured
+        /// 2026-09-23, Claude Code 2.1.280, `--model sonnet`).
+        static let leanSessionArgs = ["--tools", "", "--disable-slash-commands", "--strict-mcp-config"]
+
+        /// Placeholder in the protocol context template that is replaced with
+        /// the custom vocabulary terms, so the glossary follows the ASR
+        /// dictionary without a second copy.
+        static let vocabularyPlaceholder = "{{vocabulary}}"
+
+        static func composeProtocolContext(template: String, vocabularyTerms: [String]) -> String {
+            template.replacingOccurrences(
+                of: vocabularyPlaceholder,
+                with: vocabularyTerms.joined(separator: ", "),
+            )
         }
 
         static let timeoutSeconds: TimeInterval = 600
@@ -47,7 +70,7 @@
             let process = Process()
             let resolvedBin = Self.resolveClaudePath(claudeBin)
             process.executableURL = URL(fileURLWithPath: resolvedBin)
-            process.arguments = Self.buildSubprocessArgs(claudeBin: claudeBin, resolvedBin: resolvedBin)
+            process.arguments = Self.buildSubprocessArgs(claudeBin: claudeBin, resolvedBin: resolvedBin, protocolContext: protocolContext)
             process.environment = Self.buildEnvironment(
                 baseEnvironment: ProcessInfo.processInfo.environment,
                 searchPaths: Self.searchPaths,
@@ -410,8 +433,12 @@
         /// Build the CLI argument vector. When `resolvedBin` is the
         /// `/usr/bin/env` fallback, prepend `claudeBin` so env can resolve
         /// it from PATH.
-        static func buildSubprocessArgs(claudeBin: String, resolvedBin: String) -> [String] {
+        static func buildSubprocessArgs(claudeBin: String, resolvedBin: String, protocolContext: String? = nil) -> [String] {
             var args = ["-p", "-", "--output-format", "stream-json", "--verbose", "--model", "sonnet"]
+            args += leanSessionArgs
+            if let protocolContext, !protocolContext.isEmpty {
+                args += ["--append-system-prompt", protocolContext]
+            }
             if resolvedBin == "/usr/bin/env" {
                 args.insert(claudeBin, at: 0)
             }

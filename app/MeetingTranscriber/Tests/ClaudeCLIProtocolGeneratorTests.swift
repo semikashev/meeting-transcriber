@@ -124,7 +124,8 @@
             )
             XCTAssertEqual(
                 args,
-                ["-p", "-", "--output-format", "stream-json", "--verbose", "--model", "sonnet"],
+                ["-p", "-", "--output-format", "stream-json", "--verbose", "--model", "sonnet"]
+                    + ClaudeCLIProtocolGenerator.leanSessionArgs,
             )
         }
 
@@ -137,8 +138,52 @@
             )
             XCTAssertEqual(
                 args,
-                ["claude-work", "-p", "-", "--output-format", "stream-json", "--verbose", "--model", "sonnet"],
+                ["claude-work", "-p", "-", "--output-format", "stream-json", "--verbose", "--model", "sonnet"]
+                    + ClaudeCLIProtocolGenerator.leanSessionArgs,
             )
+        }
+
+        func testLeanSessionArgsDisableToolsSkillsAndMCP() {
+            XCTAssertEqual(
+                ClaudeCLIProtocolGenerator.leanSessionArgs,
+                ["--tools", "", "--disable-slash-commands", "--strict-mcp-config"],
+            )
+        }
+
+        func testBuildSubprocessArgsAppendsProtocolContext() {
+            let args = ClaudeCLIProtocolGenerator.buildSubprocessArgs(
+                claudeBin: "claude",
+                resolvedBin: "/opt/homebrew/bin/claude",
+                protocolContext: "Glossary: Acme",
+            )
+            XCTAssertEqual(Array(args.suffix(2)), ["--append-system-prompt", "Glossary: Acme"])
+        }
+
+        func testBuildSubprocessArgsSkipsEmptyProtocolContext() {
+            let args = ClaudeCLIProtocolGenerator.buildSubprocessArgs(
+                claudeBin: "claude",
+                resolvedBin: "/opt/homebrew/bin/claude",
+                protocolContext: "",
+            )
+            XCTAssertFalse(args.contains("--append-system-prompt"))
+        }
+
+        // MARK: - composeProtocolContext
+
+        func testComposeProtocolContextReplacesVocabularyPlaceholder() {
+            let text = ClaudeCLIProtocolGenerator.composeProtocolContext(
+                template: "Terms: {{vocabulary}}.",
+                vocabularyTerms: ["Acme", "Widget Pro"],
+            )
+            XCTAssertEqual(text, "Terms: Acme, Widget Pro.")
+        }
+
+        func testComposeProtocolContextWithoutPlaceholderKeepsTemplate() {
+            let text = ClaudeCLIProtocolGenerator.composeProtocolContext(
+                template: "No terms here.",
+                vocabularyTerms: ["Acme"],
+            )
+            XCTAssertEqual(text, "No terms here.")
         }
 
         // MARK: - buildEnvironment

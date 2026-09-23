@@ -484,6 +484,13 @@ final class AppSettings {
         var claudeBin: String {
             didSet { defaults.set(claudeBin, forKey: "claudeBin") }
         }
+
+        /// Template appended to the Claude CLI system prompt for protocol
+        /// generation; `{{vocabulary}}` is replaced with the custom vocabulary
+        /// terms (see `protocolContextText()`). No UI — `defaults write`.
+        var protocolContextPath: String {
+            didSet { defaults.set(protocolContextPath, forKey: "protocolContextPath") }
+        }
     #endif
 
     /// Default OpenAI-compatible endpoint — Ollama's base URL. Both the base
@@ -644,6 +651,7 @@ final class AppSettings {
         #else
             protocolProvider = storedProvider ?? .claudeCLI
             claudeBin = defaults.object(forKey: "claudeBin") as? String ?? "claude"
+            protocolContextPath = defaults.string(forKey: "protocolContextPath") ?? ""
         #endif
         protocolLanguage = defaults.string(forKey: "protocolLanguage") ?? "German"
         includeFullTranscriptInProtocol = defaults.object(forKey: "includeFullTranscriptInProtocol") as? Bool ?? true

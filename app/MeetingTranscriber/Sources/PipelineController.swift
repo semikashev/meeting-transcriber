@@ -197,6 +197,7 @@ final class PipelineController {
                     claudeBin: settings.claudeBin,
                     language: settings.protocolLanguage,
                     anthropicAPIKey: settings.claudeAPIKey.isEmpty ? nil : settings.claudeAPIKey,
+                    protocolContext: settings.protocolContextText(),
                 )
         #endif
 
