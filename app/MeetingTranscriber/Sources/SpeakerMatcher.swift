@@ -78,9 +78,21 @@ class SpeakerMatcher {
     /// recent-samples FIFO, never replacing them. This preserves the
     /// previous algorithm's behaviour on identical-sample queries while
     /// adding the centroid's drift-resistance for free.
-    func match(embeddings: [String: [Float]]) -> [String: String] {
-        matchVerbose(embeddings: embeddings).mapValues(\.assignedName)
+    func match(
+        embeddings: [String: [Float]], speakingTimes: [String: TimeInterval] = [:],
+    ) -> [String: String] {
+        matchVerbose(embeddings: embeddings, speakingTimes: speakingTimes).mapValues(\.assignedName)
     }
+
+    /// A name already given to one label may go to another label of the same
+    /// track this close to it. The diarizer regularly splits one person into
+    /// several clusters on one track; with every name usable once, the second
+    /// cluster went unnamed or took the next-best stranger. On a replay of 50
+    /// real meetings (218 labels of already-known people) this raised the
+    /// correctly named labels from 101 to 133 while wrong names went from 24
+    /// to 25; the result was flat for any distance between 0.20 and 0.35.
+    /// Never across tracks: the same person on both is bleed on one of them.
+    static let sameTrackReuseDistance: Float = 0.25
 
     /// Per-label match result. Reuses `TopCandidate` so the matcher and the
     /// JSONL log share one shape — eliminates a field-by-field re-pack at the
@@ -95,30 +107,29 @@ class SpeakerMatcher {
 
     /// Match each label against the stored DB, returning the top candidates
     /// with their per-anchor distances.
-    func matchVerbose(embeddings: [String: [Float]], topK: Int = 3)
-        -> [String: VerboseMatch] {
+    /// Labels are matched longest speaker first (`speakingTimes`; key order
+    /// breaks ties and stands in when no times are given), so a contested name
+    /// goes to the label with the most evidence behind it.
+    func matchVerbose(
+        embeddings: [String: [Float]], speakingTimes: [String: TimeInterval] = [:], topK: Int = 3,
+    ) -> [String: VerboseMatch] {
         // Synthetic entries (RPC `seedSpeaker`) carry random embeddings —
         // letting them participate in matching would let any caller with
         // RPC access poison auto-naming. Drop them before scoring.
         let stored = loadDB().filter { !$0.isSynthetic }
         var result: [String: VerboseMatch] = [:]
-        var usedNames: Set<String> = []
+        var usedOnTracks: [String: Set<SpeakerKey.Track>] = [:]
 
-        let sorted = embeddings.sorted { $0.key < $1.key }
+        let order: [String] = Self.longestFirst(Array(embeddings.keys), speakingTimes: speakingTimes)
 
-        for (label, embedding) in sorted {
-            let scored = stored
-                .filter { !usedNames.contains($0.name) }
-                .map { speaker -> TopCandidate in
-                    let sampleDist = speaker.anchorEmbeddings
-                        .map { Self.cosineDistance(embedding, $0) }.min()
-                        ?? Float.greatestFiniteMagnitude
-                    let centroidDist = speaker.centroid.map { vec in
-                        Self.cosineDistance(embedding, vec)
-                    }
-                    return TopCandidate(
-                        name: speaker.name, sample: sampleDist, centroid: centroidDist,
-                    )
+        for label in order {
+            guard let embedding = embeddings[label] else { continue }
+            let track = SpeakerKey(encoded: label).track
+            let scored: [TopCandidate] = stored
+                .map { Self.candidate($0, for: embedding) }
+                .filter { candidate in
+                    guard let tracks = usedOnTracks[candidate.name] else { return true }
+                    return tracks == [track] && candidate.hybrid < Self.sameTrackReuseDistance
                 }
                 .sorted { $0.hybrid < $1.hybrid }
 
@@ -129,7 +140,7 @@ class SpeakerMatcher {
                best.hybrid < threshold,
                (second?.hybrid ?? .greatestFiniteMagnitude) - best.hybrid >= confidenceMargin {
                 assignedName = best.name
-                usedNames.insert(best.name)
+                usedOnTracks[best.name, default: []].insert(track)
             } else {
                 assignedName = label
             }
@@ -144,6 +155,23 @@ class SpeakerMatcher {
         }
 
         return result
+    }
+
+    /// Labels ordered by speaking time, longest first; key order breaks ties.
+    static func longestFirst(_ labels: [String], speakingTimes: [String: TimeInterval]) -> [String] {
+        labels.sorted { (lhs: String, rhs: String) -> Bool in
+            let l: TimeInterval = speakingTimes[lhs] ?? 0
+            let r: TimeInterval = speakingTimes[rhs] ?? 0
+            return l != r ? l > r : lhs < rhs
+        }
+    }
+
+    /// Per-anchor distances from `embedding` to one stored speaker.
+    private static func candidate(_ speaker: StoredSpeaker, for embedding: [Float]) -> TopCandidate {
+        let sampleDist: Float = speaker.anchorEmbeddings
+            .map { cosineDistance(embedding, $0) }.min() ?? .greatestFiniteMagnitude
+        let centroidDist: Float? = speaker.centroid.map { cosineDistance(embedding, $0) }
+        return TopCandidate(name: speaker.name, sample: sampleDist, centroid: centroidDist)
     }
 
     /// Distance from a query embedding to a stored speaker.

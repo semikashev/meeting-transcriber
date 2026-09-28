@@ -299,7 +299,7 @@ extension SpeakerNamingSession {
         guard let embeddings = diarization.embeddings else { return nil }
 
         let matcher = speakerMatcherFactory()
-        var autoNames = matcher.match(embeddings: embeddings)
+        var autoNames = matcher.match(embeddings: embeddings, speakingTimes: diarization.speakingTimes)
         if !prior.participants.isEmpty {
             autoNames = SpeakerMatcher.preMatchParticipants(
                 mapping: autoNames,

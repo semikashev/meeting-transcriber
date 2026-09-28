@@ -307,7 +307,9 @@ enum VoiceEnrollmentLogic {
         let knownNames = matcher.allSpeakerNames()
         // Pre-fill auto-name suggestions by running a match against the
         // existing DB. Same flow as a real meeting.
-        let autoNames = diarization.embeddings.map { matcher.match(embeddings: $0) } ?? [:]
+        let autoNames = diarization.embeddings.map { embeddings in
+            matcher.match(embeddings: embeddings, speakingTimes: diarization.speakingTimes)
+        } ?? [:]
         let mapping = autoNames.isEmpty
             ? Dictionary(uniqueKeysWithValues: diarization.speakingTimes.keys.map { ($0, $0) })
             : autoNames

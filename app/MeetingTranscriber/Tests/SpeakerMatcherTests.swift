@@ -941,21 +941,79 @@ final class SpeakerMatcherTests: XCTestCase {
     }
 
     func testMatchIsDeterministicByKey() {
-        // Two speakers both close to the same stored speaker.
-        // Sorted by key, SPEAKER_0 < SPEAKER_1, so SPEAKER_0 claims the match first.
+        // Two labels on different tracks both close to the same stored speaker,
+        // no speaking times known. Sorted by key, the microphone label claims
+        // the match first, and a name is not reused across tracks.
         let matcher = SpeakerMatcher(dbPath: dbPath, threshold: 0.40, confidenceMargin: 0.0)
         let stored = [StoredSpeaker(name: "Speaker A", embeddings: [[1, 0, 0]])]
         matcher.saveDB(stored)
 
         let embeddings: [String: [Float]] = [
-            "SPEAKER_0": [0.95, 0.1, 0], // close to Speaker A
-            "SPEAKER_1": [0.96, 0.08, 0], // also close to Speaker A (even closer)
+            "M_SPEAKER_0": [0.95, 0.1, 0], // close to Speaker A
+            "R_SPEAKER_1": [0.96, 0.08, 0], // also close to Speaker A (even closer)
         ]
         let result = matcher.match(embeddings: embeddings)
 
-        // SPEAKER_0 is processed first (alphabetical) and claims "Speaker A"
-        XCTAssertEqual(result["SPEAKER_0"], "Speaker A", "First key alphabetically should win the match")
-        XCTAssertEqual(result["SPEAKER_1"], "SPEAKER_1", "Second speaker left unmatched")
+        XCTAssertEqual(result["M_SPEAKER_0"], "Speaker A", "First key alphabetically should win the match")
+        XCTAssertEqual(result["R_SPEAKER_1"], "R_SPEAKER_1", "Second speaker left unmatched")
+    }
+
+    // MARK: - match: order and name reuse
+
+    func testMatchGivesTheLongestSpeakerTheContestedName() {
+        // Key order would hand the name to the microphone label; the app label
+        // carries far more speech and is the better evidence of who this is.
+        let matcher = SpeakerMatcher(dbPath: dbPath, threshold: 0.40, confidenceMargin: 0.0)
+        matcher.saveDB([StoredSpeaker(name: "Speaker A", embeddings: [[1, 0, 0]])])
+        let result = matcher.match(
+            embeddings: ["M_S1": [0.99, 0.05, 0], "R_S1": [0.95, 0.1, 0]],
+            speakingTimes: ["M_S1": 5, "R_S1": 300],
+        )
+        XCTAssertEqual(result["R_S1"], "Speaker A")
+        XCTAssertEqual(result["M_S1"], "M_S1")
+    }
+
+    func testMatchNamesTwoClustersOfOneVoiceOnOneTrackAlike() {
+        // The diarizer split one person into two clusters on the same track:
+        // on a real corpus that was the largest single cause of the user's own
+        // voice going unnamed.
+        let matcher = SpeakerMatcher(dbPath: dbPath)
+        matcher.saveDB([
+            StoredSpeaker(name: "Speaker A", embeddings: [[1, 0, 0]], centroid: [1, 0, 0]),
+            StoredSpeaker(name: "Speaker B", embeddings: [[0, 1, 0]], centroid: [0, 1, 0]),
+        ])
+        let result = matcher.match(
+            embeddings: ["M_S1": [1, 0.02, 0], "M_S2": [0.97, 0.15, 0]],
+            speakingTimes: ["M_S1": 400, "M_S2": 40],
+        )
+        XCTAssertEqual(result["M_S1"], "Speaker A")
+        XCTAssertEqual(result["M_S2"], "Speaker A")
+    }
+
+    func testMatchDoesNotReuseANameBeyondTheReuseDistance() {
+        let matcher = SpeakerMatcher(dbPath: dbPath, threshold: 0.40, confidenceMargin: 0.0)
+        matcher.saveDB([StoredSpeaker(name: "Speaker A", embeddings: [[1, 0, 0]], centroid: [1, 0, 0])])
+        // Second cluster within the match threshold (~0.32) but past the reuse
+        // distance: a similar voice, not necessarily the same person.
+        let result = matcher.match(
+            embeddings: ["M_S1": [1, 0, 0], "M_S2": [0.68, 0.73, 0]],
+            speakingTimes: ["M_S1": 400, "M_S2": 40],
+        )
+        XCTAssertEqual(result["M_S1"], "Speaker A")
+        XCTAssertEqual(result["M_S2"], "M_S2")
+    }
+
+    func testMatchDoesNotReuseANameAcrossTracks() {
+        // The same person on both tracks is bleed on one of them: naming the
+        // bleed cluster after them would put their name on the other side's words.
+        let matcher = SpeakerMatcher(dbPath: dbPath)
+        matcher.saveDB([StoredSpeaker(name: "Speaker A", embeddings: [[1, 0, 0]], centroid: [1, 0, 0])])
+        let result = matcher.match(
+            embeddings: ["R_S1": [1, 0, 0], "M_S3": [0.99, 0.05, 0]],
+            speakingTimes: ["R_S1": 400, "M_S3": 30],
+        )
+        XCTAssertEqual(result["R_S1"], "Speaker A")
+        XCTAssertEqual(result["M_S3"], "M_S3")
     }
 
     // MARK: - matchVerbose

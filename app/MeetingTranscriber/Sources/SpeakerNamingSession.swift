@@ -293,7 +293,7 @@ final class SpeakerNamingSession {
         guard let embeddings = diarization.embeddings else { return diarization.autoNames }
 
         let matcher = speakerMatcherFactory()
-        let verbose = matcher.matchVerbose(embeddings: embeddings)
+        let verbose = matcher.matchVerbose(embeddings: embeddings, speakingTimes: diarization.speakingTimes)
         let matched = verbose.mapValues(\.assignedName)
         var autoNames = matched
         let topCandidates = verbose.mapValues(\.topCandidates)
