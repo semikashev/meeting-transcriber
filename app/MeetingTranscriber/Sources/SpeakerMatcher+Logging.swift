@@ -40,4 +40,23 @@ extension SpeakerMatcher {
             )
         }
     }
+
+    /// One line per label that was confirmed but not learned, so a voice that
+    /// never improves can be traced to the gate that held it back.
+    static func logAdmissions(_ outcome: [String: SampleAdmission]) {
+        for (label, admission) in outcome.sorted(by: { $0.key < $1.key }) {
+            switch admission {
+            case .admitted:
+                continue
+
+            case .tooShort:
+                logger.info("speaker_sample_held label=\(label, privacy: .public) reason=too_short")
+
+            case let .ambiguous(nearest):
+                logger.info(
+                    "speaker_sample_held label=\(label, privacy: .public) reason=ambiguous nearest=\(nearest.pseudonymized, privacy: .public)",
+                )
+            }
+        }
+    }
 }

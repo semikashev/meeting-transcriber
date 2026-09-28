@@ -4751,7 +4751,9 @@ final class PipelineQueueTests: XCTestCase {
         let seeded = SpeakerMatcher(dbPath: dbURL)
         seeded.updateDB(
             mapping: ["S0": "Alice", "S1": "Bob"],
-            embeddings: ["S0": [0.1, 0.2], "S1": [0.3, 0.4]],
+            // Two distinct voices: near-parallel vectors would read as one
+            // voice under two names, and the second would not be learned.
+            embeddings: ["S0": [1, 0], "S1": [0, 1]],
         )
 
         let localQueue = PipelineQueue(

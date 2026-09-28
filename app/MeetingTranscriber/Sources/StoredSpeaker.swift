@@ -99,6 +99,20 @@ struct StoredSpeaker: Codable, Identifiable {
         }
     }
 
+    /// Copy of this speaker with one more confirmed use at `date` and nothing
+    /// else changed: a naming that counts for chip ranking but taught no voice.
+    func recordingUse(at date: Date) -> Self {
+        Self(
+            name: name,
+            embeddings: embeddings,
+            centroid: centroid,
+            centroidSampleCount: centroidSampleCount,
+            lastUsed: date,
+            useCount: useCount + 1,
+            isSynthetic: isSynthetic,
+        )
+    }
+
     /// Copy of this speaker with a new `name`, preserving all other fields.
     /// Used by `SpeakerMatcher.renameSpeaker`; centralises the field list so
     /// future additions don't have to be threaded through the rename site.
