@@ -23,6 +23,7 @@ final class SpeakerNamingSessionTests: XCTestCase {
         /// the call count because the echo quarantine is invisible in the count:
         /// the write still happens, it just carries less.
         private(set) var updateSpeakerDBEmbeddings: [[String: [Float]]] = []
+        private(set) var updateSpeakerDBProvenance: [SampleProvenance] = []
         private(set) var metadataUpdates: [(jobID: UUID, slug: String?, mode: DiarizerMode?)] = []
         private(set) var stageStartCount = 0
         private(set) var stageEndCount = 0
@@ -47,7 +48,9 @@ final class SpeakerNamingSessionTests: XCTestCase {
         func updateSpeakerDB(
             matcher _: SpeakerMatcher, mapping _: [String: String],
             embeddings: [String: [Float]], speakingTimes _: [String: TimeInterval],
+            provenance: SampleProvenance,
         ) {
+            updateSpeakerDBProvenance.append(provenance)
             updateSpeakerDBCallCount += 1
             updateSpeakerDBEmbeddings.append(embeddings)
         }
@@ -266,6 +269,11 @@ final class SpeakerNamingSessionTests: XCTestCase {
         let written = try XCTUnwrap(mock.updateSpeakerDBEmbeddings.first)
         XCTAssertNil(written[local], "The microphone copy of a remote voice is bleed and must not be learned")
         XCTAssertEqual(written[remote], [1, 0, 0])
+        XCTAssertEqual(
+            mock.updateSpeakerDBProvenance.first,
+            SampleProvenance(origin: .meeting, jobID: job.id, meetingTitle: "Standup"),
+            "Each learned sample must say which recording taught it, or it cannot be undone",
+        )
     }
 
     // MARK: - Confirm
@@ -388,6 +396,7 @@ final class SpeakerNamingSessionTests: XCTestCase {
         func updateSpeakerDB(
             matcher _: SpeakerMatcher, mapping _: [String: String],
             embeddings _: [String: [Float]], speakingTimes _: [String: TimeInterval],
+            provenance _: SampleProvenance,
         ) {}
 
         func generateProtocol(jobID _: UUID, transcript _: String, title _: String, protocolsDir _: URL) async {

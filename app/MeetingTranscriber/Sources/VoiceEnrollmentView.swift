@@ -256,6 +256,7 @@ enum VoiceEnrollmentLogic {
         _ result: PipelineQueue.SpeakerNamingResult,
         payload: VoiceEnrollmentView.NamingPayload,
         matcher: SpeakerMatcher,
+        asReference: Bool = false,
     ) -> Outcome {
         switch result {
         case let .confirmed(mapping):
@@ -266,6 +267,9 @@ enum VoiceEnrollmentLogic {
                 mapping: mapping,
                 embeddings: embeddings,
                 speakingTimes: payload.diarization.speakingTimes,
+                provenance: SampleProvenance(
+                    origin: .enrollment, meetingTitle: payload.url.lastPathComponent, pinned: asReference,
+                ),
             )
             let saved = Set(mapping.values.filter { !$0.isEmpty }).sorted()
             return .stage(.done(savedNames: saved))

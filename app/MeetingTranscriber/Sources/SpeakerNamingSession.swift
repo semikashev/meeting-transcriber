@@ -26,6 +26,7 @@ protocol SpeakerNamingSessionDelegate: AnyObject {
     func updateSpeakerDB(
         matcher: SpeakerMatcher, mapping: [String: String],
         embeddings: [String: [Float]], speakingTimes: [String: TimeInterval],
+        provenance: SampleProvenance,
     )
     /// Run the LLM protocol generator over a transcript (a queue pipeline stage).
     func generateProtocol(jobID: UUID, transcript: String, title: String, protocolsDir: URL) async

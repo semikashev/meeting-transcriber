@@ -346,12 +346,14 @@ class PipelineQueue {
         matcher: SpeakerMatcher,
         mapping: [String: String],
         embeddings: [String: [Float]],
-        speakingTimes: [String: TimeInterval] = [:],
+        speakingTimes: [String: TimeInterval],
+        provenance: SampleProvenance,
     ) {
         matcher.updateDB(
             mapping: mapping,
             embeddings: embeddings,
             speakingTimes: speakingTimes,
+            provenance: provenance,
         )
         refreshKnownSpeakerNames()
     }

@@ -110,7 +110,7 @@ class SpeakerMatcher {
             let scored = stored
                 .filter { !usedNames.contains($0.name) }
                 .map { speaker -> TopCandidate in
-                    let sampleDist = speaker.embeddings
+                    let sampleDist = speaker.anchorEmbeddings
                         .map { Self.cosineDistance(embedding, $0) }.min()
                         ?? Float.greatestFiniteMagnitude
                     let centroidDist = speaker.centroid.map { vec in
@@ -151,7 +151,7 @@ class SpeakerMatcher {
     /// For legacy entries (no centroid persisted), the recent-samples FIFO
     /// is the sole anchor — which is identical to the pre-centroid algorithm.
     static func distance(query: [Float], speaker: StoredSpeaker) -> Float {
-        var anchors = speaker.embeddings
+        var anchors = speaker.anchorEmbeddings
         if let c = speaker.centroid { anchors.append(c) }
         return anchors.map { cosineDistance(query, $0) }.min() ?? .greatestFiniteMagnitude
     }
@@ -195,30 +195,6 @@ class SpeakerMatcher {
         return (updated, count + 1)
     }
 
-    /// Whether a confirmed embedding may teach the DB the voice it was named as.
-    enum SampleAdmission: Equatable {
-        case admitted
-        /// Less speech behind it than `minSpeakingTimeForSample`.
-        case tooShort
-        /// Already stands for another stored person at least as well as for
-        /// the named one (see `ambiguousSampleDistance`).
-        case ambiguous(nearest: String)
-    }
-
-    /// Minimum speaking time behind an embedding for it to be learned at all.
-    /// Below it the recent-samples FIFO used to take it anyway as a fallback;
-    /// matching takes the minimum over those samples, so one such vector
-    /// decided matches on its own.
-    static let minSpeakingTimeForSample: TimeInterval = 3.0
-    /// A confirmed embedding this close to another person's anchor is not
-    /// learned for the named one. Such a vector matches both people at once:
-    /// neither then clears `confidenceMargin`, the user types the name by
-    /// hand, and the same vector is written under yet another person. On a
-    /// real database this loop had spread one vector across eight people.
-    /// Distinct people's centroids sat no closer than 0.26 on that database,
-    /// so the radius does not reach a merely similar voice.
-    static let ambiguousSampleDistance: Float = 0.15
-
     /// Update speaker DB with confirmed names and their embeddings.
     /// - Each embedding first passes `sampleAdmission`: too little speech, or
     ///   a vector that already stands for someone else, is not learned. The
@@ -237,6 +213,7 @@ class SpeakerMatcher {
         mapping: [String: String],
         embeddings: [String: [Float]],
         speakingTimes: [String: TimeInterval] = [:],
+        provenance: SampleProvenance? = nil,
         now: Date = Date(),
     ) -> [String: SampleAdmission] {
         let confirmed = mapping
@@ -256,17 +233,24 @@ class SpeakerMatcher {
                 )
                 outcome[label] = admission
                 let idx = stored.firstIndex { $0.name == name }
+                var labelProvenance = provenance ?? SampleProvenance()
+                labelProvenance.track = SpeakerKey(encoded: label).track
                 switch (admission, idx) {
                 case let (.admitted, idx?):
                     stored[idx] = Self.applyConfirmation(
                         to: stored[idx], embedding: embedding, duration: duration ?? 0, now: now,
+                        provenance: labelProvenance,
                     )
+
                 case (.admitted, nil):
                     stored.append(Self.newSpeaker(
                         name: name, embedding: embedding, duration: duration ?? 0, now: now,
+                        provenance: labelProvenance,
                     ))
+
                 case let (_, idx?):
                     stored[idx] = stored[idx].recordingUse(at: now)
+
                 case (_, nil):
                     break
                 }
@@ -276,62 +260,22 @@ class SpeakerMatcher {
         }
     }
 
-    /// Pure: decide whether `embedding`, confirmed as `name`, may be learned.
-    /// A missing duration is not judged, so legacy callers keep their samples.
-    static func sampleAdmission(
-        _ embedding: [Float], named name: String, duration: TimeInterval?, against stored: [StoredSpeaker],
-    ) -> SampleAdmission {
-        if let duration, duration < minSpeakingTimeForSample { return .tooShort }
-        let own = stored.first { $0.name == name }
-            .map { distance(query: embedding, speaker: $0) } ?? .greatestFiniteMagnitude
-        let nearestOther = stored
-            .filter { $0.name != name && !$0.isSynthetic }
-            .map { (name: $0.name, distance: distance(query: embedding, speaker: $0)) }
-            .min { $0.distance < $1.distance }
-        if let nearestOther, nearestOther.distance < ambiguousSampleDistance, nearestOther.distance <= own {
-            return .ambiguous(nearest: nearestOther.name)
-        }
-        return .admitted
-    }
-
     /// Pure helper: fold a confirmed embedding into an existing `StoredSpeaker`.
-    /// Centroid is updated only when `duration >= minSpeakingTimeForCentroid`.
-    /// FIFO of recent samples is bumped unconditionally.
+    /// The embedding joins the history; it counts toward the centroid only
+    /// with `duration >= minSpeakingTimeForCentroid` and a dimension the
+    /// centroid can take, and is a recent-sample anchor either way.
     static func applyConfirmation(
         to speaker: StoredSpeaker, embedding: [Float], duration: TimeInterval, now: Date,
+        provenance: SampleProvenance? = nil,
     ) -> StoredSpeaker {
-        var samples = speaker.embeddings
-        samples.append(embedding)
-        if samples.count > maxRecentSamples {
-            samples.removeFirst(samples.count - maxRecentSamples)
-        }
-
-        let qualifies = duration >= minSpeakingTimeForCentroid
-        // Seed the centroid from the existing sample list on first qualifying
-        // confirmation after a v3 schema upgrade. Subsequent confirmations
-        // run the normal incremental update.
-        let seedCentroid = speaker.centroid ?? meanEmbedding(speaker.embeddings)
-        let seedCount = speaker.centroid != nil
-            ? speaker.centroidSampleCount
-            : (seedCentroid != nil ? speaker.embeddings.count : 0)
-
-        let nextCentroid: [Float]?
-        let nextCount: Int
-        if qualifies, let updated = updateCentroid(
-            current: seedCentroid, count: seedCount, with: embedding,
-        ) {
-            nextCentroid = updated.centroid
-            nextCount = updated.count
-        } else {
-            nextCentroid = seedCentroid
-            nextCount = seedCount
-        }
-
+        let dimensionFits = speaker.centroid.map { $0.count == embedding.count } ?? true
+        let sample = makeSample(
+            embedding: embedding, duration: duration, qualifies: dimensionFits,
+            now: now, provenance: provenance,
+        )
         return StoredSpeaker(
             name: speaker.name,
-            embeddings: samples,
-            centroid: nextCentroid,
-            centroidSampleCount: nextCount,
+            samples: speaker.appending(sample),
             lastUsed: now,
             useCount: speaker.useCount + 1,
         )
@@ -340,15 +284,30 @@ class SpeakerMatcher {
     /// Pure helper: build a fresh `StoredSpeaker` from a single confirmation.
     static func newSpeaker(
         name: String, embedding: [Float], duration: TimeInterval, now: Date,
+        provenance: SampleProvenance? = nil,
     ) -> StoredSpeaker {
-        let qualifies = duration >= minSpeakingTimeForCentroid
-        return StoredSpeaker(
-            name: name,
-            embeddings: [embedding],
-            centroid: qualifies ? embedding : nil,
-            centroidSampleCount: qualifies ? 1 : 0,
-            lastUsed: now,
-            useCount: 1,
+        let sample = makeSample(
+            embedding: embedding, duration: duration, qualifies: true,
+            now: now, provenance: provenance,
+        )
+        return StoredSpeaker(name: name, samples: [sample], lastUsed: now, useCount: 1)
+    }
+
+    private static func makeSample(
+        embedding: [Float], duration: TimeInterval, qualifies: Bool, now: Date,
+        provenance: SampleProvenance?,
+    ) -> VoiceSample {
+        let counts = qualifies && !embedding.isEmpty && duration >= minSpeakingTimeForCentroid
+        return VoiceSample(
+            embedding: embedding,
+            origin: provenance?.origin ?? .meeting,
+            centroidWeight: counts ? 1 : 0,
+            addedAt: now,
+            duration: duration > 0 ? duration : nil,
+            track: provenance?.track,
+            jobID: provenance?.jobID,
+            meetingTitle: provenance?.meetingTitle,
+            pinned: provenance?.pinned ?? false,
         )
     }
 
@@ -409,15 +368,21 @@ class SpeakerMatcher {
     /// Pure helper: combine `src` into `dst`. Used by both rename-collision
     /// and explicit merge.
     static func merged(into dst: StoredSpeaker, from src: StoredSpeaker) -> StoredSpeaker {
-        var samples = dst.embeddings + src.embeddings
-        if samples.count > maxRecentSamples {
-            samples.removeFirst(samples.count - maxRecentSamples)
+        // Both histories, destination first; the derived centroid is then the
+        // weighted average of both, exactly as `mergeCentroids` computes it.
+        var samples = dst.samples + src.samples
+        // Migrated recent samples were only ever FIFO anchors: keep as many as
+        // the old append-and-trim kept, the most recent ones.
+        let migratedRecent = samples.indices.filter { samples[$0].origin == .migratedSample }
+        let excess = migratedRecent.count - maxRecentSamples
+        if excess > 0 {
+            let drop = Set(migratedRecent.prefix(excess))
+            samples = samples.enumerated().filter { !drop.contains($0.offset) }.map(\.element)
         }
-        let combined = mergeCentroids(
-            a: dst.centroid, aCount: dst.centroidSampleCount,
-            b: src.centroid, bCount: src.centroidSampleCount,
-        )
-        let centroid = combined.centroid ?? meanEmbedding(samples)
+        while samples.count(where: { !$0.pinned }) > StoredSpeaker.maxHistory,
+              let oldest = samples.firstIndex(where: { !$0.pinned }) {
+            samples.remove(at: oldest)
+        }
         let lastUsed: Date? = switch (dst.lastUsed, src.lastUsed) {
         case let (a?, b?): max(a, b)
         case let (a?, nil): a
@@ -426,9 +391,7 @@ class SpeakerMatcher {
         }
         return StoredSpeaker(
             name: dst.name,
-            embeddings: samples,
-            centroid: centroid,
-            centroidSampleCount: combined.count,
+            samples: samples,
             lastUsed: lastUsed,
             useCount: dst.useCount + src.useCount,
             // Stay synthetic only when both sides are synthetic. Merging a

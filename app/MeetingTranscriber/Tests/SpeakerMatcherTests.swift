@@ -1154,16 +1154,24 @@ final class SpeakerMatcherTests: XCTestCase {
         XCTAssertTrue(bothSynthetic.isSynthetic)
     }
 
-    func testMergedDerivesCentroidFromSamplesWhenNeitherSideHasCentroid() {
-        // With no persisted centroid on either side, merged() falls back to the
-        // element-wise mean of the combined recent samples.
+    func testMergedKeepsCentroidlessEntriesLazyUntilARealSampleJoins() {
+        // Neither side ever had a centroid (pre-v3 entries). The merge keeps
+        // both samples as anchors and seeds nothing; the first qualifying
+        // confirmation then averages all of them, as it would have for either
+        // entry alone.
         let a = StoredSpeaker(name: "A", embeddings: [[1, 0]])
         let b = StoredSpeaker(name: "B", embeddings: [[0, 1]])
 
         let result = SpeakerMatcher.merged(into: a, from: b)
-        // mean of (1,0) and (0,1) = (0.5, 0.5)
-        XCTAssertEqual(result.centroid?[0] ?? 0, 0.5, accuracy: 0.001)
-        XCTAssertEqual(result.centroid?[1] ?? 0, 0.5, accuracy: 0.001)
+        XCTAssertNil(result.centroid)
+        XCTAssertEqual(result.embeddings, [[1, 0], [0, 1]])
+
+        let confirmed = SpeakerMatcher.applyConfirmation(
+            to: result, embedding: [1, 1], duration: 10, now: Self.testEpoch,
+        )
+        XCTAssertEqual(confirmed.centroid?[0] ?? 0, 2.0 / 3.0, accuracy: 0.001)
+        XCTAssertEqual(confirmed.centroid?[1] ?? 0, 2.0 / 3.0, accuracy: 0.001)
+        XCTAssertEqual(confirmed.centroidSampleCount, 3)
     }
 
     func testMergedTrimsCombinedSamplesToMostRecent() {

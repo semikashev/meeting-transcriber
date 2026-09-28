@@ -66,6 +66,9 @@ extension SpeakerNamingSession {
             // centroid-quality filter (short segments stay as fallback samples,
             // long ones seed the centroid) sees real durations.
             speakingTimes: namingData.speakingTimes,
+            // Recorded on each learned sample, so what this recording taught
+            // can later be found and undone (Known Voices).
+            provenance: SampleProvenance(origin: .meeting, jobID: jobID, meetingTitle: job.meetingTitle),
         )
 
         if let transcriptPath = job.transcriptPath {
