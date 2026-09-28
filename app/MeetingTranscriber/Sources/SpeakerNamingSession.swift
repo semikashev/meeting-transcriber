@@ -156,7 +156,7 @@ final class SpeakerNamingSession {
         case let .confirmed(userMapping):
             recordRecognition(
                 jobID: jobID, title: data.meetingTitle,
-                userMapping: userMapping, fallback: data.mapping,
+                userMapping: userMapping, fallback: (data.mapping, data.speakingTimes),
                 source: source,
             )
             // Transition out of .speakerNamingPending synchronously so the UI's
@@ -178,7 +178,7 @@ final class SpeakerNamingSession {
         case .skipped:
             recordRecognition(
                 jobID: jobID, title: data.meetingTitle,
-                userMapping: nil, fallback: data.mapping,
+                userMapping: nil, fallback: (data.mapping, data.speakingTimes),
                 source: source,
             )
             acceptAutoNames(jobID: jobID, slug: slug)
@@ -351,7 +351,7 @@ final class SpeakerNamingSession {
             // hide an auto-accept nobody reviewed.
             recordRecognition(
                 jobID: jobID, title: title,
-                userMapping: nil, fallback: autoNames,
+                userMapping: nil, fallback: (autoNames, diarization.speakingTimes),
                 source: .headless,
             )
             return autoNames
@@ -426,7 +426,7 @@ final class SpeakerNamingSession {
             if let data = speakerNamingDataByJob[job.id] {
                 recordRecognition(
                     jobID: job.id, title: data.meetingTitle,
-                    userMapping: nil, fallback: data.mapping,
+                    userMapping: nil, fallback: (data.mapping, data.speakingTimes),
                     source: .stale,
                 )
             }
@@ -443,14 +443,16 @@ final class SpeakerNamingSession {
     private func recordRecognition(
         jobID: UUID, title: String,
         // swiftlint:disable:next discouraged_optional_collection
-        userMapping: [String: String]?, fallback: [String: String],
+        userMapping: [String: String]?,
+        fallback: (mapping: [String: String], speakingTimes: [String: TimeInterval]),
         source: RecognitionSource,
     ) {
         let events = RecognitionStats.buildEvents(
-            suggested: stashedSuggestedAtDialog[jobID] ?? fallback,
+            suggested: stashedSuggestedAtDialog[jobID] ?? fallback.mapping,
             userMapping: userMapping,
             topCandidates: stashedTopCandidates[jobID] ?? [:],
             jobID: jobID, meetingTitle: title, source: source,
+            speakingTimes: fallback.speakingTimes,
         )
         var counts: [RecognitionAction: Int] = [:]
         for e in events {

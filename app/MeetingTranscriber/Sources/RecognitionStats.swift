@@ -56,6 +56,10 @@ struct RecognitionEvent: Codable, Equatable {
     /// `topCandidates`: rows written before the field existed must still decode,
     /// and they read as `nil` rather than being silently attributed to a source.
     let source: RecognitionSource?
+    /// Seconds of speech behind the label. Lets the log tell a miss on a
+    /// two-second fragment from a miss on a main speaker, which is the first
+    /// question when judging a change to the matcher. Optional: older rows.
+    let speakingTime: TimeInterval?
 
     init(
         ts: Date, jobID: UUID, meetingTitle: String, track: RecognitionTrack,
@@ -64,6 +68,7 @@ struct RecognitionEvent: Codable, Equatable {
         // swiftlint:disable:next discouraged_optional_collection
         topCandidates: [TopCandidate]?,
         source: RecognitionSource? = nil,
+        speakingTime: TimeInterval? = nil,
     ) {
         self.ts = ts
         self.jobID = jobID
@@ -75,6 +80,7 @@ struct RecognitionEvent: Codable, Equatable {
         self.action = action
         self.topCandidates = topCandidates
         self.source = source
+        self.speakingTime = speakingTime
     }
 }
 
@@ -119,6 +125,7 @@ enum RecognitionStats {
         jobID: UUID,
         meetingTitle: String,
         source: RecognitionSource? = nil,
+        speakingTimes: [String: TimeInterval] = [:],
         now: Date = Date(),
     ) -> [RecognitionEvent] {
         let labels = Set(suggested.keys).union(userMapping?.keys ?? [:].keys).sorted()
@@ -139,6 +146,7 @@ enum RecognitionStats {
                 action: action,
                 topCandidates: topCandidates[label],
                 source: source,
+                speakingTime: speakingTimes[label],
             )
         }
     }
