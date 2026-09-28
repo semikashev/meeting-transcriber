@@ -75,6 +75,9 @@ enum A11yID {
     /// Same single-home pattern for the About tab.
     static let settingsTabAbout = settingsTab("about")
 
+    // Voice enrollment.
+    static let enrollAsReferenceToggle = "enroll-as-reference-toggle"
+
     // Speaker-naming dialog.
     static let confirmButton = "confirm-button"
     static let skipButton = "skip-button"

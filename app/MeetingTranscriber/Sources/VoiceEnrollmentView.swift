@@ -17,6 +17,10 @@ struct VoiceEnrollmentView: View {
     @State private var elapsed: TimeInterval = 0
     @State private var elapsedTimer: Task<Void, Never>?
     @State private var diarizationTask: Task<Void, Never>?
+    /// Enrolled voices are pinned as reference samples: a recording picked on
+    /// purpose is the cleanest evidence of a voice the app gets, so later
+    /// meetings should add to it, not wear it away.
+    @State private var asReference = true
 
     init(
         matcher: SpeakerMatcher,
@@ -94,6 +98,12 @@ struct VoiceEnrollmentView: View {
             )
             .font(.caption)
             .foregroundStyle(.secondary)
+            Toggle("Keep as reference voices", isOn: $asReference)
+                .accessibilityIdentifier(A11yID.enrollAsReferenceToggle)
+                .help(
+                    "Reference samples are never replaced by newer meetings and always count "
+                        + "when matching. Best with a clean recording of 30 seconds or more per person.",
+                )
         }
     }
 
@@ -125,7 +135,7 @@ struct VoiceEnrollmentView: View {
                 gracePeriod: 0,
             ) { result in
                 switch VoiceEnrollmentLogic.handleNamingResult(
-                    result, payload: payload, matcher: matcher,
+                    result, payload: payload, matcher: matcher, asReference: asReference,
                 ) {
                 case let .stage(next): stage = next
                 case let .rerun(url, count): startDiarization(url: url, numSpeakers: count)
