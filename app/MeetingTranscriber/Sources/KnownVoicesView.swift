@@ -38,6 +38,15 @@ enum KnownVoicesFormatting {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
     }
+
+    /// Confirmation text for a clean-up plan (`VoiceHealth.cleanUpPlan`).
+    static func cleanUpMessage(_ plan: [String: Set<UUID>]) -> String {
+        let samples = plan.values.reduce(0) { $0 + $1.count }
+        let names = plan.keys.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+        return "\(samples) suspect sample\(samples == 1 ? "" : "s") will be removed from "
+            + names.joined(separator: ", ")
+            + ". Each voice is recomputed from its remaining samples. Reference samples are kept."
+    }
 }
 
 /// Manage the persisted speaker DB: rename, delete, merge entries. Backs onto
@@ -48,6 +57,8 @@ struct KnownVoicesView: View {
     @State private var filter = ""
     @State private var modal: ActiveModal?
     @State private var showingEnrollment = false
+    @State private var showingSamples = false
+    @State private var health: [String: [VoiceHealth.Issue]] = [:]
 
     private let matcher: SpeakerMatcher
     private let diarizerFactory: (() -> any DiarizationProvider)?
@@ -82,19 +93,23 @@ struct KnownVoicesView: View {
         // Seed `speakers` synchronously from the matcher so the Table renders
         // its rows on first body evaluation. `.onAppear → reload()` re-runs
         // the same query for in-place refresh after mutations.
-        _speakers = State(initialValue: SpeakerMatcher.rankByRecency(speakers: matcher.loadDB()))
+        let stored = matcher.loadDB()
+        _speakers = State(initialValue: SpeakerMatcher.rankByRecency(speakers: stored))
+        _health = State(initialValue: VoiceHealth.issues(in: stored))
     }
 
     enum ActiveModal: Identifiable {
         case rename(name: String, value: String)
         case merge(from: String, destination: String)
         case delete(name: String)
+        case cleanUp
 
         var id: String {
             switch self {
             case let .rename(name, _): "rename:\(name)"
             case let .merge(from, _): "merge:\(from)"
             case let .delete(name): "delete:\(name)"
+            case .cleanUp: "cleanUp"
             }
         }
     }
@@ -134,7 +149,24 @@ struct KnownVoicesView: View {
         } message: {
             Text("\(deletingName) will be removed. This cannot be undone.")
         }
+        .alert("Clean up voices?", isPresented: isCleanUp) {
+            Button("Cancel", role: .cancel) { modal = nil }
+            Button("Remove", role: .destructive) {
+                modal = nil
+                performCleanUp()
+            }
+        } message: {
+            Text(KnownVoicesFormatting.cleanUpMessage(VoiceHealth.cleanUpPlan(for: speakers)))
+        }
         .sheet(isPresented: isMerge) { mergeSheet }
+        .sheet(isPresented: $showingSamples) {
+            if let selection {
+                VoiceSamplesView(matcher: matcher, name: selection) {
+                    reload()
+                    onMutate?()
+                }
+            }
+        }
         .sheet(isPresented: $showingEnrollment) {
             if let diarizerFactory {
                 VoiceEnrollmentView(
@@ -160,6 +192,13 @@ struct KnownVoicesView: View {
     private var isDelete: Binding<Bool> {
         Binding(
             get: { if case .delete = modal { true } else { false } },
+            set: { if !$0 { modal = nil } },
+        )
+    }
+
+    private var isCleanUp: Binding<Bool> {
+        Binding(
+            get: { if case .cleanUp = modal { true } else { false } },
             set: { if !$0 { modal = nil } },
         )
     }
@@ -243,7 +282,15 @@ struct KnownVoicesView: View {
             }
             TableColumn("Last used") { Text(KnownVoicesFormatting.lastUsedLabel($0.lastUsed)) }
             TableColumn("Uses") { Text("\($0.useCount)") }
-            TableColumn("Samples") { Text("\($0.embeddings.count)") }
+            TableColumn("Samples") { speaker in
+                Text("\(speaker.samples.count { $0.origin != .migratedCentroid })")
+            }
+            TableColumn("Health") { speaker in
+                let issues = health[speaker.name] ?? []
+                Text(VoiceHealth.summary(issues))
+                    .foregroundStyle(issues.isEmpty ? Color.secondary : Color.orange)
+                    .help(VoiceHealth.details(issues))
+            }
         }
     }
 
@@ -291,6 +338,13 @@ struct KnownVoicesView: View {
                 if let selection { modal = .delete(name: selection) }
             }
             .disabled(selection == nil)
+            Button("Samples…") { showingSamples = true }
+                .disabled(selection == nil)
+                .accessibilityIdentifier(A11yID.voiceSamplesButton)
+            Button("Clean Up…") { modal = .cleanUp }
+                .disabled(VoiceHealth.cleanUpPlan(for: speakers).isEmpty)
+                .accessibilityIdentifier(A11yID.voiceCleanUpButton)
+                .help("Remove samples that match another voice at least as well, or sit far from their own.")
             Spacer()
             Button("Done") { dismiss() }
                 .keyboardShortcut(.defaultAction)
@@ -298,7 +352,18 @@ struct KnownVoicesView: View {
     }
 
     private func reload() {
-        speakers = SpeakerMatcher.rankByRecency(speakers: matcher.loadDB())
+        let stored = matcher.loadDB()
+        speakers = SpeakerMatcher.rankByRecency(speakers: stored)
+        health = VoiceHealth.issues(in: stored)
+    }
+
+    /// Remove every suspect, unpinned sample `VoiceHealth` finds.
+    func performCleanUp() {
+        for (name, ids) in VoiceHealth.cleanUpPlan(for: matcher.loadDB()) {
+            matcher.removeSamples(ids, from: name)
+        }
+        reload()
+        onMutate?()
     }
 
     private func startRename() {
