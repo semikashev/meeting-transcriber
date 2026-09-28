@@ -39,15 +39,24 @@ extension SpeakerNamingSession {
         // The transcript rewrite below still uses every name the user gave, so a
         // quarantined speaker is still named in the transcript — only the voice
         // is not memorised.
-        let admissible = EchoEmbeddingQuarantine.admissible(
+        let unquarantined = EchoEmbeddingQuarantine.admissible(
             namingData.embeddings,
             verdict: EchoVerdict(job.echo),
             isDualSource: namingData.isDualSource,
             provenSilentAppTrack: micSpeakersOverSilence(namingData, verdict: EchoVerdict(job.echo), slug: slug),
         )
-        if admissible.count != namingData.embeddings.count {
-            let held = namingData.embeddings.count - admissible.count
+        if unquarantined.count != namingData.embeddings.count {
+            let held = namingData.embeddings.count - unquarantined.count
             logger.info("echo_quarantine held=\(held, privacy: .public) of=\(namingData.embeddings.count, privacy: .public)")
+        }
+        // The same person named on both tracks: learn only the track they
+        // spoke into, the other copy is bleed (see `CrossTrackEmbeddingFilter`).
+        let admissible = CrossTrackEmbeddingFilter.admissible(
+            unquarantined, mapping: fullMapping, speakingTimes: namingData.speakingTimes,
+        )
+        if admissible.count != unquarantined.count {
+            let held = unquarantined.count - admissible.count
+            logger.info("cross_track_bleed held=\(held, privacy: .public) of=\(unquarantined.count, privacy: .public)")
         }
         delegate.updateSpeakerDB(
             matcher: matcher,
