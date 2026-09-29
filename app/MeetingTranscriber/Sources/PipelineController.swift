@@ -32,7 +32,7 @@ final class PipelineController {
     var queue: PipelineQueue
 
     private let settings: AppSettings
-    private let notifier: any AppNotifying
+    let notifier: any AppNotifying
 
     /// Decides the folder a new queue writes into, and tells the user when it is
     /// not the one they chose (see `OutputDirectoryResolver`). Built from the
@@ -51,6 +51,23 @@ final class PipelineController {
     /// reachable at process teardown, since `rebuild`/`ensureQueue` are driven by
     /// user actions while `AppState` is alive). Captures the owner weakly.
     private var engineProvider: (() -> (any TranscribingEngine)?)?
+
+    /// Recordings a running merge is still reading. The Protocols window shows
+    /// them as busy, so they can neither be deleted under the merge nor merged
+    /// a second time.
+    var mergingStems: Set<String> = []
+
+    /// The stems each running merge holds, released when its job finishes.
+    var pendingMergeStems: [UUID: Set<String>] = [:]
+
+    /// Originals to move to the Trash once the merged job's protocol exists,
+    /// keyed by that job. In memory on purpose: a restart forgets the request
+    /// and keeps the originals, which is the safe way to lose it.
+    var mergeCleanups: [UUID: MergeCleanup] = [:]
+
+    /// How originals leave the folder after a merge. Injectable so tests
+    /// record instead of trashing.
+    var originalsRemover: any FileRemoving = TrashFileRemover()
 
     init(settings: AppSettings, notifier: any AppNotifying, terminalJobStore: TerminalJobStore? = nil) {
         self.settings = settings
@@ -217,16 +234,18 @@ final class PipelineController {
     }
 
     func configureCallbacks() {
-        queue.onJobStateChange = { [notifier] job, _, newState in
+        queue.onJobStateChange = { [notifier, weak self] job, _, newState in
             switch newState {
             case .done:
                 let title = job.protocolPath != nil ? "Protocol Ready" : "Transcript Saved"
                 notifier.notify(title: title, body: job.meetingTitle)
+                self?.finishMerge(job: job, succeeded: true)
 
             case .error:
                 if let err = job.error {
                     notifier.notify(title: "Error", body: err)
                 }
+                self?.finishMerge(job: job, succeeded: false)
 
             default:
                 break

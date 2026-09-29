@@ -125,6 +125,11 @@ enum A11yID {
 
     // Protocols window.
     static let protocolsFooter = "protocolsFooter"
+    static let protocolsMerge = "protocolsMerge"
+    static let protocolsMergeList = "protocolsMergeList"
+    static let protocolsMergeTitle = "protocolsMergeTitle"
+    static let protocolsMergeDeleteOriginals = "protocolsMergeDeleteOriginals"
+    static let protocolsMergeConfirm = "protocolsMergeConfirm"
 
     /// Per-row delete buttons, addressed by the recording's stem (app-set,
     /// never user input, so safe to publish unredacted like the row index above).
