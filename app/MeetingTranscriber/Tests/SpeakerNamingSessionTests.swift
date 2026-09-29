@@ -23,6 +23,7 @@ final class SpeakerNamingSessionTests: XCTestCase {
         /// the call count because the echo quarantine is invisible in the count:
         /// the write still happens, it just carries less.
         private(set) var updateSpeakerDBEmbeddings: [[String: [Float]]] = []
+        private(set) var updateSpeakerDBProvenance: [SampleProvenance] = []
         private(set) var metadataUpdates: [(jobID: UUID, slug: String?, mode: DiarizerMode?)] = []
         private(set) var stageStartCount = 0
         private(set) var stageEndCount = 0
@@ -47,7 +48,9 @@ final class SpeakerNamingSessionTests: XCTestCase {
         func updateSpeakerDB(
             matcher _: SpeakerMatcher, mapping _: [String: String],
             embeddings: [String: [Float]], speakingTimes _: [String: TimeInterval],
+            provenance: SampleProvenance,
         ) {
+            updateSpeakerDBProvenance.append(provenance)
             updateSpeakerDBCallCount += 1
             updateSpeakerDBEmbeddings.append(embeddings)
         }
@@ -106,14 +109,16 @@ final class SpeakerNamingSessionTests: XCTestCase {
 
     /// A dual-track naming set: one speaker per track, prefixed the way
     /// `mergeDualTrackDiarization` prefixes them.
-    private func makeDualTrackNamingData(jobID: UUID) -> PipelineQueue.SpeakerNamingData {
+    private func makeDualTrackNamingData(
+        jobID: UUID, appSeconds: TimeInterval = 30, micSeconds: TimeInterval = 30,
+    ) -> PipelineQueue.SpeakerNamingData {
         let remote = SpeakerKey(track: .app, id: "SPEAKER_0").encoded
         let local = SpeakerKey(track: .mic, id: "SPEAKER_0").encoded
         return PipelineQueue.SpeakerNamingData(
             jobID: jobID,
             meetingTitle: "Standup",
             mapping: [remote: remote, local: local],
-            speakingTimes: [remote: 30, local: 30],
+            speakingTimes: [remote: appSeconds, local: micSeconds],
             embeddings: [remote: [1, 0, 0], local: [0, 1, 0]],
             audioPath: nil,
             segments: [],
@@ -230,6 +235,45 @@ final class SpeakerNamingSessionTests: XCTestCase {
                 + "fires unconditionally would silently stop the app learning the user's own voice",
         )
         XCTAssertEqual(written[remote], [1, 0, 0])
+    }
+
+    /// The cross-track rule rides the same confirm path as the quarantine, and
+    /// needs no echo verdict: the name alone says the two clusters are one person.
+    func testConfirmWithOneNameOnBothTracksLearnsOnlyTheLongerTrack() async throws {
+        let tmp = try makeTempDirectory(prefix: "SpeakerNamingSessionTests")
+        let transcriptPath = tmp.appendingPathComponent("transcript.txt")
+        try "] R_SPEAKER_0: hello".write(to: transcriptPath, atomically: true, encoding: .utf8)
+
+        let session = makeSession(outputDir: tmp)
+        let mock = MockDelegate()
+        session.delegate = mock
+
+        let job = pendingJob(
+            namingSlug: "standup_abcd1234", transcriptPath: transcriptPath,
+            echo: EchoDetectionDTO(echoResult(correlations: [0.2, 0.2, 0.2, 0.2])),
+        )
+        mock.jobs[job.id] = job
+        session.speakerNamingDataByJob[job.id] = makeDualTrackNamingData(
+            jobID: job.id, appSeconds: 240, micSeconds: 15,
+        )
+
+        let local = SpeakerKey(track: .mic, id: "SPEAKER_0").encoded
+        let remote = SpeakerKey(track: .app, id: "SPEAKER_0").encoded
+        session.completeSpeakerNaming(
+            jobID: job.id,
+            result: .confirmed([remote: "Speaker A", local: "Speaker A"]),
+            source: .dialog,
+        )
+
+        await waitUntil { mock.jobs[job.id]?.state == .done }
+        let written = try XCTUnwrap(mock.updateSpeakerDBEmbeddings.first)
+        XCTAssertNil(written[local], "The microphone copy of a remote voice is bleed and must not be learned")
+        XCTAssertEqual(written[remote], [1, 0, 0])
+        XCTAssertEqual(
+            mock.updateSpeakerDBProvenance.first,
+            SampleProvenance(origin: .meeting, jobID: job.id, meetingTitle: "Standup"),
+            "Each learned sample must say which recording taught it, or it cannot be undone",
+        )
     }
 
     // MARK: - Confirm
@@ -352,6 +396,7 @@ final class SpeakerNamingSessionTests: XCTestCase {
         func updateSpeakerDB(
             matcher _: SpeakerMatcher, mapping _: [String: String],
             embeddings _: [String: [Float]], speakingTimes _: [String: TimeInterval],
+            provenance _: SampleProvenance,
         ) {}
 
         func generateProtocol(jobID _: UUID, transcript _: String, title _: String, protocolsDir _: URL) async {

@@ -376,17 +376,104 @@ final class SpeakerMatcherTests: XCTestCase {
         XCTAssertEqual(stored.first?.centroidSampleCount, 1)
     }
 
-    func testUpdateDBSkipsCentroidWhenSpeakingTimeShort() {
+    // MARK: - updateDB sample admission
+
+    func testUpdateDBDoesNotCreateASpeakerFromAShortSample() {
         let matcher = SpeakerMatcher(dbPath: dbPath)
-        matcher.updateDB(
+        let outcome = matcher.updateDB(
             mapping: ["S0": "Speaker B"],
             embeddings: ["S0": [1, 0]],
             speakingTimes: ["S0": 1.0],
             now: Self.testEpoch,
         )
-        let stored = matcher.loadDB()
-        XCTAssertNil(stored.first?.centroid)
-        XCTAssertEqual(stored.first?.embeddings, [[1, 0]])
+        XCTAssertEqual(outcome["S0"], .tooShort)
+        XCTAssertTrue(matcher.loadDB().isEmpty, "A second of speech is not enough to learn a voice from")
+    }
+
+    func testUpdateDBRecordsTheUseButNotTheVoiceOfAShortSample() {
+        let matcher = SpeakerMatcher(dbPath: dbPath)
+        matcher.saveDB([StoredSpeaker(
+            name: "Speaker B", embeddings: [[1, 0]], centroid: [1, 0], centroidSampleCount: 1, useCount: 4,
+        )])
+        matcher.updateDB(
+            mapping: ["S0": "Speaker B"],
+            embeddings: ["S0": [0, 1]],
+            speakingTimes: ["S0": 1.0],
+            now: Self.testEpoch,
+        )
+        let stored = matcher.loadDB()[0]
+        XCTAssertEqual(stored.embeddings, [[1, 0]], "The short sample must not reach the recent samples either")
+        XCTAssertEqual(stored.centroid, [1, 0])
+        XCTAssertEqual(stored.useCount, 5, "Naming still counts as a use, for chip ranking")
+        XCTAssertEqual(stored.lastUsed, Self.testEpoch)
+    }
+
+    func testUpdateDBWithoutSpeakingTimesKeepsTheSampleAsFallbackOnly() {
+        // No duration known (legacy callers): the sample is kept, the centroid is not moved.
+        let matcher = SpeakerMatcher(dbPath: dbPath)
+        let outcome = matcher.updateDB(mapping: ["S0": "Speaker B"], embeddings: ["S0": [1, 0]])
+        XCTAssertEqual(outcome["S0"], .admitted)
+        XCTAssertNil(matcher.loadDB().first?.centroid)
+        XCTAssertEqual(matcher.loadDB().first?.embeddings, [[1, 0]])
+    }
+
+    func testUpdateDBRejectsASampleThatIsSomeoneElsesVoice() {
+        let matcher = SpeakerMatcher(dbPath: dbPath)
+        matcher.saveDB([StoredSpeaker(name: "Speaker A", embeddings: [[1, 0, 0]], centroid: [1, 0, 0])])
+        let outcome = matcher.updateDB(
+            mapping: ["S0": "Speaker B"],
+            embeddings: ["S0": [0.99, 0.05, 0]],
+            speakingTimes: ["S0": 30],
+            now: Self.testEpoch,
+        )
+        XCTAssertEqual(outcome["S0"], .ambiguous(nearest: "Speaker A"))
+        XCTAssertEqual(
+            matcher.loadDB().map(\.name), ["Speaker A"],
+            "A vector that already stands for another person would match both and neither",
+        )
+    }
+
+    func testUpdateDBAdmitsASampleCloserToItsOwnVoice() {
+        // Two similar voices: the sample is within the ambiguity radius of A but
+        // nearer to B, the name it was confirmed under.
+        let matcher = SpeakerMatcher(dbPath: dbPath)
+        matcher.saveDB([
+            StoredSpeaker(name: "Speaker A", embeddings: [[1, 0, 0]], centroid: [1, 0, 0]),
+            StoredSpeaker(name: "Speaker B", embeddings: [[0.95, 0.31, 0]], centroid: [0.95, 0.31, 0]),
+        ])
+        let outcome = matcher.updateDB(
+            mapping: ["S0": "Speaker B"],
+            embeddings: ["S0": [0.98, 0.2, 0]],
+            speakingTimes: ["S0": 30],
+        )
+        XCTAssertEqual(outcome["S0"], .admitted)
+        XCTAssertEqual(matcher.loadDB().first { $0.name == "Speaker B" }?.embeddings.count, 2)
+    }
+
+    func testUpdateDBLetsTheLongerSpeakerClaimAVoiceSharedWithinOneRecording() {
+        // Two labels of one recording carry near-identical embeddings under two
+        // names. The one with more speech is written first and becomes the anchor.
+        for (longer, shorter) in [("S0", "S1"), ("S1", "S0")] {
+            let matcher = SpeakerMatcher(dbPath: dbPath)
+            matcher.saveDB([])
+            let outcome = matcher.updateDB(
+                mapping: [longer: "Long", shorter: "Short"],
+                embeddings: [longer: [1, 0, 0], shorter: [0.99, 0.01, 0]],
+                speakingTimes: [longer: 120, shorter: 20],
+            )
+            XCTAssertEqual(outcome[longer], .admitted)
+            XCTAssertEqual(outcome[shorter], .ambiguous(nearest: "Long"))
+            XCTAssertEqual(matcher.loadDB().map(\.name), ["Long"])
+        }
+    }
+
+    func testUpdateDBIgnoresSyntheticSpeakersForAmbiguity() {
+        let matcher = SpeakerMatcher(dbPath: dbPath)
+        matcher.saveDB([StoredSpeaker(name: "Seeded", embeddings: [[1, 0, 0]], isSynthetic: true)])
+        let outcome = matcher.updateDB(
+            mapping: ["S0": "Real"], embeddings: ["S0": [1, 0, 0]], speakingTimes: ["S0": 30],
+        )
+        XCTAssertEqual(outcome["S0"], .admitted, "Random seeded vectors must not block a real voice")
     }
 
     // MARK: - match with centroid
@@ -854,21 +941,79 @@ final class SpeakerMatcherTests: XCTestCase {
     }
 
     func testMatchIsDeterministicByKey() {
-        // Two speakers both close to the same stored speaker.
-        // Sorted by key, SPEAKER_0 < SPEAKER_1, so SPEAKER_0 claims the match first.
+        // Two labels on different tracks both close to the same stored speaker,
+        // no speaking times known. Sorted by key, the microphone label claims
+        // the match first, and a name is not reused across tracks.
         let matcher = SpeakerMatcher(dbPath: dbPath, threshold: 0.40, confidenceMargin: 0.0)
         let stored = [StoredSpeaker(name: "Speaker A", embeddings: [[1, 0, 0]])]
         matcher.saveDB(stored)
 
         let embeddings: [String: [Float]] = [
-            "SPEAKER_0": [0.95, 0.1, 0], // close to Speaker A
-            "SPEAKER_1": [0.96, 0.08, 0], // also close to Speaker A (even closer)
+            "M_SPEAKER_0": [0.95, 0.1, 0], // close to Speaker A
+            "R_SPEAKER_1": [0.96, 0.08, 0], // also close to Speaker A (even closer)
         ]
         let result = matcher.match(embeddings: embeddings)
 
-        // SPEAKER_0 is processed first (alphabetical) and claims "Speaker A"
-        XCTAssertEqual(result["SPEAKER_0"], "Speaker A", "First key alphabetically should win the match")
-        XCTAssertEqual(result["SPEAKER_1"], "SPEAKER_1", "Second speaker left unmatched")
+        XCTAssertEqual(result["M_SPEAKER_0"], "Speaker A", "First key alphabetically should win the match")
+        XCTAssertEqual(result["R_SPEAKER_1"], "R_SPEAKER_1", "Second speaker left unmatched")
+    }
+
+    // MARK: - match: order and name reuse
+
+    func testMatchGivesTheLongestSpeakerTheContestedName() {
+        // Key order would hand the name to the microphone label; the app label
+        // carries far more speech and is the better evidence of who this is.
+        let matcher = SpeakerMatcher(dbPath: dbPath, threshold: 0.40, confidenceMargin: 0.0)
+        matcher.saveDB([StoredSpeaker(name: "Speaker A", embeddings: [[1, 0, 0]])])
+        let result = matcher.match(
+            embeddings: ["M_S1": [0.99, 0.05, 0], "R_S1": [0.95, 0.1, 0]],
+            speakingTimes: ["M_S1": 5, "R_S1": 300],
+        )
+        XCTAssertEqual(result["R_S1"], "Speaker A")
+        XCTAssertEqual(result["M_S1"], "M_S1")
+    }
+
+    func testMatchNamesTwoClustersOfOneVoiceOnOneTrackAlike() {
+        // The diarizer split one person into two clusters on the same track:
+        // on a real corpus that was the largest single cause of the user's own
+        // voice going unnamed.
+        let matcher = SpeakerMatcher(dbPath: dbPath)
+        matcher.saveDB([
+            StoredSpeaker(name: "Speaker A", embeddings: [[1, 0, 0]], centroid: [1, 0, 0]),
+            StoredSpeaker(name: "Speaker B", embeddings: [[0, 1, 0]], centroid: [0, 1, 0]),
+        ])
+        let result = matcher.match(
+            embeddings: ["M_S1": [1, 0.02, 0], "M_S2": [0.97, 0.15, 0]],
+            speakingTimes: ["M_S1": 400, "M_S2": 40],
+        )
+        XCTAssertEqual(result["M_S1"], "Speaker A")
+        XCTAssertEqual(result["M_S2"], "Speaker A")
+    }
+
+    func testMatchDoesNotReuseANameBeyondTheReuseDistance() {
+        let matcher = SpeakerMatcher(dbPath: dbPath, threshold: 0.40, confidenceMargin: 0.0)
+        matcher.saveDB([StoredSpeaker(name: "Speaker A", embeddings: [[1, 0, 0]], centroid: [1, 0, 0])])
+        // Second cluster within the match threshold (~0.32) but past the reuse
+        // distance: a similar voice, not necessarily the same person.
+        let result = matcher.match(
+            embeddings: ["M_S1": [1, 0, 0], "M_S2": [0.68, 0.73, 0]],
+            speakingTimes: ["M_S1": 400, "M_S2": 40],
+        )
+        XCTAssertEqual(result["M_S1"], "Speaker A")
+        XCTAssertEqual(result["M_S2"], "M_S2")
+    }
+
+    func testMatchDoesNotReuseANameAcrossTracks() {
+        // The same person on both tracks is bleed on one of them: naming the
+        // bleed cluster after them would put their name on the other side's words.
+        let matcher = SpeakerMatcher(dbPath: dbPath)
+        matcher.saveDB([StoredSpeaker(name: "Speaker A", embeddings: [[1, 0, 0]], centroid: [1, 0, 0])])
+        let result = matcher.match(
+            embeddings: ["R_S1": [1, 0, 0], "M_S3": [0.99, 0.05, 0]],
+            speakingTimes: ["R_S1": 400, "M_S3": 30],
+        )
+        XCTAssertEqual(result["R_S1"], "Speaker A")
+        XCTAssertEqual(result["M_S3"], "M_S3")
     }
 
     // MARK: - matchVerbose
@@ -1067,16 +1212,24 @@ final class SpeakerMatcherTests: XCTestCase {
         XCTAssertTrue(bothSynthetic.isSynthetic)
     }
 
-    func testMergedDerivesCentroidFromSamplesWhenNeitherSideHasCentroid() {
-        // With no persisted centroid on either side, merged() falls back to the
-        // element-wise mean of the combined recent samples.
+    func testMergedKeepsCentroidlessEntriesLazyUntilARealSampleJoins() {
+        // Neither side ever had a centroid (pre-v3 entries). The merge keeps
+        // both samples as anchors and seeds nothing; the first qualifying
+        // confirmation then averages all of them, as it would have for either
+        // entry alone.
         let a = StoredSpeaker(name: "A", embeddings: [[1, 0]])
         let b = StoredSpeaker(name: "B", embeddings: [[0, 1]])
 
         let result = SpeakerMatcher.merged(into: a, from: b)
-        // mean of (1,0) and (0,1) = (0.5, 0.5)
-        XCTAssertEqual(result.centroid?[0] ?? 0, 0.5, accuracy: 0.001)
-        XCTAssertEqual(result.centroid?[1] ?? 0, 0.5, accuracy: 0.001)
+        XCTAssertNil(result.centroid)
+        XCTAssertEqual(result.embeddings, [[1, 0], [0, 1]])
+
+        let confirmed = SpeakerMatcher.applyConfirmation(
+            to: result, embedding: [1, 1], duration: 10, now: Self.testEpoch,
+        )
+        XCTAssertEqual(confirmed.centroid?[0] ?? 0, 2.0 / 3.0, accuracy: 0.001)
+        XCTAssertEqual(confirmed.centroid?[1] ?? 0, 2.0 / 3.0, accuracy: 0.001)
+        XCTAssertEqual(confirmed.centroidSampleCount, 3)
     }
 
     func testMergedTrimsCombinedSamplesToMostRecent() {

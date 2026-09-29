@@ -26,6 +26,7 @@ protocol SpeakerNamingSessionDelegate: AnyObject {
     func updateSpeakerDB(
         matcher: SpeakerMatcher, mapping: [String: String],
         embeddings: [String: [Float]], speakingTimes: [String: TimeInterval],
+        provenance: SampleProvenance,
     )
     /// Run the LLM protocol generator over a transcript (a queue pipeline stage).
     func generateProtocol(jobID: UUID, transcript: String, title: String, protocolsDir: URL) async
@@ -155,7 +156,7 @@ final class SpeakerNamingSession {
         case let .confirmed(userMapping):
             recordRecognition(
                 jobID: jobID, title: data.meetingTitle,
-                userMapping: userMapping, fallback: data.mapping,
+                userMapping: userMapping, fallback: (data.mapping, data.speakingTimes),
                 source: source,
             )
             // Transition out of .speakerNamingPending synchronously so the UI's
@@ -177,7 +178,7 @@ final class SpeakerNamingSession {
         case .skipped:
             recordRecognition(
                 jobID: jobID, title: data.meetingTitle,
-                userMapping: nil, fallback: data.mapping,
+                userMapping: nil, fallback: (data.mapping, data.speakingTimes),
                 source: source,
             )
             acceptAutoNames(jobID: jobID, slug: slug)
@@ -292,7 +293,7 @@ final class SpeakerNamingSession {
         guard let embeddings = diarization.embeddings else { return diarization.autoNames }
 
         let matcher = speakerMatcherFactory()
-        let verbose = matcher.matchVerbose(embeddings: embeddings)
+        let verbose = matcher.matchVerbose(embeddings: embeddings, speakingTimes: diarization.speakingTimes)
         let matched = verbose.mapValues(\.assignedName)
         var autoNames = matched
         let topCandidates = verbose.mapValues(\.topCandidates)
@@ -350,7 +351,7 @@ final class SpeakerNamingSession {
             // hide an auto-accept nobody reviewed.
             recordRecognition(
                 jobID: jobID, title: title,
-                userMapping: nil, fallback: autoNames,
+                userMapping: nil, fallback: (autoNames, diarization.speakingTimes),
                 source: .headless,
             )
             return autoNames
@@ -425,7 +426,7 @@ final class SpeakerNamingSession {
             if let data = speakerNamingDataByJob[job.id] {
                 recordRecognition(
                     jobID: job.id, title: data.meetingTitle,
-                    userMapping: nil, fallback: data.mapping,
+                    userMapping: nil, fallback: (data.mapping, data.speakingTimes),
                     source: .stale,
                 )
             }
@@ -442,14 +443,16 @@ final class SpeakerNamingSession {
     private func recordRecognition(
         jobID: UUID, title: String,
         // swiftlint:disable:next discouraged_optional_collection
-        userMapping: [String: String]?, fallback: [String: String],
+        userMapping: [String: String]?,
+        fallback: (mapping: [String: String], speakingTimes: [String: TimeInterval]),
         source: RecognitionSource,
     ) {
         let events = RecognitionStats.buildEvents(
-            suggested: stashedSuggestedAtDialog[jobID] ?? fallback,
+            suggested: stashedSuggestedAtDialog[jobID] ?? fallback.mapping,
             userMapping: userMapping,
             topCandidates: stashedTopCandidates[jobID] ?? [:],
             jobID: jobID, meetingTitle: title, source: source,
+            speakingTimes: fallback.speakingTimes,
         )
         var counts: [RecognitionAction: Int] = [:]
         for e in events {

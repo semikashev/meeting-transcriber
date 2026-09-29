@@ -48,6 +48,7 @@ final class AccidentalNamingAcceptTests: XCTestCase {
         func updateSpeakerDB(
             matcher _: SpeakerMatcher, mapping: [String: String],
             embeddings _: [String: [Float]], speakingTimes _: [String: TimeInterval],
+            provenance _: SampleProvenance,
         ) {
             updateSpeakerDBCalls.append(mapping)
         }

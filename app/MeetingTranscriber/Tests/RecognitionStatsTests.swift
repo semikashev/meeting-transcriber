@@ -215,4 +215,26 @@ final class RecognitionStatsTests: XCTestCase {
         let lastCentroid: Float? = events.first?.topCandidates?.last?.centroid
         XCTAssertNil(lastCentroid)
     }
+
+    func testBuildEventsCarriesEachLabelsSpeakingTime() {
+        let events = RecognitionStats.buildEvents(
+            suggested: ["R_S1": "Speaker A", "M_S2": "M_S2"],
+            userMapping: ["R_S1": "Speaker A", "M_S2": ""],
+            topCandidates: [:],
+            jobID: UUID(), meetingTitle: "Test",
+            speakingTimes: ["R_S1": 312, "M_S2": 2.5],
+        )
+        XCTAssertEqual(events.first { $0.label == "R_S1" }?.speakingTime, 312)
+        XCTAssertEqual(events.first { $0.label == "M_S2" }?.speakingTime, 2.5)
+    }
+
+    func testRowsWrittenBeforeSpeakingTimeStillDecode() throws {
+        let row = Data("""
+        {"action":"accepted","jobID":"DDD279AC-0DA3-43F4-9E50-BACD4C3B1CD3","label":"S1",\
+        "meetingTitle":"M","track":"single","ts":"2026-09-11T12:52:31Z","userName":"A","autoName":"A"}
+        """.utf8)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        XCTAssertNil(try decoder.decode(RecognitionEvent.self, from: row).speakingTime)
+    }
 }

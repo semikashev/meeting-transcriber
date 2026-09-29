@@ -17,6 +17,10 @@ struct VoiceEnrollmentView: View {
     @State private var elapsed: TimeInterval = 0
     @State private var elapsedTimer: Task<Void, Never>?
     @State private var diarizationTask: Task<Void, Never>?
+    /// Enrolled voices are pinned as reference samples: a recording picked on
+    /// purpose is the cleanest evidence of a voice the app gets, so later
+    /// meetings should add to it, not wear it away.
+    @State private var asReference = true
 
     init(
         matcher: SpeakerMatcher,
@@ -94,6 +98,12 @@ struct VoiceEnrollmentView: View {
             )
             .font(.caption)
             .foregroundStyle(.secondary)
+            Toggle("Keep as reference voices", isOn: $asReference)
+                .accessibilityIdentifier(A11yID.enrollAsReferenceToggle)
+                .help(
+                    "Reference samples are never replaced by newer meetings and always count "
+                        + "when matching. Best with a clean recording of 30 seconds or more per person.",
+                )
         }
     }
 
@@ -125,7 +135,7 @@ struct VoiceEnrollmentView: View {
                 gracePeriod: 0,
             ) { result in
                 switch VoiceEnrollmentLogic.handleNamingResult(
-                    result, payload: payload, matcher: matcher,
+                    result, payload: payload, matcher: matcher, asReference: asReference,
                 ) {
                 case let .stage(next): stage = next
                 case let .rerun(url, count): startDiarization(url: url, numSpeakers: count)
@@ -256,6 +266,7 @@ enum VoiceEnrollmentLogic {
         _ result: PipelineQueue.SpeakerNamingResult,
         payload: VoiceEnrollmentView.NamingPayload,
         matcher: SpeakerMatcher,
+        asReference: Bool = false,
     ) -> Outcome {
         switch result {
         case let .confirmed(mapping):
@@ -266,6 +277,9 @@ enum VoiceEnrollmentLogic {
                 mapping: mapping,
                 embeddings: embeddings,
                 speakingTimes: payload.diarization.speakingTimes,
+                provenance: SampleProvenance(
+                    origin: .enrollment, meetingTitle: payload.url.lastPathComponent, pinned: asReference,
+                ),
             )
             let saved = Set(mapping.values.filter { !$0.isEmpty }).sorted()
             return .stage(.done(savedNames: saved))
@@ -293,7 +307,9 @@ enum VoiceEnrollmentLogic {
         let knownNames = matcher.allSpeakerNames()
         // Pre-fill auto-name suggestions by running a match against the
         // existing DB. Same flow as a real meeting.
-        let autoNames = diarization.embeddings.map { matcher.match(embeddings: $0) } ?? [:]
+        let autoNames = diarization.embeddings.map { embeddings in
+            matcher.match(embeddings: embeddings, speakingTimes: diarization.speakingTimes)
+        } ?? [:]
         let mapping = autoNames.isEmpty
             ? Dictionary(uniqueKeysWithValues: diarization.speakingTimes.keys.map { ($0, $0) })
             : autoNames

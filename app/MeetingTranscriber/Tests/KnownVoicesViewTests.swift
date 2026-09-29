@@ -92,6 +92,52 @@ final class KnownVoicesViewTests: XCTestCase { // swiftlint:disable:this balance
         XCTAssertEqual(calls, 1)
     }
 
+    // MARK: - Voice health
+
+    private func pollutedDB() -> SpeakerMatcher {
+        // B carries a sample that is A's voice: the clean-up target.
+        let matcher = SpeakerMatcher(dbPath: dbPath)
+        matcher.saveDB([
+            StoredSpeaker(name: "A", embeddings: [[1, 0, 0]], centroid: [1, 0, 0], centroidSampleCount: 5),
+            StoredSpeaker(
+                name: "B", embeddings: [[0, 1, 0], [0.99, 0.05, 0]], centroid: [0, 1, 0], centroidSampleCount: 5,
+            ),
+        ])
+        return matcher
+    }
+
+    func testCleanUpRemovesTheSuspectSampleAndInvokesOnMutate() throws {
+        let matcher = pollutedDB()
+        var calls = 0
+        // swiftlint:disable:next trailing_closure
+        let view = KnownVoicesView(matcher: matcher, onMutate: { calls += 1 })
+
+        view.performCleanUp()
+
+        let b = try XCTUnwrap(matcher.loadDB().first { $0.name == "B" })
+        XCTAssertEqual(b.embeddings, [[0, 1, 0]])
+        XCTAssertEqual(matcher.loadDB().first { $0.name == "A" }?.embeddings, [[1, 0, 0]])
+        XCTAssertEqual(calls, 1)
+    }
+
+    func testCleanUpButtonIsDisabledWhenThereIsNothingToCleanUp() throws {
+        let matcher = SpeakerMatcher(dbPath: dbPath)
+        matcher.saveDB([StoredSpeaker(name: "A", embeddings: [[1, 0, 0]], centroid: [1, 0, 0])])
+        let body = try KnownVoicesView(matcher: matcher).inspect()
+        XCTAssertTrue(try body.find(button: "Clean Up…").isDisabled())
+    }
+
+    func testCleanUpButtonIsEnabledForAPollutedDatabase() throws {
+        let body = try KnownVoicesView(matcher: pollutedDB()).inspect()
+        XCTAssertFalse(try body.find(button: "Clean Up…").isDisabled())
+        XCTAssertTrue(try body.find(button: "Samples…").isDisabled(), "Samples needs a selected voice")
+    }
+
+    func testCleanUpMessageNamesTheVoicesAndCount() {
+        let message = KnownVoicesFormatting.cleanUpMessage(["B": [UUID(), UUID()], "A": [UUID()]])
+        XCTAssertTrue(message.hasPrefix("3 suspect samples will be removed from A, B."))
+    }
+
     func testMissingOnMutateIsHandledGracefully() {
         let matcher = SpeakerMatcher(dbPath: dbPath)
         matcher.saveDB([StoredSpeaker(name: "X", embeddings: [[1, 0, 0]])])

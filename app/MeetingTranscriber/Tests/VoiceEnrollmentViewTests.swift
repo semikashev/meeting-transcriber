@@ -199,6 +199,38 @@ final class VoiceEnrollmentViewTests: XCTestCase { // swiftlint:disable:this bal
 
     // MARK: - VoiceEnrollmentLogic.handleNamingResult
 
+    func testReferenceToggleIsOnByDefault() throws {
+        let toggle = try makeView().inspect()
+            .find(viewWithAccessibilityIdentifier: A11yID.enrollAsReferenceToggle)
+            .find(ViewType.Toggle.self)
+        XCTAssertTrue(
+            try toggle.isOn(),
+            "A recording picked on purpose is the cleanest evidence of a voice; keep it by default",
+        )
+    }
+
+    func testHandleNamingResultAsReferencePinsTheEnrolledSamples() throws {
+        let matcher = SpeakerMatcher(dbPath: dbPath)
+        _ = VoiceEnrollmentLogic.handleNamingResult(
+            .confirmed(["SPEAKER_00": "Alice"]),
+            payload: makeNamingPayload(),
+            matcher: matcher,
+            asReference: true,
+        )
+        let sample = try XCTUnwrap(matcher.loadDB().first?.samples.first)
+        XCTAssertTrue(sample.pinned)
+        XCTAssertEqual(sample.origin, .enrollment)
+        XCTAssertEqual(sample.meetingTitle, "voice-enrollment-test.wav")
+    }
+
+    func testHandleNamingResultWithoutReferenceLeavesSamplesUnpinned() {
+        let matcher = SpeakerMatcher(dbPath: dbPath)
+        _ = VoiceEnrollmentLogic.handleNamingResult(
+            .confirmed(["SPEAKER_00": "Alice"]), payload: makeNamingPayload(), matcher: matcher,
+        )
+        XCTAssertEqual(matcher.loadDB().first?.samples.first?.pinned, false)
+    }
+
     func testHandleNamingResultConfirmedPersistsSpeakersAndReturnsDoneStage() {
         let matcher = SpeakerMatcher(dbPath: dbPath)
         let outcome = VoiceEnrollmentLogic.handleNamingResult(
