@@ -11,6 +11,28 @@ struct ProtocolsWindowView: View {
     let onReveal: (ProtocolEntry) -> Void
     let onDelete: (ProtocolEntry, ProtocolRemovalScope) -> Void
     let onRefresh: () -> Void
+    let onMerge: (SessionMergeRequest) -> Void
+    @State private var merge: ProtocolsMergeState
+
+    /// `merge` is only for tests that need to see the selection; the window
+    /// keeps its own so a refresh (a new `entries` array) does not clear it.
+    init(
+        entries: [ProtocolEntry],
+        onOpen: @escaping (ProtocolEntry) -> Void,
+        onReveal: @escaping (ProtocolEntry) -> Void,
+        onDelete: @escaping (ProtocolEntry, ProtocolRemovalScope) -> Void,
+        onRefresh: @escaping () -> Void,
+        onMerge: @escaping (SessionMergeRequest) -> Void = { _ in },
+        merge: ProtocolsMergeState = ProtocolsMergeState(),
+    ) {
+        self.entries = entries
+        self.onOpen = onOpen
+        self.onReveal = onReveal
+        self.onDelete = onDelete
+        self.onRefresh = onRefresh
+        self.onMerge = onMerge
+        _merge = State(initialValue: merge)
+    }
 
     private static let audioFormatter: ByteCountFormatter = {
         let f = ByteCountFormatter()
@@ -26,7 +48,7 @@ struct ProtocolsWindowView: View {
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                List(entries) { entry in
+                List(entries, selection: $merge.selectedStems) { entry in
                     row(entry)
                 }
             }
@@ -35,6 +57,23 @@ struct ProtocolsWindowView: View {
         }
         .frame(minWidth: 640, minHeight: 360)
         .onAppear(perform: onRefresh)
+        .sheet(isPresented: Binding(get: { merge.draft != nil }, set: { if !$0 { merge.draft = nil } })) {
+            if let draft = merge.draft {
+                MergeSessionsSheet(
+                    draft: draft,
+                    onConfirm: { request in
+                        merge.draft = nil
+                        merge.selectedStems = []
+                        onMerge(request)
+                    },
+                    onCancel: { merge.draft = nil },
+                )
+            }
+        }
+    }
+
+    private var canMerge: Bool {
+        SessionMerge.canMerge(merge.selectedEntries(in: entries))
     }
 
     private func row(_ entry: ProtocolEntry) -> some View {
@@ -66,6 +105,10 @@ struct ProtocolsWindowView: View {
         .padding(.vertical, 2)
         .contentShape(Rectangle())
         .onTapGesture(count: 2) { onOpen(entry) }
+        .contextMenu {
+            Button("Merge selected recordings…") { merge.beginMerge(in: entries) }
+                .disabled(!canMerge)
+        }
     }
 
     private func actions(_ entry: ProtocolEntry) -> some View {
@@ -100,6 +143,11 @@ struct ProtocolsWindowView: View {
                 .foregroundStyle(.secondary)
                 .accessibilityIdentifier(A11yID.protocolsFooter)
             Spacer()
+            Button("Merge…") { merge.beginMerge(in: entries) }
+                .controlSize(.small)
+                .disabled(!canMerge)
+                .help("Join the selected recordings of one call into a single protocol (select two or more with ⌘-click)")
+                .accessibilityIdentifier(A11yID.protocolsMerge)
             Button("Refresh", action: onRefresh)
                 .controlSize(.small)
         }

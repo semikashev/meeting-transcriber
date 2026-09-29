@@ -306,6 +306,7 @@ struct MeetingTranscriberApp: App {
                     rescanProtocols()
                 },
                 onRefresh: rescanProtocols,
+                onMerge: mergeProtocolEntries,
             )
         }
     }
@@ -438,10 +439,30 @@ struct MeetingTranscriberApp: App {
         let busy = Set(appState.pipeline.queue.jobs
             .filter { $0.state != .done && $0.state != .error }
             .compactMap(\.namingSlug))
+            .union(appState.pipeline.mergingStems)
         let dir = appState.settings.effectiveOutputDir
         let accessing = dir.startAccessingSecurityScopedResource()
         defer { if accessing { dir.stopAccessingSecurityScopedResource() } }
         protocolEntries = ProtocolLibrary.scan(outputDir: dir, busyStems: busy)
+    }
+
+    private func mergeProtocolEntries(_ request: SessionMergeRequest) {
+        let pipeline = appState.pipeline
+        let settings = appState.settings
+        Task {
+            do {
+                try await pipeline.mergeSessions(
+                    request,
+                    outputDir: settings.effectiveOutputDir,
+                    calendar: settings.calendarTitlesEnabled
+                        ? EventKitMeetingLookup { [settings] in settings.calendarTitlesEnabled }
+                        : NoCalendarLookup(),
+                )
+            } catch {
+                appState.notifier.notify(title: "Could not merge recordings", body: error.localizedDescription)
+            }
+            rescanProtocols()
+        }
     }
 
     private func removeProtocolEntry(_ entry: ProtocolEntry, scope: ProtocolRemovalScope) {
