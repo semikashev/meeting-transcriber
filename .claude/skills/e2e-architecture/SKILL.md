@@ -5,7 +5,7 @@ description: Reference for the E2E approaches (fixture-based xctest e2e.yml, liv
 
 # E2E Architecture
 
-Two complementary E2E approaches, run by different workflows. Pick by what
+Three complementary E2E approaches, run by different workflows. Pick by what
 you're validating:
 
 **CI trigger labels:** the heavy self-hosted lanes stay off ordinary PRs (only
@@ -274,9 +274,10 @@ PRs are excluded from the self-hosted runner.
 4. In the GUI session, launch the deployed `.app`
    (`open ~/Applications/MeetingTranscriber-Dev.app`). Click "Allow" on the
    Microphone prompt, and toggle the dev `.app` on under System Settings →
-   Privacy & Security → Screen & System Audio Recording (used for window-title
-   meeting detection — the e2e also has a sandbox-safe power-assertion detector,
-   so this one is belt-and-suspenders).
+   Privacy & Security → Screen & System Audio Recording. Detection does not need
+   it (the production detector is power assertions plus mic input); it sharpens
+   the meeting title and is the audio-tap TCC fallback, see Critical Notes in
+   CLAUDE.md.
 5. Verify Microphone + Screen & System Audio Recording show the dev `.app`
    with the toggle on.
 6. Grant **Accessibility** and **Automation** for the `--naming-escape` lane.

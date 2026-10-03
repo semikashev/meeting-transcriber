@@ -20,7 +20,7 @@ app/MeetingTranscriber/    # Swift macOS menu-bar app (SPM)
                            #   DebugRPCServer + /v1 automation API (#if !APPSTORE).
   Tests/                   # XCTest + ViewInspector; Fixtures/ test audio (two_speakers_de.wav, ...)
   Entitlements/            # Homebrew.entitlements (mic only) + AppStore.entitlements (sandbox)
-  Info.plist               # Bundle metadata
+  Sources/Info.plist       # Bundle metadata
 tools/audiotap/            # AudioTapLib: CATapDescription app-audio + AVAudioEngine mic capture (SPM lib)
 tools/meeting-simulator/   # Meeting simulator for testing
 tools/mt-cli/              # Thin Swift client for DebugRPCServer (+ skill.md)
@@ -106,8 +106,9 @@ the stable-tag ruleset gate → see the `distribution` skill (`.claude/skills/di
 
 ## Git Workflow
 
-Use the `/git-workflow` skill. Commit proactively after every logical unit of work — don't wait for user permission.
+Commit proactively after every logical unit of work — don't wait for user permission.
 
+- **Public remotes:** this fork (`origin`) and `upstream` are public. Before a commit or push, strip private context (personal sites and domains, names, internal details) from code, comments and commit messages and state the reason neutrally.
 - **Conventional Commits:** `<type>(<scope>): <description>` — types: feat, fix, docs, style, refactor, perf, test, chore, build, ci, revert. CI enforces this on the PR title too (`conventional-title` check); the type list there and here must stay in step.
 - **Scopes:** app, test, build, ci, docs
 - **Atomic commits:** one logical change per commit. If you need "and" in the message, split it.
@@ -267,7 +268,7 @@ Suffix constants live as static lets: the audio-file suffixes on `RecordingFileS
 
 - AudioTapLib (CATapDescription) requires macOS 14.2+ — compiled as SPM library, no separate binary needed
 - **Meeting detection** needs no Screen Recording: the watch loop auto-detects via `CompositeMeetingDetector` over `PowerAssertionDetector` (IOKit power assertions) and `MicInputDetector` (Core Audio process objects), neither of which reads window titles. The grant only sharpens the meeting *title* (`CGWindowListCopyWindowInfo`, real title vs. a placeholder) and gates the audio-tap TCC fallback below. The window-title `MeetingDetector` that would require it is not the production detector (issue #562).
-- Audio capture (CATapDescription process tap) is TCC-gated: it needs either the `NSAudioCaptureUsageDescription` "Audio Recording" grant or, as a fallback, the Screen Recording grant. With neither, the tap returns `noErr` but captures silence, with no error and nothing logged (issue #524; measured on macOS 26, see the process-tap TCC-gate notes). This corrects an earlier "does not require Screen Recording" claim.
+- Audio capture (CATapDescription process tap) is TCC-gated: it needs either the `NSAudioCaptureUsageDescription` "Audio Recording" grant or, as a fallback, the Screen Recording grant. With neither, the tap returns `noErr` but captures silence, with no error and nothing logged (issue #524; measured on macOS 26, see the process-tap TCC-gate notes).
 - FluidAudio models are downloaded automatically on first run (~50 MB)
 
 ## GUI Testing
@@ -323,10 +324,9 @@ try picker.select(value: LiveCaptionsSize.small)
 Measured under the pinned ViewInspector 0.10.3, and pinned by
 `ViewInspectorIdentifierTests`: a `Picker` and a `Stepper` each carrying an
 identifier are found and driven, and an unknown identifier throws, so the lookup
-is not matching whatever it is handed. This replaces an earlier note here that
-claimed neither control surfaces a findable identifier. The label and
-document-order locators still in `SettingsInteractionTests` date from that
-belief; they work, and they are not the shape to copy. `find(text:)` for a bare
+is not matching whatever it is handed. The label and document-order locators
+still in `SettingsInteractionTests` predate this; they work, and they are not
+the shape to copy. `find(text:)` for a bare
 label only when the label itself is the behavior under test. An identifier makes a control
 tree-visible;
 press-drivable *additionally* requires a `/ui/press` allowlist entry — never allowlist
@@ -392,7 +392,7 @@ success on a sidebar row without selecting it.
 
 ## E2E Architecture
 
-Two complementary E2E approaches (fixture-based xctest `e2e.yml`, live-recording
+Three complementary E2E approaches (fixture-based xctest `e2e.yml`, live-recording
 `e2e-app.yml`/`scripts/e2e-app.sh`, and browser-meeting `e2e-browser.yml` incl. the
 `--jitsi` real-meeting variant), the CI trigger labels (`run-e2e`/`run-quality`), when
 to pick each, why the live-recording variant exists, and the one-time self-hosted Mac
@@ -438,7 +438,7 @@ Two build variants controlled by compile-time flag `APPSTORE` (`-Xswiftc -DAPPST
 | **Safari call audio** | Yes (`ProcessResponsibility` via `dlsym`) | No (private symbol unavailable; bundle-derived PIDs only) |
 | **Entitlements** | Mic only | Sandbox + mic + network + file picker |
 | **Build** | `./scripts/build_release.sh` | `./scripts/build_release.sh --appstore` |
-| **Tests** | ~1,900 | fewer (CLI + RPC tests excluded via `#if !APPSTORE`) |
+| **Tests** | full suite | fewer (CLI + RPC tests excluded via `#if !APPSTORE`) |
 
 - CLI-specific code lives in `ClaudeCLIProtocolGenerator.swift` and `DebugRPCServer.swift` (each entire file `#if !APPSTORE`)
 - `ProtocolProvider` enum uses `CaseIterable` — `.claudeCLI` case excluded at compile time, picker adapts automatically
