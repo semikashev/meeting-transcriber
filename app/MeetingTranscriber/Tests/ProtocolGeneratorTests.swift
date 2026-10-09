@@ -543,4 +543,33 @@ final class ProtocolGeneratorTests: XCTestCase {
         )
         XCTAssertEqual(mode & 0o777, 0o600)
     }
+
+    // MARK: - Heading
+
+    func testApplyTitleReplacesModelHeading() {
+        let markdown = "# Meeting Protocol - Weekly sync of the team\n**Date:** 2026-10-07\n\n## Summary\nText."
+        XCTAssertEqual(
+            ProtocolGenerator.applyTitle(markdown, title: "INT // Integrations bi-weekly"),
+            "# Meeting Protocol - INT // Integrations bi-weekly\n**Date:** 2026-10-07\n\n## Summary\nText.",
+        )
+    }
+
+    func testApplyTitleReplacesOnlyTheFirstHeading() {
+        let markdown = "# Protokoll - Invented\n\n## Summary\n# Stray heading"
+        let result = ProtocolGenerator.applyTitle(markdown, title: "Planning")
+        XCTAssertTrue(result.hasPrefix("# Meeting Protocol - Planning\n"))
+        XCTAssertTrue(result.hasSuffix("# Stray heading"))
+    }
+
+    func testApplyTitlePrependsHeadingWhenModelWroteNone() {
+        XCTAssertEqual(
+            ProtocolGenerator.applyTitle("## Summary\nText.", title: "Planning"),
+            "# Meeting Protocol - Planning\n\n## Summary\nText.",
+        )
+    }
+
+    func testApplyTitleLeavesMarkdownAloneForBlankTitle() {
+        let markdown = "# Meeting Protocol - Invented\n"
+        XCTAssertEqual(ProtocolGenerator.applyTitle(markdown, title: "  "), markdown)
+    }
 }
