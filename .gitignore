@@ -32,3 +32,6 @@ scripts/fixtures/package-lock.json
 
 # Developer ID provisioning profiles (account artifacts, like the signing cert)
 signing/
+
+# graphify: артефакты графа знаний (генерируются, не коммитим)
+graphify-out/

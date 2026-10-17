@@ -1,0 +1,20 @@
+# ==== graphify: суженный прогон — только приложение и документация ====
+# Полная версия графа (со всеми тестами и stdlib-шумом) сохранена отдельно:
+#   ~/git/.graphify-backups/meeting-transcriber-full-2026-10-17/
+
+# --- не знания, а инфраструктура/артефакты ---
+# Test fixtures: .wav/.mp3/.mp4 сэмплы, снапшоты, иконки
+app/MeetingTranscriber/Tests/
+app/MeetingTranscriber/Tests/Fixtures/
+app/MeetingTranscriber/Tests/__Snapshots__/
+Assets.xcassets
+site/
+site/assets
+docs/*.gif
+release/
+Casks/
+
+# --- CI и утилиты: для архитектуры приложения шум ---
+.github/
+tools/
+scripts/
