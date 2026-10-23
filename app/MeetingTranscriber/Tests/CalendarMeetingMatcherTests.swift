@@ -127,6 +127,29 @@ final class CalendarMeetingMatcherTests: XCTestCase {
         XCTAssertFalse(match.isAmbiguous)
     }
 
+    /// The running-event rule must not hand a call to a long block on one's
+    /// own calendar: a webinar joined a minute before its start was filed
+    /// under the all-afternoon conference block it fell into.
+    func testMeetingAboutToStartBeatsARunningPersonalBlock() throws {
+        let block = event("Conference", from: -120, to: 240, attendees: [])
+        let webinar = event("Webinar", from: 1, to: 61)
+        let match = try XCTUnwrap(CalendarMeetingMatcher.bestMatch(
+            recordingStart: at(0), appName: "Zoom", among: [block, webinar],
+        ))
+        XCTAssertEqual(match.meeting.title, "Webinar")
+        XCTAssertFalse(match.isAmbiguous)
+    }
+
+    /// A link to join makes it a call even with no invitees listed.
+    func testCallLinkAboutToStartBeatsARunningPersonalBlock() throws {
+        let block = event("Conference", from: -120, to: 240, attendees: [])
+        let call = event("Call", from: 1, to: 31, attendees: [], text: "https://telemost.yandex.ru/j/1")
+        let match = try XCTUnwrap(CalendarMeetingMatcher.bestMatch(
+            recordingStart: at(0), appName: "Arc", among: [block, call],
+        ))
+        XCTAssertEqual(match.meeting.title, "Call")
+    }
+
     /// Only an upcoming event in the window: still a match (joined early).
     func testUpcomingEventMatchesWhenNothingIsRunning() {
         let match = CalendarMeetingMatcher.bestMatch(

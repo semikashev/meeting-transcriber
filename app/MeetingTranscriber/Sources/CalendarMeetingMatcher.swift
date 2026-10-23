@@ -47,12 +47,16 @@ struct CalendarMeeting: Equatable, Sendable {
 /// The event must still be running when the recording starts (an early join
 /// is allowed up to `earlyJoin`), because the one failure worth designing
 /// around is a call in the free slot after a meeting inheriting that
-/// meeting's name. An event that is running beats one that has not started
-/// yet: a recording in the last minutes of a meeting belongs to that
-/// meeting, not to the next one on the calendar (measured with the distance
-/// alone: the threshold was exactly the early-join window). Among the rest,
-/// a conference link pointing at the app in use wins, then events with
-/// attendees over personal blocks, then the closest start.
+/// meeting's name. A meeting with others (invitees, or a link to the call)
+/// beats a block on one's own calendar even when only the block is running:
+/// a webinar joined a minute early was filed under the all-afternoon
+/// conference block it fell into. Between two meetings, or two blocks, an
+/// event that is running beats one that has not started yet: a recording in
+/// the last minutes of a meeting belongs to that meeting, not to the next one
+/// on the calendar (measured with the distance alone: the threshold was
+/// exactly the early-join window). Among the rest, a conference link
+/// pointing at the app in use wins, then events with attendees, then the
+/// closest start.
 enum CalendarMeetingMatcher {
     /// How long before an event's start a recording may begin and still count.
     static let earlyJoin: TimeInterval = 15 * 60
@@ -96,9 +100,11 @@ enum CalendarMeetingMatcher {
             guard !event.isAllDay, !title.isEmpty else { return nil }
             guard event.start <= recordingStart.addingTimeInterval(earlyJoin),
                   event.end >= recordingStart else { return nil }
+            let linked = hasConferenceLink(event, forApp: appName)
             var score = 0
+            if !event.attendees.isEmpty || linked { score += 2000 }
             if event.start <= recordingStart { score += 1000 }
-            if hasConferenceLink(event, forApp: appName) { score += 100 }
+            if linked { score += 100 }
             if !event.attendees.isEmpty { score += 10 }
             score -= Int(abs(event.start.timeIntervalSince(recordingStart)) / 60)
             return (event, score)
