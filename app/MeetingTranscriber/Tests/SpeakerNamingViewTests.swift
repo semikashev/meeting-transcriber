@@ -276,6 +276,21 @@ final class SpeakerNamingViewTests: XCTestCase { // swiftlint:disable:this type_
         XCTAssertEqual(mapping, ["SPEAKER_00": "Alice"])
     }
 
+    /// Every field starts out holding the matcher's suggestion, so an empty
+    /// field on a suggested speaker is a suggestion the user removed. It must
+    /// reach the session as an empty name: a label left out keeps its
+    /// suggestion, and the rejected name would be learned anyway.
+    func testBuildMappingReportsAClearedSuggestionAsAnEmptyName() {
+        let speakers: [(label: String, autoName: String?, speakingTime: Double)] = [
+            (label: "SPEAKER_00", autoName: "Alice", speakingTime: 60),
+            (label: "SPEAKER_01", autoName: "Bob", speakingTime: 30),
+            (label: "SPEAKER_02", autoName: nil, speakingTime: 20),
+        ]
+        let names = ["SPEAKER_00": "  ", "SPEAKER_01": "Bob", "SPEAKER_02": ""]
+        let mapping = SpeakerNamingView.buildSpeakerMapping(speakers: speakers, names: names)
+        XCTAssertEqual(mapping, ["SPEAKER_00": "", "SPEAKER_01": "Bob"])
+    }
+
     func testBuildMappingSkipsWhitespaceOnlyNames() {
         let speakers: [(label: String, autoName: String?, speakingTime: Double)] = [
             (label: "SPEAKER_00", autoName: nil, speakingTime: 60),

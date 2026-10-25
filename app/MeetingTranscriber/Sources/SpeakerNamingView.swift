@@ -724,6 +724,11 @@ struct SpeakerNamingView: View { // swiftlint:disable:this type_body_length
             let name = (names[speaker.label] ?? "").trimmingCharacters(in: .whitespaces)
             if !name.isEmpty {
                 mapping[speaker.label] = name
+            } else if speaker.autoName != nil {
+                // The field started out holding the suggestion, so empty means
+                // the user deleted it. Report that, or the session keeps the
+                // suggestion (see `NamingConfirmation`).
+                mapping[speaker.label] = ""
             }
         }
         return mapping
