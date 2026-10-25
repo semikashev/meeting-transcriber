@@ -24,6 +24,8 @@ final class SpeakerNamingSessionTests: XCTestCase {
         /// the write still happens, it just carries less.
         private(set) var updateSpeakerDBEmbeddings: [[String: [Float]]] = []
         private(set) var updateSpeakerDBProvenance: [SampleProvenance] = []
+        /// The names each write would teach, label by label.
+        private(set) var updateSpeakerDBMappings: [[String: String]] = []
         private(set) var metadataUpdates: [(jobID: UUID, slug: String?, mode: DiarizerMode?)] = []
         private(set) var stageStartCount = 0
         private(set) var stageEndCount = 0
@@ -46,13 +48,14 @@ final class SpeakerNamingSessionTests: XCTestCase {
         }
 
         func updateSpeakerDB(
-            matcher _: SpeakerMatcher, mapping _: [String: String],
+            matcher _: SpeakerMatcher, mapping: [String: String],
             embeddings: [String: [Float]], speakingTimes _: [String: TimeInterval],
             provenance: SampleProvenance,
         ) {
             updateSpeakerDBProvenance.append(provenance)
             updateSpeakerDBCallCount += 1
             updateSpeakerDBEmbeddings.append(embeddings)
+            updateSpeakerDBMappings.append(mapping)
         }
 
         func generateProtocol(jobID: UUID, transcript _: String, title: String, protocolsDir _: URL) {
@@ -273,6 +276,42 @@ final class SpeakerNamingSessionTests: XCTestCase {
             mock.updateSpeakerDBProvenance.first,
             SampleProvenance(origin: .meeting, jobID: job.id, meetingTitle: "Standup"),
             "Each learned sample must say which recording taught it, or it cannot be undone",
+        )
+    }
+
+    // MARK: - Cleared suggestion
+
+    /// Wiring only; the outcomes are pinned in `NamingConfirmationTests`. The
+    /// confirm path, which the dialog and the automation API share, must teach
+    /// nothing for a cleared suggestion and take it off the transcript.
+    func testConfirmWithAClearedSuggestionNeitherLearnsNorKeepsIt() async throws {
+        let tmp = try makeTempDirectory(prefix: "SpeakerNamingSessionTests")
+        let transcriptPath = tmp.appendingPathComponent("transcript.txt")
+        try "[00:01] Alice: hi\n[00:02] Bob: hello\n".write(to: transcriptPath, atomically: true, encoding: .utf8)
+        let session = makeSession(outputDir: tmp)
+        let mock = MockDelegate()
+        session.delegate = mock
+        let job = pendingJob(namingSlug: "standup_abcd1234", transcriptPath: transcriptPath)
+        mock.jobs[job.id] = job
+        session.speakerNamingDataByJob[job.id] = PipelineQueue.SpeakerNamingData(
+            jobID: job.id, meetingTitle: "Standup",
+            mapping: ["SPEAKER_0": "Alice", "SPEAKER_1": "Bob"],
+            speakingTimes: ["SPEAKER_0": 30, "SPEAKER_1": 30],
+            embeddings: ["SPEAKER_0": [1, 0, 0], "SPEAKER_1": [0, 1, 0]],
+            audioPath: nil, segments: [], participants: [], isDualSource: false,
+        )
+
+        session.completeSpeakerNaming(
+            jobID: job.id, result: .confirmed(["SPEAKER_0": "", "SPEAKER_1": "Bob"]), source: .dialog,
+        )
+
+        await waitUntil { mock.jobs[job.id]?.state == .done }
+        let taught = try XCTUnwrap(mock.updateSpeakerDBMappings.first)
+        XCTAssertEqual(taught["SPEAKER_0"], "SPEAKER_0", "the cleared label goes back to unnamed")
+        XCTAssertEqual(taught["SPEAKER_1"], "Bob")
+        XCTAssertEqual(
+            try String(contentsOf: transcriptPath, encoding: .utf8),
+            "[00:01] SPEAKER_0: hi\n[00:02] Bob: hello\n",
         )
     }
 

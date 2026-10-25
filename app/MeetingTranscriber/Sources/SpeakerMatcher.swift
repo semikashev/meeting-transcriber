@@ -245,7 +245,8 @@ class SpeakerMatcher {
         now: Date = Date(),
     ) -> [String: SampleAdmission] {
         let confirmed = mapping
-            .filter { label, name in name != label && embeddings[label] != nil }
+            // An empty name is a suggestion the user cleared (see `NamingConfirmation`).
+            .filter { label, name in !name.isEmpty && name != label && embeddings[label] != nil }
             .sorted { lhs, rhs in
                 let l = speakingTimes[lhs.key] ?? 0
                 let r = speakingTimes[rhs.key] ?? 0

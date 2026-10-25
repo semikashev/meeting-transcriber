@@ -558,6 +558,18 @@ final class SpeakerMatcherTests: XCTestCase {
         XCTAssertEqual(loaded[0].name, "Speaker A")
     }
 
+    /// The naming dialog reports a suggestion the user cleared as an empty
+    /// name, and voice enrollment hands its mapping straight to `updateDB`.
+    func testUpdateDBSkipsAnEmptyName() {
+        let matcher = SpeakerMatcher(dbPath: dbPath)
+        matcher.updateDB(
+            mapping: ["SPEAKER_0": "Speaker A", "SPEAKER_1": ""],
+            embeddings: ["SPEAKER_0": [1, 0, 0], "SPEAKER_1": [0, 1, 0]],
+            speakingTimes: ["SPEAKER_0": 10, "SPEAKER_1": 10],
+        )
+        XCTAssertEqual(matcher.loadDB().map(\.name), ["Speaker A"])
+    }
+
     // MARK: - Migration
 
     func testMigrateOldFormatResetsDB() throws {

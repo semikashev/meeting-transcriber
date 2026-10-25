@@ -189,6 +189,12 @@ Request body:
 { "mapping": { "Speaker 1": "Alice", "Speaker 2": "Bob" } }
 ```
 
+A label left out of `mapping` keeps its `suggested` name. A label mapped to an
+empty string rejects its suggestion: the speaker stays unnamed, the voice is not
+learned, and the suggested name is removed from the transcript where no other
+label carries it. This is what the naming dialog sends when the user clears a
+suggested name.
+
 Responses:
 
 - `200 OK` on success.

@@ -24,10 +24,7 @@ extension SpeakerNamingSession {
 
         // Update speaker matcher DB
         let matcher = speakerMatcherFactory()
-        var fullMapping = namingData.mapping
-        for (label, name) in mapping where !name.isEmpty {
-            fullMapping[label] = name
-        }
+        let fullMapping = NamingConfirmation.resolvedNames(suggested: namingData.mapping, confirmed: mapping)
         // Hold back what an echo-affected recording must not teach the app. The
         // filter sits here rather than in `updateDB` because this is the only
         // place a job's embeddings reach the database, and it is the last point
@@ -73,7 +70,10 @@ extension SpeakerNamingSession {
 
         if let transcriptPath = job.transcriptPath {
             do {
-                var transcript = try String(contentsOf: transcriptPath, encoding: .utf8)
+                var transcript = try NamingConfirmation.revertClearedSuggestions(
+                    in: String(contentsOf: transcriptPath, encoding: .utf8),
+                    suggested: namingData.mapping, confirmed: mapping,
+                )
                 // Format from `TimestampedSegment.formattedLine`: `[MM:SS] Speaker: text`.
                 // Anchor the replace on `] ` + label + `:` so we hit the speaker
                 // slot and not a substring inside the spoken text.
