@@ -469,7 +469,7 @@ class WatchLoop {
         participants: [String] = [],
         calendarMayName: Bool = true,
     ) {
-        let (title, participants, participantEmails) = calendarNamed(
+        let (title, participants, participantEmails, fromCalendar) = calendarNamed(
             title: title, participants: participants, appName: appName,
             recording: recording, calendarMayName: calendarMayName,
         )
@@ -513,6 +513,8 @@ class WatchLoop {
             participants: participants,
             participantEmails: participantEmails.isEmpty ? nil : participantEmails,
             meetingStartTime: recording.recordingStartDate,
+            // A title the calendar may not overrule was typed by the user.
+            titleNamesMeeting: fromCalendar || !calendarMayName,
         )
         pipelineQueue?.enqueue(job)
         logger.info("Enqueued pipeline job for: \(title, privacy: .private)")

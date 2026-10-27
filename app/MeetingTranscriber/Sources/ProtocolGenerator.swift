@@ -161,6 +161,33 @@ enum ProtocolGenerator {
         ].joined(separator: "\n") + "\n\n"
     }
 
+    // MARK: - Heading
+
+    static let headingPrefix = "Meeting Protocol - "
+
+    /// Put the recording's title into the protocol heading.
+    ///
+    /// The prompt asks the model for `# Meeting Protocol - [Meeting Title]`,
+    /// but the model never sees the title, so it invents one from the
+    /// transcript. A calendar event or a title the user typed is the name the
+    /// meeting is known by, and it already names the file; the heading has to
+    /// agree with it. Callers apply this only to such titles
+    /// (`PipelineJob.titleNamesMeeting`): an app name or a window title says
+    /// less about the meeting than the model's own heading.
+    ///
+    /// The first `# ` line is replaced; with none, a heading is prepended.
+    static func applyTitle(_ markdown: String, title: String) -> String {
+        let title = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty else { return markdown }
+        let heading = "# \(headingPrefix)\(title)"
+        var lines = markdown.components(separatedBy: "\n")
+        guard let index = lines.firstIndex(where: { $0.hasPrefix("# ") }) else {
+            return heading + "\n\n" + markdown
+        }
+        lines[index] = heading
+        return lines.joined(separator: "\n")
+    }
+
     // MARK: - File Operations
 
     /// Save a transcript to a text file.

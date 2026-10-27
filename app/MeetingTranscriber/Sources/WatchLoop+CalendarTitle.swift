@@ -25,13 +25,13 @@ extension WatchLoop {
         appName: String,
         recording: RecordingResult,
         calendarMayName: Bool,
-    ) -> (title: String, participants: [String], participantEmails: [String]) {
-        guard calendarMayName else { return (title, participants, []) }
+    ) -> (title: String, participants: [String], participantEmails: [String], fromCalendar: Bool) {
+        guard calendarMayName else { return (title, participants, [], false) }
         let start = recording.recordingStartDate == .distantPast ? nowProvider() : recording.recordingStartDate
         guard let meeting = calendarLookup.meeting(startingAt: start, appName: appName) else {
-            return (title, participants, [])
+            return (title, participants, [], false)
         }
         logger.info("Recording named after calendar event: \(meeting.title, privacy: .private)")
-        return (meeting.title, participants.isEmpty ? meeting.attendees : participants, meeting.attendeeEmails)
+        return (meeting.title, participants.isEmpty ? meeting.attendees : participants, meeting.attendeeEmails, true)
     }
 }

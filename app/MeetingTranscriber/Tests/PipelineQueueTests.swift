@@ -1977,6 +1977,50 @@ final class PipelineQueueTests: XCTestCase {
         )
     }
 
+    // MARK: - Protocol heading from the meeting title
+
+    /// Writes its own heading, as a real model does: it never sees the title.
+    private final class InventedHeadingProtocolGen: MockProtocolGen {
+        override func generate(transcript: String, title: String, diarized: Bool, meetingStartTime: Date?) throws -> String {
+            _ = try super.generate(transcript: transcript, title: title, diarized: diarized, meetingStartTime: meetingStartTime)
+            return "# Meeting Protocol - Invented by the model\n\n## Summary\nText."
+        }
+    }
+
+    private func protocolHeading(titleNamesMeeting: Bool) async throws -> String {
+        let engine = MockEngine()
+        engine.segmentsToReturn = [TimestampedSegment(start: 0, end: 5, text: "Hello world")]
+        let diar = MockDiarization()
+        diar.resultToReturn = DiarizationResult(
+            segments: [.init(start: 0, end: 5, speaker: "SPEAKER_0")],
+            speakingTimes: ["SPEAKER_0": 5],
+            autoNames: [:],
+            embeddings: nil,
+        )
+        let q = makeCapturingQueue(engine: engine, diar: diar, protocolGen: InventedHeadingProtocolGen())
+        try q.enqueue(PipelineJob(
+            meetingTitle: "Weekly planning", appName: "Teams",
+            mixPath: createTestAudioFile(in: tmpDir), appPath: nil, micPath: nil, micDelay: 0,
+            titleNamesMeeting: titleNamesMeeting,
+        ))
+        await q.processNext()
+        let path = try XCTUnwrap(q.jobs.first?.protocolPath)
+        return try String(contentsOf: path, encoding: .utf8).components(separatedBy: "\n")[0]
+    }
+
+    /// A calendar event or a typed title is what the meeting is called, so it
+    /// replaces the heading the model invented.
+    func testMeetingTitleReplacesTheModelHeading() async throws {
+        let heading = try await protocolHeading(titleNamesMeeting: true)
+        XCTAssertEqual(heading, "# Meeting Protocol - Weekly planning")
+    }
+
+    /// An app name or window title says less than the model's heading.
+    func testFallbackTitleKeepsTheModelHeading() async throws {
+        let heading = try await protocolHeading(titleNamesMeeting: false)
+        XCTAssertEqual(heading, "# Meeting Protocol - Invented by the model")
+    }
+
     // MARK: - Relocated Audio Paths (#726)
 
     /// After stage 3 hands the audio to the output folder, the job has to name

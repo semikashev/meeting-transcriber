@@ -87,6 +87,15 @@ struct PipelineJob: Identifiable, Codable {
     /// protocol prompts must preserve `nil` so they never treat processing time
     /// as authoritative meeting context.
     var meetingStartTime: Date?
+    /// The title is the meeting's own name: the calendar event the recording
+    /// fell into, or a title the user typed. Only then does it replace the
+    /// heading the model wrote into the protocol; an app name or a window
+    /// title says less than the model's heading does.
+    ///
+    /// Optional so snapshots saved before the field existed still decode;
+    /// nil and false both keep the model's heading, so callers read `== true`.
+    // swiftlint:disable:next discouraged_optional_boolean
+    var titleNamesMeeting: Bool?
 
     /// Timestamp used only for output artifact names. Reimports and recovery
     /// have no real meeting start, so their filenames use enqueue time.
@@ -193,6 +202,7 @@ struct PipelineJob: Identifiable, Codable {
         // swiftlint:disable:next discouraged_optional_collection
         participantEmails: [String]? = nil,
         meetingStartTime: Date? = nil,
+        titleNamesMeeting: Bool = false,
         autoSkipNaming: Bool = false,
         // swiftlint:disable:next discouraged_optional_boolean
         includeFullTranscriptInProtocol: Bool? = nil,
@@ -210,6 +220,7 @@ struct PipelineJob: Identifiable, Codable {
         self.participantEmails = participantEmails
         self.enqueuedAt = Date()
         self.meetingStartTime = meetingStartTime
+        self.titleNamesMeeting = titleNamesMeeting
         self.state = .waiting
         self.error = nil
         self.warnings = []

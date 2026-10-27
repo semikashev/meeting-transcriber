@@ -959,12 +959,15 @@ extension PipelineQueue {
             let diarized = transcript.range(
                 of: #"\[\w[\w\s]*\]"#, options: .regularExpression,
             ) != nil
-            let protocolMD = try await generator.generate(
+            let generated = try await generator.generate(
                 transcript: transcript,
                 title: title,
                 diarized: diarized,
                 meetingStartTime: meetingStartTime,
             )
+            let protocolMD = job?.titleNamesMeeting == true
+                ? ProtocolGenerator.applyTitle(generated, title: job?.meetingTitle ?? title)
+                : generated
             let markdown = transcriptOutputOptions(forJobID: jobID).includeFullTranscriptInProtocol
                 ? protocolMD + "\n\n---\n\n## Full Transcript\n\n" + transcript
                 : protocolMD
