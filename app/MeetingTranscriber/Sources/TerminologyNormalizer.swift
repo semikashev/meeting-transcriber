@@ -5,7 +5,10 @@ import Foundation
 /// whole-word/phrase and case-insensitive. Rules are bounded before compiling
 /// regular expressions because this runs on the main-actor pipeline path.
 struct TerminologyNormalizer: Sendable {
-    static let maximumRulesTextBytes = 64 * 1024
+    // Raised from upstream's 64 KB: one rule per case form, each with its
+    // spoken variants, filled 64 KB with ~700 rules, below the count cap. The
+    // cap that bounds matching is the rule count; bytes only bound parsing.
+    static let maximumRulesTextBytes = 256 * 1024
     // Raised from upstream's 200: Russian needs one rule per case form, so 200
     // covered only ~35 declinable terms. Matching cost is linear in rule count.
     static let maximumRuleCount = 1000

@@ -77,6 +77,23 @@ final class TerminologyNormalizerTests: XCTestCase {
         XCTAssertTrue(normalizer.diagnostics.isTooLarge)
     }
 
+    /// A Russian rule set needs one rule per case form with many spoken
+    /// variants each, and outgrew 64 KB while still far below the rule count
+    /// cap. Over the byte limit nothing applies at all, so the headroom is
+    /// what this pins.
+    func testRuleSetOfTwoHundredKilobytesStillApplies() {
+        let rules = (0 ..< 280).map { rule in
+            "Canonical\(rule) => " + (0 ..< 20).map { "вариант \($0) термина \(rule)" }.joined(separator: " | ")
+        }.joined(separator: "\n")
+        XCTAssertGreaterThan(rules.utf8.count, 200 * 1024)
+
+        let normalizer = TerminologyNormalizer(rulesText: rules)
+
+        XCTAssertFalse(normalizer.diagnostics.isTooLarge)
+        XCTAssertEqual(normalizer.diagnostics.activeRuleCount, 280)
+        XCTAssertEqual(normalizer.normalize("сказал вариант 3 термина 271 вчера"), "сказал Canonical271 вчера")
+    }
+
     func testRuleLimitAcceptsMaximumRuleCount() {
         let validRules = (0 ..< TerminologyNormalizer.maximumRuleCount)
             .map { "Canonical\($0) => variant\($0)" }
