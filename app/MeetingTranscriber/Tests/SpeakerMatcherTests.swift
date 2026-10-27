@@ -979,10 +979,47 @@ final class SpeakerMatcherTests: XCTestCase {
         matcher.saveDB([StoredSpeaker(name: "Speaker A", embeddings: [[1, 0, 0]])])
         let result = matcher.match(
             embeddings: ["M_S1": [0.99, 0.05, 0], "R_S1": [0.95, 0.1, 0]],
-            speakingTimes: ["M_S1": 5, "R_S1": 300],
+            speakingTimes: ["M_S1": 15, "R_S1": 300],
         )
         XCTAssertEqual(result["R_S1"], "Speaker A")
         XCTAssertEqual(result["M_S1"], "M_S1")
+    }
+
+    // MARK: - match: too little speech
+
+    func testMatchLeavesALabelWithTooLittleSpeechUnnamedButStillRanksIt() {
+        // A few seconds of fragments gives an embedding that sits near many
+        // voices at once; the name it gets is a guess, so none is suggested.
+        let matcher = SpeakerMatcher(dbPath: dbPath)
+        matcher.saveDB([StoredSpeaker(name: "Speaker A", embeddings: [[1, 0, 0]], centroid: [1, 0, 0])])
+        let short = SpeakerMatcher.minSpeakingTimeForAutoName - 1
+
+        let result = matcher.matchVerbose(embeddings: ["R_S1": [0.99, 0.01, 0]], speakingTimes: ["R_S1": short])
+
+        XCTAssertEqual(result["R_S1"]?.assignedName, "R_S1")
+        XCTAssertEqual(result["R_S1"]?.topCandidates.first?.name, "Speaker A", "the dialog still shows who it resembles")
+    }
+
+    func testMatchNamesALabelWithExactlyTheMinimumSpeech() {
+        let matcher = SpeakerMatcher(dbPath: dbPath)
+        matcher.saveDB([StoredSpeaker(name: "Speaker A", embeddings: [[1, 0, 0]], centroid: [1, 0, 0])])
+        let result = matcher.match(
+            embeddings: ["R_S1": [0.99, 0.01, 0]],
+            speakingTimes: ["R_S1": SpeakerMatcher.minSpeakingTimeForAutoName],
+        )
+        XCTAssertEqual(result["R_S1"], "Speaker A")
+    }
+
+    func testParticipantsAreNotHandedToALabelWithTooLittleSpeech() {
+        // A short noise cluster used to make the count of unnamed labels match
+        // the calendar's, and then took a participant's name.
+        let result = SpeakerMatcher.preMatchParticipants(
+            mapping: ["R_S1": "R_S1", "R_S2": "R_S2"],
+            speakingTimes: ["R_S1": 300, "R_S2": SpeakerMatcher.minSpeakingTimeForAutoName - 1],
+            participants: ["Anna"],
+        )
+        XCTAssertEqual(result["R_S1"], "Anna")
+        XCTAssertEqual(result["R_S2"], "R_S2")
     }
 
     func testMatchNamesTwoClustersOfOneVoiceOnOneTrackAlike() {

@@ -18,6 +18,15 @@ class SpeakerMatcher {
     /// into the centroid. Short snippets are still kept as fallback samples
     /// but don't pollute the running average.
     static let minSpeakingTimeForCentroid: TimeInterval = 3.0
+    /// A label heard for less than this gets no automatic name, from the
+    /// voice database or from the participant list; the dialog still ranks
+    /// candidates for it. Short fragments (interjections, crosstalk, noise)
+    /// give embeddings that crowd into one region near many voices, so the
+    /// name they get is mostly a guess. In the recognition log, suggestions
+    /// for labels under 10 s were accepted 4 times and rejected 19 times. On
+    /// a replay of 86 meetings against a fixed database the gate took wrong
+    /// names from 20 to 11 and correct ones from 296 to 289.
+    static let minSpeakingTimeForAutoName: TimeInterval = 10
     /// Process-wide lock for read-modify-write sequences against
     /// `speakers.json`. The RPC handlers, the pipeline-job confirmation
     /// path, the KnownVoices UI, and voice enrollment can all mutate the
@@ -135,8 +144,10 @@ class SpeakerMatcher {
 
             let best = scored.first
             let second = scored.count > 1 ? scored[1] : nil
+            let tooLittleSpeech = Self.hasTooLittleSpeech(label, in: speakingTimes)
             let assignedName: String
-            if let best,
+            if !tooLittleSpeech,
+               let best,
                best.hybrid < threshold,
                (second?.hybrid ?? .greatestFiniteMagnitude) - best.hybrid >= confidenceMargin {
                 assignedName = best.name
@@ -148,6 +159,7 @@ class SpeakerMatcher {
                 label: label, best: best, second: second,
                 assigned: assignedName,
                 thresholds: (distance: threshold, margin: confidenceMargin),
+                tooLittleSpeech: tooLittleSpeech,
             )
             result[label] = VerboseMatch(
                 assignedName: assignedName, topCandidates: Array(scored.prefix(topK)),
@@ -155,6 +167,13 @@ class SpeakerMatcher {
         }
 
         return result
+    }
+
+    /// True when the diarizer heard `label` for less than
+    /// `minSpeakingTimeForAutoName`. A label without a known time is not held
+    /// back: callers that pass no times keep the behaviour they had.
+    static func hasTooLittleSpeech(_ label: String, in speakingTimes: [String: TimeInterval]) -> Bool {
+        speakingTimes[label].map { $0 < minSpeakingTimeForAutoName } ?? false
     }
 
     /// Labels ordered by speaking time, longest first; key order breaks ties.
@@ -527,9 +546,12 @@ class SpeakerMatcher {
         participants: [String],
         excludeLabels: Set<String> = [],
     ) -> [String: String] {
-        // Find unmatched labels: name equals raw label (not yet named) and not excluded
+        // Find unmatched labels: name equals raw label (not yet named), not
+        // excluded, and long enough to be named at all. A short noise cluster
+        // counted here used to complete an exact count and take a name.
         let unmatchedLabels = mapping.keys.filter { label in
             mapping[label] == label && !excludeLabels.contains(label)
+                && !hasTooLittleSpeech(label, in: speakingTimes)
         }
 
         // Find unused participants: not already assigned as a value in mapping

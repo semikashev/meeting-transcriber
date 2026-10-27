@@ -14,10 +14,17 @@ extension SpeakerMatcher {
         second: TopCandidate?,
         assigned: String,
         thresholds: (distance: Float, margin: Float),
+        tooLittleSpeech: Bool = false,
     ) {
         guard let best else {
             logger.info(
                 "speaker_match label=\(label, privacy: .public) result=no_candidates",
+            )
+            return
+        }
+        if tooLittleSpeech {
+            logger.info(
+                "speaker_match_rejected label=\(label, privacy: .public) reason=too_little_speech dist=\(best.hybrid, privacy: .public) candidate=\(best.name.pseudonymized, privacy: .public)",
             )
             return
         }
