@@ -63,6 +63,11 @@ extension SpeakerMatcher {
                 logger.info(
                     "speaker_sample_held label=\(label, privacy: .public) reason=ambiguous nearest=\(nearest.pseudonymized, privacy: .public)",
                 )
+
+            case let .hub(near):
+                logger.info(
+                    "speaker_sample_held label=\(label, privacy: .public) reason=hub near=\(near.count, privacy: .public)",
+                )
             }
         }
     }

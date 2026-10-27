@@ -450,6 +450,35 @@ final class SpeakerMatcherTests: XCTestCase {
         XCTAssertEqual(matcher.loadDB().first { $0.name == "Speaker B" }?.embeddings.count, 2)
     }
 
+    func testUpdateDBRejectsAVectorThatSitsCloseToSeveralPeopleAtOnce() {
+        // Close to its own name, and also close to two other people: a vector
+        // like that is the shape short fragments and noise take, and learned
+        // under any name it pulls everyone's fragments to that name.
+        let matcher = SpeakerMatcher(dbPath: dbPath)
+        matcher.saveDB([
+            StoredSpeaker(name: "Speaker A", embeddings: [[1, 0, 0]], centroid: [1, 0, 0]),
+            StoredSpeaker(name: "Speaker B", embeddings: [[0.9, 0.3, 0]], centroid: [0, 1, 0]),
+            StoredSpeaker(name: "Speaker C", embeddings: [[0.9, 0, 0.3]], centroid: [0, 0, 1]),
+        ])
+        let outcome = matcher.updateDB(
+            mapping: ["S0": "Speaker A"], embeddings: ["S0": [1, 0, 0]], speakingTimes: ["S0": 30],
+        )
+        XCTAssertEqual(outcome["S0"], .hub(near: ["Speaker B", "Speaker C"]))
+        XCTAssertEqual(matcher.loadDB().first { $0.name == "Speaker A" }?.embeddings.count, 1)
+    }
+
+    func testUpdateDBAdmitsAVectorCloseToOnlyOneOtherPerson() {
+        let matcher = SpeakerMatcher(dbPath: dbPath)
+        matcher.saveDB([
+            StoredSpeaker(name: "Speaker A", embeddings: [[1, 0, 0]], centroid: [1, 0, 0]),
+            StoredSpeaker(name: "Speaker B", embeddings: [[0.9, 0.3, 0]], centroid: [0, 1, 0]),
+        ])
+        let outcome = matcher.updateDB(
+            mapping: ["S0": "Speaker A"], embeddings: ["S0": [1, 0, 0]], speakingTimes: ["S0": 30],
+        )
+        XCTAssertEqual(outcome["S0"], .admitted)
+    }
+
     func testUpdateDBLetsTheLongerSpeakerClaimAVoiceSharedWithinOneRecording() {
         // Two labels of one recording carry near-identical embeddings under two
         // names. The one with more speech is written first and becomes the anchor.
