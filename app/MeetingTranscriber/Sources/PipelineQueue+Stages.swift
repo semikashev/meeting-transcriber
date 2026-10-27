@@ -231,7 +231,6 @@ extension PipelineQueue {
                 ctx: ctx, workDir: workDir, outputDir: outputDir,
             )
         } catch is CancellationError {
-            stopElapsedTimer()
             // Cleared here too, not only in the branch below. The set is what
             // tells a later generic error apart from a cancellation, so an ID
             // left in it outlives the job it described for the rest of the
@@ -241,7 +240,6 @@ extension PipelineQueue {
             logger.info("Job \(ctx.jobID) cancelled")
             // Job already removed by cancelJob()
         } catch {
-            stopElapsedTimer()
             if cancelledJobIDs.remove(ctx.jobID) != nil {
                 logger.info("Job \(ctx.jobID) cancelled")
             } else {
@@ -436,7 +434,6 @@ extension PipelineQueue {
         _ ctx: JobContext, engine: any TranscribingEngine, workDir: URL,
     ) async throws -> TranscriptionOutput {
         updateJobState(id: ctx.jobID, to: .transcribing)
-        startElapsedTimer()
         logger.info("[\(ctx.shortID, privacy: .public)] transcription_start title=\(ctx.title, privacy: .private)")
 
         // Snapshot terminology once per job. A user edit while either track is
@@ -487,8 +484,6 @@ extension PipelineQueue {
             // to annotate.
             transcript = segments.transcriptText(note: nil)
         }
-
-        stopElapsedTimer()
 
         let segCount = cachedSegments?.count ?? 0
         let totalSecs = cachedSegments?.last?.end ?? 0
@@ -559,7 +554,6 @@ extension PipelineQueue {
         }
 
         updateJobState(id: ctx.jobID, to: .diarizing)
-        startElapsedTimer()
         do {
             // Inside the block on purpose: preparing the mix is part of
             // diarizing, and this catch is what keeps a diarization problem from
@@ -859,8 +853,9 @@ extension PipelineQueue {
             jobs[idx].transcriptPath = txtPath
             jobs[idx].namingSlug = ctx.slug
             // Where the sidecars below land, so a later restore can clean them
-            // up even if the output folder setting has moved on since.
-            jobs[idx].sidecarOutputDir = outputDir
+            // up even if the output folder setting has moved on since. Records
+            // rather than overwrites; see `previousSidecarOutputDirs`.
+            jobs[idx].recordSidecarOutputDir(outputDir)
         }
 
         let recordingsDir = outputDir.appendingPathComponent("recordings")
@@ -908,7 +903,6 @@ extension PipelineQueue {
             )
         }
 
-        stopElapsedTimer()
         if let namingData = naming.speakerNamingDataByJob[ctx.jobID] {
             updateJobState(id: ctx.jobID, to: .speakerNamingPending)
             // Auto-pop the dialog now that the job is in the right state.
@@ -948,27 +942,54 @@ extension PipelineQueue {
         // only after a transcript exists, so namingSlug is set on every real
         // path; the fallback just keeps generation working if the job is gone.
         let job = jobs.first { $0.id == jobID }
-        let basename = job?.namingSlug
+        let initialBasename = job?.namingSlug
             ?? Self.namingSlug(title: title, jobID: jobID, startTime: Date())
         let meetingStartTime = job?.meetingStartTime
+        updateJobState(id: jobID, to: .generatingProtocol)
+        let protocolMD: String
         do {
-            updateJobState(id: jobID, to: .generatingProtocol)
-            startElapsedTimer()
             let diarized = transcript.range(
                 of: #"\[\w[\w\s]*\]"#, options: .regularExpression,
             ) != nil
-            let protocolMD = try await generator.generate(
+            protocolMD = try await generator.generate(
                 transcript: transcript,
                 title: title,
                 diarized: diarized,
                 meetingStartTime: meetingStartTime,
             )
-            let markdown = transcriptOutputOptions(forJobID: jobID).includeFullTranscriptInProtocol
-                ? protocolMD + "\n\n---\n\n## Full Transcript\n\n" + transcript
-                : protocolMD
-            let mdPath = try ProtocolGenerator.saveProtocol(
-                markdown, basename: basename, dir: protocolsDir,
+        } catch {
+            // Every ProtocolGenerating error's message is now guaranteed
+            // content-free: ClaudeCLIProtocolGenerator sources cliFailed's
+            // text from the stream-json result event (never generated
+            // content, see ClaudeCLIProtocolGenerator.publicFailureMessage)
+            // or a fixed placeholder, never from the accumulated protocol
+            // text; every other case (cliNotFound, timeout, emptyProtocol,
+            // and OpenAIProtocolGenerator's connection/HTTP errors) already
+            // only ever carried diagnostic text. Safe to log at .public —
+            // restores the visibility traded away in PR #692's 4th commit.
+            logger.warning("[\(shortID, privacy: .public)] protocol_generation_failed error=\(error.localizedDescription, privacy: .public)")
+            addWarning(id: jobID, "Protocol generation failed — transcript saved")
+            return
+        }
+
+        let outputOptions = transcriptOutputOptions(forJobID: jobID)
+        var basename = initialBasename
+        // A job cancelled or removed during the LLM call is gone, and
+        // `transcriptOutputOptions` then answers from the queue-wide setting
+        // rather than the job's own: its files are not ours to rename.
+        if outputOptions.useAITitleForFilenames,
+           jobs.contains(where: { $0.id == jobID }),
+           let titleSlug = ProtocolGenerator.extractTitle(from: protocolMD).flatMap(ProtocolGenerator.toSnakeCase) {
+            basename = renameJobArtifacts(
+                jobID: jobID, from: initialBasename, titleSlug: titleSlug, protocolsDir: protocolsDir,
             )
+        }
+
+        let markdown = outputOptions.includeFullTranscriptInProtocol
+            ? protocolMD + "\n\n---\n\n## Full Transcript\n\n" + transcript
+            : protocolMD
+        do {
+            let mdPath = try ProtocolGenerator.saveProtocol(markdown, basename: basename, dir: protocolsDir)
             logger.info("[\(shortID, privacy: .public)] protocol_saved file=\(mdPath.lastPathComponent, privacy: .private)")
             if let idx = jobs.firstIndex(where: { $0.id == jobID }) {
                 jobs[idx].protocolPath = mdPath
@@ -988,21 +1009,98 @@ extension PipelineQueue {
                 ),
                 protocolPath: mdPath,
             ) { [weak self] message in self?.addWarning(id: jobID, message) }
-            stopElapsedTimer()
         } catch {
-            // Every ProtocolGenerating error's message is now guaranteed
-            // content-free: ClaudeCLIProtocolGenerator sources cliFailed's
-            // text from the stream-json result event (never generated
-            // content, see ClaudeCLIProtocolGenerator.publicFailureMessage)
-            // or a fixed placeholder, never from the accumulated protocol
-            // text; every other case (cliNotFound, timeout, emptyProtocol,
-            // and OpenAIProtocolGenerator's connection/HTTP errors) already
-            // only ever carried diagnostic text. Safe to log at .public —
-            // restores the visibility traded away in PR #692's 4th commit.
-            logger.warning("[\(shortID, privacy: .public)] protocol_generation_failed error=\(error.localizedDescription, privacy: .public)")
-            addWarning(id: jobID, "Protocol generation failed — transcript saved")
-            stopElapsedTimer()
+            // Private, unlike the generation failure above: a file-write
+            // CocoaError names the file, and the file name is the meeting title.
+            logger.warning("[\(shortID, privacy: .public)] protocol_save_failed error=\(error.localizedDescription, privacy: .private)")
+            addWarning(id: jobID, "Protocol was generated but could not be saved; the transcript was saved")
         }
+    }
+
+    /// Gives a job's artifacts the stem built from the AI meeting title
+    /// (`titleSlug`), and returns the stem the job carries afterwards: the new
+    /// one, or `oldStem` when nothing was renamed.
+    ///
+    /// All-or-nothing. The plan names every file explicitly (see
+    /// `ArtifactRenamePlan`) and never overwrites: a stem is only taken when none
+    /// of its artifacts exist, so another meeting's audio can't be replaced, and
+    /// a move onto an existing file fails instead of deleting it. If any move
+    /// fails the ones already done are undone and the job keeps its old stem and
+    /// paths, so the paths on the job never point at files that aren't there.
+    /// Only a failed undo (a file that moved and cannot move back) leaves files
+    /// under the new name, and the warning on the job says so.
+    ///
+    /// Job paths are repointed only for files that actually moved, and
+    /// `meetingTitle` is left alone: it is the caller's title, read back through
+    /// `/state` and `/v1/jobs`, and it is the input to later protocol runs.
+    @discardableResult
+    func renameJobArtifacts(
+        jobID: UUID,
+        from oldStem: String,
+        titleSlug: String,
+        protocolsDir: URL,
+    ) -> String {
+        let fm = FileManager.default
+        let shortID = PipelineJob.shortID(for: jobID)
+        let dirs = ArtifactRenamePlan.Directories(
+            protocols: protocolsDir,
+            recordings: protocolsDir.deletingLastPathComponent().appendingPathComponent("recordings"),
+        )
+        let exists: (URL) -> Bool = { fm.fileExists(atPath: $0.path) }
+
+        guard let newStem = ArtifactRenamePlan.availableStem(
+            titleSlug: titleSlug, shortID: shortID, currentStem: oldStem, in: dirs, exists: exists,
+        ) else {
+            logger.warning("[\(shortID, privacy: .public)] ai_title_rename_skipped reason=no_free_name")
+            return oldStem
+        }
+        guard newStem != oldStem else { return oldStem }
+
+        let moves = ArtifactRenamePlan.moves(from: oldStem, to: newStem, in: dirs, exists: exists)
+        var done: [ArtifactRenamePlan.Move] = []
+        do {
+            for move in moves {
+                try fm.moveItem(at: move.from, to: move.to)
+                done.append(move)
+            }
+        } catch {
+            var undoFailed = false
+            for move in done.reversed() {
+                do {
+                    try fm.moveItem(at: move.to, to: move.from)
+                } catch {
+                    undoFailed = true
+                    logger
+                        .error(
+                            "[\(shortID, privacy: .public)] ai_title_rename_undo_failed file=\(move.from.lastPathComponent, privacy: .private) error=\(error.localizedDescription, privacy: .private)",
+                        )
+                }
+            }
+            logger.warning("[\(shortID, privacy: .public)] ai_title_rename_failed error=\(error.localizedDescription, privacy: .private)")
+            addWarning(
+                id: jobID,
+                undoFailed
+                    ? "Could not rename the output files to the AI meeting title, and some could not be moved back; check the output folder"
+                    : "Could not rename the output files to the AI meeting title; the original names were kept",
+            )
+            return oldStem
+        }
+        logger.info("[\(shortID, privacy: .public)] ai_title_rename moved=\(done.count, privacy: .public)")
+
+        if let idx = jobs.firstIndex(where: { $0.id == jobID }) {
+            func moved(_ url: URL?) -> URL? {
+                guard let url else { return nil }
+                return done.first { $0.from.standardizedFileURL == url.standardizedFileURL }?.to ?? url
+            }
+            jobs[idx].namingSlug = newStem
+            jobs[idx].transcriptPath = moved(jobs[idx].transcriptPath)
+            jobs[idx].protocolPath = moved(jobs[idx].protocolPath)
+            jobs[idx].recordRelocatedAudio(RelocatedAudioPaths(
+                mix: moved(jobs[idx].mixPath), app: moved(jobs[idx].appPath), mic: moved(jobs[idx].micPath),
+            ))
+            saveSnapshot()
+        }
+        return newStem
     }
 
     // MARK: - VAD Preprocessing
@@ -1045,7 +1143,8 @@ extension PipelineQueue {
     /// Hand the app's own staging recordings over to the protocol output
     /// directory, per `AudioPersistencePolicy`. Nil `mixPath` (paired imports
     /// without a `_mix.wav` source) → mix slot is skipped, no persistent mix is
-    /// written.
+    /// written. `outputDir` here is `<root>/recordings`, reachable because the
+    /// queue holds the security scope on the root.
     private static func persistAudioToOutput(
         ctx: JobContext, outputDir: URL, stagingDir: URL,
     ) -> RelocatedAudioPaths {
@@ -1063,9 +1162,6 @@ extension PipelineQueue {
                 "persistAudioToOutput: mixPath aliases micPath — would destroy source",
             )
         }
-
-        let accessing = outputDir.startAccessingSecurityScopedResource()
-        defer { if accessing { outputDir.stopAccessingSecurityScopedResource() } }
 
         let fm = FileManager.default
         try? fm.createDirectory(at: outputDir, withIntermediateDirectories: true)

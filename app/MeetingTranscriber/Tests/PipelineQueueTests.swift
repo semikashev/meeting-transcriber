@@ -148,8 +148,8 @@ final class PipelineQueueTests: XCTestCase {
     }
 
     func testSnapshotWorkerClearsItselfAfterFlush() async {
-        // Lifecycle guard: a drained worker must set `snapshotWorker = nil`
-        // so the next saveSnapshot starts a fresh task. Without this, a
+        // Lifecycle guard: a drained writer must clear itself so the next
+        // saveSnapshot starts a fresh one. Without this, a
         // leak-then-skip bug would silently drop later writes.
         queue.enqueue(makeJob())
         XCTAssertTrue(queue.isSnapshotWorkerActive)
@@ -701,7 +701,7 @@ final class PipelineQueueTests: XCTestCase {
         )
         let slug = try XCTUnwrap(queue.jobs.first { $0.id == jobID }?.namingSlug)
         let recordingsDir = tmpDir.appendingPathComponent("recordings")
-        let leftovers = sidecarURLs(slug: slug, in: recordingsDir)
+        let leftovers = SidecarFixture.urls(slug: slug, in: recordingsDir)
 
         // Premise: naming really did park with data on disk, or the test proves
         // nothing about cleaning it up.
@@ -830,6 +830,7 @@ final class PipelineQueueTests: XCTestCase {
                 TranscriptOutputOptions(
                     includeFullTranscriptInProtocol: false,
                     saveRawTranscriptSeparately: false,
+                    useAITitleForFilenames: false,
                 )
             },
         )
@@ -1766,9 +1767,10 @@ final class PipelineQueueTests: XCTestCase {
     private func makeCapturingQueue(
         engine: MockEngine,
         diar: MockDiarization,
-        protocolGen: MockProtocolGen,
+        protocolGen: MockProtocolGen?,
         micLabel: String = "Me",
         stagingDir: URL? = nil,
+        useAITitleForFilenames: Bool = false,
         beforeDiarizing: (() -> Void)? = nil,
         terminologyRules: String = "",
     ) -> PipelineQueue {
@@ -1789,6 +1791,7 @@ final class PipelineQueueTests: XCTestCase {
             diarizeEnabled: true,
             numSpeakers: 0,
             micLabel: micLabel,
+            useAITitleForFilenames: useAITitleForFilenames,
             terminologyNormalizer: terminologyNormalizer,
         )
     }
@@ -1938,7 +1941,9 @@ final class PipelineQueueTests: XCTestCase {
 
     // MARK: - One meeting-start-anchored basename per job
 
-    private func makeStraightThroughQueue(stagingDir: URL? = nil) -> (PipelineQueue, MockProtocolGen) {
+    private func makeStraightThroughQueue(
+        stagingDir: URL? = nil, useAITitleForFilenames: Bool = false,
+    ) -> (PipelineQueue, MockProtocolGen) {
         let engine = MockEngine()
         engine.segmentsToReturn = [TimestampedSegment(start: 0, end: 5, text: "Hello world")]
         let diar = MockDiarization()
@@ -1950,7 +1955,10 @@ final class PipelineQueueTests: XCTestCase {
         )
         let protocolGen = MockProtocolGen()
         return (
-            makeCapturingQueue(engine: engine, diar: diar, protocolGen: protocolGen, stagingDir: stagingDir),
+            makeCapturingQueue(
+                engine: engine, diar: diar, protocolGen: protocolGen, stagingDir: stagingDir,
+                useAITitleForFilenames: useAITitleForFilenames,
+            ),
             protocolGen,
         )
     }
@@ -2424,6 +2432,325 @@ final class PipelineQueueTests: XCTestCase {
             "reimport job must stamp with enqueuedAt and keep the shortID, got stem: \(expectedStem)",
         )
         XCTAssertNil(protocolGen.capturedMeetingStartTime)
+    }
+
+    // MARK: - AI meeting title for filenames
+
+    private var protocolsDir: URL {
+        tmpDir.appendingPathComponent("protocols")
+    }
+
+    private var recordingsDir: URL {
+        tmpDir.appendingPathComponent("recordings")
+    }
+
+    private func names(in dir: URL) -> [String] {
+        ((try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []).sorted()
+    }
+
+    private func write(_ text: String, to url: URL) throws {
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(), withIntermediateDirectories: true,
+        )
+        try Data(text.utf8).write(to: url)
+    }
+
+    /// A dual-source job whose audio sits in the staging dir, so every artifact
+    /// kind (protocol, transcript, mix/app/mic, the three 16 kHz sidecars)
+    /// is produced and later renamed. `stamped: false` is a job that was never
+    /// stamped with the setting, i.e. the default naming.
+    private func makeAITitleJob(title: String = "Google Chrome", stamped: Bool = true) throws -> PipelineJob {
+        var job = try makeDualSourceJob(title: title)
+        if stamped { job.useAITitleForFilenames = true }
+        return job
+    }
+
+    func testAITitleRenamesEveryArtifactAndRepointsTheJob() async throws {
+        let (q, gen) = makeStraightThroughQueue(stagingDir: tmpDir)
+        gen.headingTitle = "Sprint Planning"
+        try q.enqueue(makeAITitleJob())
+        await q.processNext()
+        await q.awaitSnapshotFlush()
+
+        XCTAssertEqual(names(in: protocolsDir), ["sprint_planning.md", "sprint_planning.txt"])
+        let recordings = names(in: recordingsDir)
+        XCTAssertFalse(recordings.isEmpty)
+        for suffix in ["_mix.wav", "_app.wav", "_mic.wav", "_16k.wav", "_app_16k.wav", "_mic_16k.wav"] {
+            XCTAssertTrue(recordings.contains("sprint_planning\(suffix)"), "missing sprint_planning\(suffix) in \(recordings)")
+        }
+        XCTAssertTrue(
+            recordings.allSatisfy { $0.hasPrefix("sprint_planning_") },
+            "nothing may keep the old stem: \(recordings)",
+        )
+
+        let job = try XCTUnwrap(q.jobs.first)
+        XCTAssertEqual(job.namingSlug, "sprint_planning")
+        XCTAssertEqual(job.meetingTitle, "Google Chrome", "the caller's title is read back through /state and /v1/jobs")
+        for path in [job.transcriptPath, job.protocolPath, job.mixPath, job.appPath, job.micPath] {
+            let url = try XCTUnwrap(path)
+            XCTAssertTrue(FileManager.default.fileExists(atPath: url.path), "job points at a missing file: \(url.lastPathComponent)")
+            XCTAssertTrue(url.lastPathComponent.hasPrefix("sprint_planning"), url.lastPathComponent)
+        }
+
+        // A quit between the rename and the `.done` transition restores from this.
+        let onDisk = try XCTUnwrap(PipelineSnapshot.load(from: tmpDir)?.first)
+        XCTAssertEqual(onDisk.namingSlug, "sprint_planning")
+        XCTAssertEqual(onDisk.mixPath?.lastPathComponent, "sprint_planning_mix.wav")
+    }
+
+    func testWithTheToggleOffTheModelsTitleRenamesNothing() async throws {
+        let (q, gen) = makeStraightThroughQueue(stagingDir: tmpDir)
+        gen.headingTitle = "Sprint Planning"
+        let job = try makeAITitleJob(stamped: false)
+        q.enqueue(job)
+        await q.processNext()
+
+        let slug = try XCTUnwrap(q.jobs.first?.namingSlug)
+        XCTAssertTrue(slug.hasSuffix(job.shortID), "the default naming carries the short id: \(slug)")
+        XCTAssertEqual(names(in: protocolsDir), ["\(slug).md", "\(slug).txt"])
+        XCTAssertTrue(names(in: recordingsDir).allSatisfy { $0.hasPrefix(slug) })
+    }
+
+    func testATitleThatYieldsNoSlugKeepsTheTimestampedNames() async throws {
+        for heading in ["[Titel der Besprechung]", "Untitled", "🚀🎉"] {
+            let (q, gen) = makeStraightThroughQueue(stagingDir: tmpDir)
+            gen.headingTitle = heading
+            try q.enqueue(makeAITitleJob())
+            await q.processNext()
+
+            let slug = try XCTUnwrap(q.jobs.first?.namingSlug)
+            XCTAssertNotEqual(slug, "meeting", heading)
+            XCTAssertTrue(
+                names(in: protocolsDir).contains("\(slug).md"),
+                "heading \(heading) must leave the job on its own stem, got \(slug)",
+            )
+            try? FileManager.default.removeItem(at: protocolsDir)
+            try? FileManager.default.removeItem(at: recordingsDir)
+        }
+    }
+
+    func testAITitleWithoutAProtocolGeneratorKeepsTheTimestampedNames() async throws {
+        let engine = MockEngine()
+        engine.segmentsToReturn = [TimestampedSegment(start: 0, end: 5, text: "Hello")]
+        let diar = MockDiarization()
+        diar.resultToReturn = DiarizationResult(
+            segments: [.init(start: 0, end: 5, speaker: "SPEAKER_0")],
+            speakingTimes: ["SPEAKER_0": 5],
+            autoNames: [:],
+            embeddings: nil,
+        )
+        let q = makeCapturingQueue(engine: engine, diar: diar, protocolGen: nil, stagingDir: tmpDir)
+        let job = try makeAITitleJob(title: "Weekly Sync")
+        q.enqueue(job)
+        await q.processNext()
+
+        XCTAssertTrue(
+            names(in: protocolsDir).contains { $0.hasSuffix("\(job.shortID).txt") },
+            "without a protocol there is no title to name files after: \(names(in: protocolsDir))",
+        )
+    }
+
+    /// The earlier meeting's protocol may be gone (moved to a notes app, deleted)
+    /// while its audio is still here. Taking its name would delete that audio.
+    func testAITitleNeverReplacesAnEarlierMeetingsAudio() async throws {
+        try write("earlier meeting", to: recordingsDir.appendingPathComponent("sprint_planning_mix.wav"))
+        try write("earlier sidecar", to: recordingsDir.appendingPathComponent("sprint_planning_16k.wav"))
+        let (q, gen) = makeStraightThroughQueue(stagingDir: tmpDir)
+        gen.headingTitle = "Sprint Planning"
+        let job = try makeAITitleJob()
+        q.enqueue(job)
+        await q.processNext()
+
+        XCTAssertEqual(
+            try String(contentsOf: recordingsDir.appendingPathComponent("sprint_planning_mix.wav"), encoding: .utf8),
+            "earlier meeting",
+        )
+        XCTAssertEqual(
+            try String(contentsOf: recordingsDir.appendingPathComponent("sprint_planning_16k.wav"), encoding: .utf8),
+            "earlier sidecar",
+        )
+        let stem = "sprint_planning_\(job.shortID)"
+        XCTAssertEqual(q.jobs.first?.namingSlug, stem)
+        XCTAssertEqual(q.jobs.first?.mixPath?.lastPathComponent, "\(stem)_mix.wav")
+        XCTAssertTrue(names(in: protocolsDir).contains("\(stem).md"))
+    }
+
+    func testAITitleSuffixesTheShortIDWhenAnEarlierProtocolHasTheName() async throws {
+        try write("earlier protocol", to: protocolsDir.appendingPathComponent("sprint_planning.md"))
+        let (q, gen) = makeStraightThroughQueue(stagingDir: tmpDir)
+        gen.headingTitle = "Sprint Planning"
+        let job = try makeAITitleJob()
+        q.enqueue(job)
+        await q.processNext()
+
+        XCTAssertEqual(
+            try String(contentsOf: protocolsDir.appendingPathComponent("sprint_planning.md"), encoding: .utf8),
+            "earlier protocol",
+        )
+        XCTAssertTrue(names(in: protocolsDir).contains("sprint_planning_\(job.shortID).md"))
+        XCTAssertTrue(names(in: protocolsDir).contains("sprint_planning_\(job.shortID).txt"))
+    }
+
+    /// A job that regenerates its protocol (late naming, protocol-only resume)
+    /// has a bare-title stem by then. Another job's files that merely start
+    /// with that title are not its files.
+    func testASecondProtocolRunRenamesOnlyThisJobsFiles() async throws {
+        let (q, gen) = makeStraightThroughQueue(stagingDir: tmpDir)
+        gen.headingTitle = "Sprint Planning"
+        let job = try makeAITitleJob()
+        q.enqueue(job)
+        await q.processNext()
+        XCTAssertEqual(q.jobs.first?.namingSlug, "sprint_planning")
+
+        let siblings = [
+            "sprint_planning_abcd1234_mix.wav", "sprint_planning_retro_mix.wav", "sprint_planning_retro_16k.wav",
+        ]
+        for name in siblings {
+            try write("sibling \(name)", to: recordingsDir.appendingPathComponent(name))
+        }
+        try write("sibling protocol", to: protocolsDir.appendingPathComponent("sprint_planning_retro.md"))
+
+        gen.headingTitle = "Sprint Review"
+        await q.generateProtocol(jobID: job.id, transcript: "Hello world", title: "Google Chrome", protocolsDir: protocolsDir)
+
+        for name in siblings {
+            XCTAssertEqual(
+                try String(contentsOf: recordingsDir.appendingPathComponent(name), encoding: .utf8),
+                "sibling \(name)", "\(name) belongs to another job",
+            )
+        }
+        XCTAssertEqual(
+            try String(contentsOf: protocolsDir.appendingPathComponent("sprint_planning_retro.md"), encoding: .utf8),
+            "sibling protocol",
+        )
+        let renamed = try XCTUnwrap(q.jobs.first)
+        XCTAssertEqual(renamed.namingSlug, "sprint_review")
+        XCTAssertEqual(renamed.mixPath?.lastPathComponent, "sprint_review_mix.wav")
+        XCTAssertTrue(try FileManager.default.fileExists(atPath: XCTUnwrap(renamed.mixPath).path))
+        XCTAssertEqual(
+            names(in: protocolsDir).filter { $0.hasPrefix("sprint_planning.") || $0.hasPrefix("sprint_review.") },
+            ["sprint_review.md", "sprint_review.txt"],
+            "the previous protocol moves with the job rather than staying behind as an orphan",
+        )
+    }
+
+    /// A quit between the rename and the protocol save restores from the
+    /// snapshot, so the rename has to write one itself. The `.done` snapshot
+    /// that follows a full run would hide a rename that forgot to.
+    func testRenamePersistsTheSnapshotItself() async throws {
+        let (q, gen) = makeStraightThroughQueue(stagingDir: tmpDir)
+        gen.headingTitle = "Sprint Planning"
+        let job = try makeAITitleJob(stamped: false)
+        q.enqueue(job)
+        await q.processNext()
+        let oldSlug = try XCTUnwrap(q.jobs.first?.namingSlug)
+
+        let renamed = q.renameJobArtifacts(
+            jobID: job.id, from: oldSlug, titleSlug: "sprint_planning", protocolsDir: protocolsDir,
+        )
+        await q.awaitSnapshotFlush()
+
+        XCTAssertEqual(renamed, "sprint_planning")
+        let onDisk = try XCTUnwrap(PipelineSnapshot.load(from: tmpDir)?.first)
+        XCTAssertEqual(onDisk.namingSlug, "sprint_planning")
+        XCTAssertEqual(onDisk.transcriptPath?.lastPathComponent, "sprint_planning.txt")
+        XCTAssertEqual(onDisk.mixPath?.lastPathComponent, "sprint_planning_mix.wav")
+    }
+
+    /// The protocol of an earlier run moves with the job, so a protocol that
+    /// then fails to save must not leave `protocolPath` naming a vanished file.
+    func testRenameRepointsTheProtocolPathToo() async throws {
+        let (q, gen) = makeStraightThroughQueue(stagingDir: tmpDir)
+        gen.headingTitle = "Sprint Planning"
+        let job = try makeAITitleJob(stamped: false)
+        q.enqueue(job)
+        await q.processNext()
+        let oldSlug = try XCTUnwrap(q.jobs.first?.namingSlug)
+        XCTAssertEqual(q.jobs.first?.protocolPath?.lastPathComponent, "\(oldSlug).md")
+
+        q.renameJobArtifacts(jobID: job.id, from: oldSlug, titleSlug: "sprint_planning", protocolsDir: protocolsDir)
+
+        let protocolPath = try XCTUnwrap(q.jobs.first?.protocolPath)
+        XCTAssertEqual(protocolPath.lastPathComponent, "sprint_planning.md")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: protocolPath.path))
+    }
+
+    /// A job cancelled while the model is still writing is gone from the queue;
+    /// its files are not renamed behind its back.
+    func testAJobCancelledDuringProtocolGenerationIsNotRenamed() async throws {
+        // The queue-wide setting is on: it is what a vanished job's options fall
+        // back to, and the only way the guard against renaming it is reached.
+        let (q, gen) = makeStraightThroughQueue(stagingDir: tmpDir, useAITitleForFilenames: true)
+        gen.headingTitle = "Sprint Planning"
+        let job = try makeAITitleJob()
+        gen.onGenerate = { q.cancelJob(id: job.id) }
+        q.enqueue(job)
+        await q.processNext()
+
+        XCTAssertNil(q.jobs.first { $0.id == job.id }, "precondition: the job was cancelled")
+        XCTAssertFalse(names(in: protocolsDir).contains { $0.hasPrefix("sprint_planning") }, "\(names(in: protocolsDir))")
+        XCTAssertFalse(names(in: recordingsDir).contains { $0.hasPrefix("sprint_planning") }, "\(names(in: recordingsDir))")
+    }
+
+    /// The user's own file, picked for import, is neither moved nor repointed;
+    /// the transcript and protocol still take the title.
+    func testAnImportLeftInPlaceIsNeitherRenamedNorRepointed() async throws {
+        let (q, gen) = makeStraightThroughQueue()
+        gen.headingTitle = "Sprint Planning"
+        let audio = try createTestAudioFile(in: tmpDir)
+        var job = PipelineJob(
+            meetingTitle: "Voice Memo", appName: "File",
+            mixPath: audio, appPath: nil, micPath: nil, micDelay: 0,
+        )
+        job.useAITitleForFilenames = true
+        q.enqueue(job)
+        await q.processNext()
+
+        XCTAssertEqual(q.jobs.first?.mixPath?.standardizedFileURL, audio.standardizedFileURL)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: audio.path))
+        XCTAssertEqual(names(in: protocolsDir), ["sprint_planning.md", "sprint_planning.txt"])
+    }
+
+    /// Half a rename is worse than none: the transcript under one name and the
+    /// audio under another, with the job pointing at files that are not there.
+    func testAFailedRenameIsUndoneAndTheJobKeepsItsOriginalNames() async throws {
+        let (q, gen) = makeStraightThroughQueue(stagingDir: tmpDir)
+        gen.headingTitle = "Sprint Planning"
+        let recordings = recordingsDir
+        // The transcript moves first and succeeds; moving the audio then fails
+        // because the recordings folder cannot be written to.
+        gen.onGenerate = {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: recordings.path)
+        }
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: recordings.path) }
+        try q.enqueue(makeAITitleJob())
+        await q.processNext()
+
+        let job = try XCTUnwrap(q.jobs.first)
+        let slug = try XCTUnwrap(job.namingSlug)
+        XCTAssertNotEqual(slug, "sprint_planning")
+        XCTAssertEqual(names(in: protocolsDir), ["\(slug).md", "\(slug).txt"], "transcript was rolled back, protocol follows the old stem")
+        XCTAssertTrue(names(in: recordings).allSatisfy { $0.hasPrefix(slug) }, "audio never moved")
+        for path in [job.transcriptPath, job.protocolPath, job.mixPath, job.appPath, job.micPath] {
+            let url = try XCTUnwrap(path)
+            XCTAssertTrue(FileManager.default.fileExists(atPath: url.path), "job points at a missing file: \(url.lastPathComponent)")
+        }
+        XCTAssertTrue(job.warnings.contains { $0.contains("AI meeting title") }, "\(job.warnings)")
+    }
+
+    /// The slug of an unbounded model heading must fit in a file name, so the
+    /// rename succeeds instead of half-failing on a 255-byte limit.
+    func testAVeryLongTitleStillRenamesEverything() async throws {
+        let (q, gen) = makeStraightThroughQueue(stagingDir: tmpDir)
+        gen.headingTitle = String(repeating: "Größe der Änderung ", count: 40)
+        try q.enqueue(makeAITitleJob())
+        await q.processNext()
+
+        let slug = try XCTUnwrap(q.jobs.first?.namingSlug)
+        XCTAssertTrue(slug.hasPrefix("größe_der_änderung"), slug)
+        XCTAssertTrue(names(in: protocolsDir).contains("\(slug).md"))
+        XCTAssertTrue(names(in: recordingsDir).allSatisfy { $0.hasPrefix(slug) })
+        XCTAssertNotNil(q.jobs.first?.mixPath.flatMap { FileManager.default.fileExists(atPath: $0.path) ? $0 : nil })
     }
 
     /// An engine that doesn't produce per-utterance timestamps (emitting one
@@ -4340,35 +4667,6 @@ final class PipelineQueueTests: XCTestCase {
 
     // MARK: - Snapshot Restore Cleans Up What It Discards
 
-    /// Write the per-slug sidecars `removeNamingData` owns. Suffixes come from
-    /// the production list, so adding one there fails these tests rather than
-    /// quietly stranding the new file.
-    private func sidecarURLs(slug: String, in recordingsDir: URL) -> [URL] {
-        (SpeakerNamingStore.sidecarSuffixes + [SpeakerNamingStore.namingJSONSuffix])
-            .map { recordingsDir.appendingPathComponent("\(slug)\($0)") }
-    }
-
-    private func writeSidecars(slug: String, in recordingsDir: URL) throws -> [URL] {
-        let urls = sidecarURLs(slug: slug, in: recordingsDir)
-        for url in urls {
-            try Data([0]).write(to: url)
-        }
-        return urls
-    }
-
-    private func assertSidecars(
-        _ sidecars: [URL], exist: Bool,
-        file: StaticString = #filePath, line: UInt = #line,
-    ) {
-        for sidecar in sidecars {
-            XCTAssertEqual(
-                FileManager.default.fileExists(atPath: sidecar.path), exist,
-                "\(sidecar.lastPathComponent): expected exists=\(exist)",
-                file: file, line: line,
-            )
-        }
-    }
-
     private func makeRestoreQueue(
         outputDir: URL, diarizeEnabled: Bool = false, inFlightRuns: InFlightRunRegistry? = nil,
     ) -> PipelineQueue {
@@ -4401,7 +4699,7 @@ final class PipelineQueueTests: XCTestCase {
         job.namingSlug = "reaped_before_quit"
         try JSONEncoder().encode([job])
             .write(to: tmpDir.appendingPathComponent(PipelineSnapshot.snapshotFilename))
-        let sidecars = try writeSidecars(slug: "reaped_before_quit", in: recordingsDir)
+        let sidecars = try SidecarFixture.write(slug: "reaped_before_quit", in: recordingsDir)
 
         let freshQueue = makeRestoreQueue(outputDir: outputDir)
         freshQueue.loadSnapshot()
@@ -4428,7 +4726,7 @@ final class PipelineQueueTests: XCTestCase {
         job.namingSlug = "running_elsewhere"
         try JSONEncoder().encode([job])
             .write(to: tmpDir.appendingPathComponent(PipelineSnapshot.snapshotFilename))
-        let sidecars = try writeSidecars(slug: "running_elsewhere", in: recordingsDir)
+        let sidecars = try SidecarFixture.write(slug: "running_elsewhere", in: recordingsDir)
 
         let registry = InFlightRunRegistry()
         XCTAssertEqual(registry.begin(jobID: job.id, mixPath: mixPath), .claimed)
@@ -4457,7 +4755,7 @@ final class PipelineQueueTests: XCTestCase {
         job.namingSlug = "audio_relocated"
         try JSONEncoder().encode([job])
             .write(to: tmpDir.appendingPathComponent(PipelineSnapshot.snapshotFilename))
-        let sidecars = try writeSidecars(slug: "audio_relocated", in: recordingsDir)
+        let sidecars = try SidecarFixture.write(slug: "audio_relocated", in: recordingsDir)
 
         let freshQueue = makeRestoreQueue(outputDir: outputDir)
         freshQueue.loadSnapshot()
@@ -4487,10 +4785,10 @@ final class PipelineQueueTests: XCTestCase {
         )
         job.state = .done
         job.namingSlug = "folder_moved"
-        job.sidecarOutputDir = oldOutputDir
+        job.recordSidecarOutputDir(oldOutputDir)
         try JSONEncoder().encode([job])
             .write(to: tmpDir.appendingPathComponent(PipelineSnapshot.snapshotFilename))
-        let sidecars = try writeSidecars(slug: "folder_moved", in: oldRecordingsDir)
+        let sidecars = try SidecarFixture.write(slug: "folder_moved", in: oldRecordingsDir)
 
         // The user repointed the output folder; the queue is built on the new one.
         let freshQueue = makeRestoreQueue(outputDir: newOutputDir)
@@ -4518,7 +4816,7 @@ final class PipelineQueueTests: XCTestCase {
         job.namingSlug = "awaiting_names"
         try JSONEncoder().encode([job])
             .write(to: tmpDir.appendingPathComponent(PipelineSnapshot.snapshotFilename))
-        let sidecars = try writeSidecars(slug: "awaiting_names", in: recordingsDir)
+        let sidecars = try SidecarFixture.write(slug: "awaiting_names", in: recordingsDir)
 
         // Overwrite the placeholder with decodable naming data so restore keeps
         // the job; the audio and segment sidecars stay as written above.
@@ -4540,6 +4838,175 @@ final class PipelineQueueTests: XCTestCase {
 
         XCTAssertEqual(freshQueue.jobs.first?.state, .speakerNamingPending)
         assertSidecars(sidecars, exist: true)
+    }
+
+    /// The naming data is read where the job recorded its sidecars, like the
+    /// cleanup above and the resume decision, not from wherever the output
+    /// setting points now. Reading the current folder found nothing after a
+    /// repoint and finished the job with auto-names the user never confirmed.
+    func testLoadSnapshotRestoresNamingDataFromTheJobsOwnOutputDir() throws {
+        let test = try makePendingJobInSnapshot(title: "Named Elsewhere", folders: 1)
+        try SpeakerNamingStore(outputDir: test.folders[0])
+            .save(test.namingData(in: test.folders[0]), slug: test.slug)
+
+        let restored = restoreIntoAnotherFolder()
+
+        XCTAssertEqual(restored.jobs.first?.state, .speakerNamingPending)
+        XCTAssertNotNil(restored.naming.speakerNamingDataByJob[test.job.id])
+    }
+
+    /// A job that wrote sidecars under two folders is read from the one it
+    /// wrote last, while the cleanup visits both. Without that order a restore
+    /// would take the folder of the run before, which holds the mapping the
+    /// later run replaced.
+    func testLoadSnapshotRestoresNamingDataFromTheFolderTheJobWroteLast() throws {
+        let test = try makePendingJobInSnapshot(title: "Named Twice", folders: 2)
+        // Only under the folder written last, which is where the save that
+        // recorded it put the file.
+        try SpeakerNamingStore(outputDir: test.folders[1])
+            .save(test.namingData(in: test.folders[1]), slug: test.slug)
+
+        let restored = restoreIntoAnotherFolder()
+
+        XCTAssertEqual(restored.jobs.first?.state, .speakerNamingPending)
+        XCTAssertNotNil(restored.naming.speakerNamingDataByJob[test.job.id])
+    }
+
+    /// A recorded folder is not proof that the file arrived there: saving the
+    /// naming data logs its failure and carries on, so the newest recorded
+    /// folder can be one the write never reached. Reading only the newest would
+    /// finish the job with the auto-names in its transcript and drop the
+    /// mapping the user is owed, which is the silent loss the recorded folder
+    /// exists to prevent.
+    func testLoadSnapshotFallsBackToAnEarlierFolderWhenTheNewestHasNoNamingData() throws {
+        let test = try makePendingJobInSnapshot(title: "Save Failed", folders: 2)
+        // Only under the folder written first: the save under the folder
+        // recorded last is the one that failed.
+        try SpeakerNamingStore(outputDir: test.folders[0])
+            .save(test.namingData(in: test.folders[0]), slug: test.slug)
+
+        let restored = restoreIntoAnotherFolder()
+
+        XCTAssertEqual(restored.jobs.first?.state, .speakerNamingPending)
+        XCTAssertNotNil(restored.naming.speakerNamingDataByJob[test.job.id])
+    }
+
+    /// When both recorded folders hold naming data, the newest wins. A run that
+    /// saved under the old folder and then again under the new one leaves two
+    /// files, and reading the older one restores the mapping the second run
+    /// replaced, so the dialog comes back pre-filled with names the user has
+    /// already corrected.
+    func testLoadSnapshotPrefersTheNewestFolderWhenBothHoldNamingData() throws {
+        let test = try makePendingJobInSnapshot(title: "Saved Twice", folders: 2)
+        for (folder, speaker) in zip(test.folders, ["Speaker A", "Speaker B"]) {
+            try SpeakerNamingStore(outputDir: folder)
+                .save(test.namingData(in: folder, speaker: speaker), slug: test.slug)
+        }
+
+        let restored = restoreIntoAnotherFolder()
+
+        XCTAssertEqual(
+            restored.naming.speakerNamingDataByJob[test.job.id]?.mapping["SPEAKER_0"], "Speaker B",
+        )
+    }
+
+    /// A folder is recorded only by a write that landed there. The read trusts
+    /// the recorded order to find the newest payload, so a folder that holds
+    /// nothing must not take the front of it — which is what happened while the
+    /// folder was recorded next to the slug rather than next to the write.
+    func testOnlyAWriteThatLandedRecordsItsFolder() throws {
+        let test = try makePendingJobInSnapshot(title: "Not Written", folders: 1)
+        let queue = makeRestoreQueue(outputDir: tmpDir.appendingPathComponent("current-output"))
+        queue.insertJobForTesting(test.job)
+        let before = queue.jobs.first?.sidecarOutputDirs
+
+        queue.setNamingMetadata(
+            jobID: test.job.id, slug: test.slug, usedDiarizerMode: nil, wroteSidecarsIn: nil,
+        )
+
+        XCTAssertEqual(queue.jobs.first?.sidecarOutputDirs, before)
+        XCTAssertEqual(queue.jobs.first?.namingSlug, test.slug, "the slug is still set")
+    }
+
+    /// A payload that names another job is not this job's mapping. The slug
+    /// carries the title, the start minute and eight hex digits of the id, so
+    /// two jobs can agree on it.
+    func testLoadSnapshotIgnoresNamingDataThatNamesAnotherJob() throws {
+        let test = try makePendingJobInSnapshot(title: "Not Mine", folders: 1)
+        let foreign = test.namingData(in: test.folders[0], jobID: UUID())
+        try SpeakerNamingStore(outputDir: test.folders[0]).save(foreign, slug: test.slug)
+
+        let restored = restoreIntoAnotherFolder()
+
+        XCTAssertNil(restored.naming.speakerNamingDataByJob[test.job.id])
+        XCTAssertEqual(
+            restored.jobs.first?.state, .done,
+            "no mapping of its own, so the job finishes rather than waiting for one",
+        )
+    }
+
+    // MARK: - Restore arrangement
+
+    /// One `.speakerNamingPending` job in a snapshot, having recorded each of
+    /// `folders` in turn, with their `recordings/` subfolders created.
+    ///
+    /// Shared because these tests differ only in which folder receives the
+    /// naming data: the same arrangement written out four times is how a
+    /// fixture in this area went wrong once before, which is what
+    /// `SidecarFixture` records.
+    private struct RestoreCase {
+        let job: PipelineJob
+        let folders: [URL]
+        let slug: String
+
+        /// Naming data for this job, pointing at the audio under `folder`.
+        func namingData(
+            in folder: URL, speaker: String = "Speaker A", jobID: UUID? = nil,
+        ) -> PipelineQueue.SpeakerNamingData {
+            PipelineQueue.SpeakerNamingData(
+                jobID: jobID ?? job.id,
+                meetingTitle: job.meetingTitle,
+                mapping: ["SPEAKER_0": speaker],
+                speakingTimes: ["SPEAKER_0": 60.0],
+                embeddings: ["SPEAKER_0": [0.1, 0.2]],
+                audioPath: folder.appendingPathComponent("recordings/\(slug)_16k.wav"),
+                segments: [.init(start: 0, end: 5, speaker: "SPEAKER_0")],
+                participants: [],
+                isDualSource: false,
+            )
+        }
+    }
+
+    private func makePendingJobInSnapshot(title: String, folders count: Int) throws -> RestoreCase {
+        let dirs = try (0 ..< count).map { index in
+            let dir = tmpDir.appendingPathComponent("restore-output-\(index)")
+            _ = try makeRecordingsDir(in: dir)
+            return dir
+        }
+        let mixPath = tmpDir.appendingPathComponent("mix.wav")
+        try Data([0]).write(to: mixPath)
+
+        let slug = title.lowercased().replacingOccurrences(of: " ", with: "_")
+        var job = PipelineJob(
+            meetingTitle: title, appName: "App",
+            mixPath: mixPath, appPath: nil, micPath: nil, micDelay: 0,
+        )
+        job.state = .speakerNamingPending
+        job.namingSlug = slug
+        for dir in dirs {
+            job.recordSidecarOutputDir(dir)
+        }
+        try JSONEncoder().encode([job])
+            .write(to: tmpDir.appendingPathComponent(PipelineSnapshot.snapshotFilename))
+        return RestoreCase(job: job, folders: dirs, slug: slug)
+    }
+
+    /// Restores into a queue writing to a folder none of the recorded ones is,
+    /// which is the state after the user repointed the output setting.
+    private func restoreIntoAnotherFolder() -> PipelineQueue {
+        let queue = makeRestoreQueue(outputDir: tmpDir.appendingPathComponent("current-output"))
+        queue.loadSnapshot()
+        return queue
     }
 
     // MARK: - Snapshot Restore + Speaker Naming Cache

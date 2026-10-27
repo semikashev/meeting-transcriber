@@ -28,6 +28,19 @@ enum ChannelFault: String, Equatable {
     /// Terminal in a way the other two are not: the track is gone for the rest
     /// of the recording and only restarting the app brings it back.
     case gaveUp
+
+    /// The opt-in silent-track watchdog rebuilt the app tap and the rebuilds
+    /// did not bring non-zero samples back, so it stopped trying (issue #672).
+    /// A silence report with one more fact in it: the automatic remedy has
+    /// been tried. The channel is still capturing, which is what keeps this
+    /// apart from `gaveUp`.
+    case rebuildsExhausted
+
+    /// The microphone went without a buffer for the capture layer's whole
+    /// budget, across restarts and rebuilds of its engine, and was released
+    /// (issues #724, #706). Unlike `gaveUp` nothing is stuck: a device change
+    /// brings it back, which is what the message has to say.
+    case stalled
 }
 
 /// Decides whether one capture channel has failed, from what the capture layer
@@ -75,6 +88,31 @@ struct ChannelFaultMonitor {
     /// the channel twice or the state showed no fault at all.
     private var reportedGiveUp = false
 
+    /// Its own latch for the same reason the give-up has one: it says
+    /// something the silence report cannot, that rebuilding was tried and
+    /// failed, so it is still worth reporting after one. It ends digital-
+    /// silence reporting for the channel; buffers stopping later and a later
+    /// give-up are still news.
+    private var reportedRebuildsExhausted = false
+
+    /// The stall count last reported, rather than a latch like the others:
+    /// a stall says something the silence message cannot (restarting did not
+    /// help, and what will), and a give-up after a revived capture wedges says
+    /// something the stall could not (it is not coming back). Every further
+    /// stall is news too, whether the revived microphone delivered in between
+    /// or never did: either way the remedy did not hold.
+    private var reportedStalls = 0
+
+    /// Whether the last update saw the channel stalled, to find the revival.
+    private var wasStalled = false
+
+    /// When the current observation window began: the start of the recording,
+    /// or the revival of a stalled channel. The ages the capture layer
+    /// reports still span the stall when the flag clears, so a revived
+    /// channel is judged only on what it did since, over a full window of its
+    /// own, as a fresh recording would be.
+    private var windowStart: TimeInterval = 0
+
     init(window: TimeInterval) {
         self.window = window
     }
@@ -95,11 +133,19 @@ struct ChannelFaultMonitor {
     ///     derivable from the ages: a channel that gave up may have delivered a
     ///     buffer a moment ago, and no age can say it will never deliver
     ///     another.
+    ///   - rebuildsExhausted: whether the silent-track watchdog stopped
+    ///     rebuilding this channel's capture. Defaulted because only the app
+    ///     channel has a watchdog, so false is the true answer everywhere else.
+    ///   - stall: whether this channel's capture is released for lack of
+    ///     audio, and how often it was. Defaulted because only the microphone
+    ///     stalls.
     mutating func update(
         ages: ChannelSignalAges,
         gaveUp: Bool,
         elapsedSinceStart: TimeInterval,
         corroborated: Bool,
+        rebuildsExhausted: Bool = false,
+        stall: MicCaptureStall = MicCaptureStall(),
     ) -> ChannelFault? {
         // First, and without waiting for the window: this is already terminal
         // when the flag flips, and the window exists to rule out states that
@@ -108,16 +154,49 @@ struct ChannelFaultMonitor {
             reportedGiveUp = true
             return .gaveUp
         }
-        guard !reportedSilence, !reportedGiveUp, elapsedSinceStart >= window else { return nil }
+        // Without the window, because the watchdog only gives up after
+        // minutes of zeros and three rebuilds. With the same corroboration
+        // `digitalSilence` needs (issue #614): the watchdog cannot tell a dead
+        // tap from a far end that is silent, a muted call or a lobby, and this
+        // pierces Focus, so it waits for the other channel to show the call is
+        // live. The flag stays set, so a later corroborated tick reports it.
+        if rebuildsExhausted, corroborated, !reportedRebuildsExhausted, !reportedGiveUp {
+            reportedRebuildsExhausted = true
+            return .rebuildsExhausted
+        }
+        // Also without a window: the capture layer already waited out its own
+        // budget before it stalled.
+        if stall.isActive {
+            wasStalled = true
+            if stall.count > reportedStalls {
+                reportedStalls = stall.count
+                if !reportedGiveUp { return .stalled }
+            }
+        } else if wasStalled {
+            // Revived. Everything reported about the dead channel is re-armed,
+            // silence included, so a revived microphone that is dead or
+            // delivers only zeroes is reported like any other, once it has
+            // had its window.
+            wasStalled = false
+            reportedSilence = false
+            windowStart = elapsedSinceStart
+        }
+        // While stalled the stall message covers the silence.
+        let observed = elapsedSinceStart - windowStart
+        guard !reportedSilence, !reportedGiveUp, !stall.isActive, observed >= window else { return nil }
 
-        let bufferAge = ages.secondsSinceLastBuffer ?? elapsedSinceStart
+        let bufferAge = min(ages.secondsSinceLastBuffer ?? elapsedSinceStart, observed)
         if bufferAge >= window {
             reportedSilence = true
             return .noBuffers
         }
 
-        let energyAge = ages.secondsSinceLastEnergy ?? elapsedSinceStart
-        guard energyAge >= window, corroborated else { return nil }
+        // The watchdog report already said this channel is silent, with more
+        // in it; a plain silence report after it would say less. A channel
+        // that then stops delivering altogether is a different failure, which
+        // is why only this arm is suppressed.
+        let energyAge = min(ages.secondsSinceLastEnergy ?? elapsedSinceStart, observed)
+        guard energyAge >= window, corroborated, !reportedRebuildsExhausted else { return nil }
         reportedSilence = true
         return .digitalSilence
     }
@@ -125,5 +204,9 @@ struct ChannelFaultMonitor {
     mutating func reset() {
         reportedSilence = false
         reportedGiveUp = false
+        reportedRebuildsExhausted = false
+        reportedStalls = 0
+        wasStalled = false
+        windowStart = 0
     }
 }

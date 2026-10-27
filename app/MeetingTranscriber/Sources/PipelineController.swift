@@ -25,11 +25,9 @@ private let logger = Logger(subsystem: AppPaths.logSubsystem, category: "Pipelin
 @Observable
 @MainActor
 final class PipelineController {
-    /// The active pipeline queue. Settable so tests can swap in a queue wired to
-    /// an isolated `logDir` (byte-equivalent to the prior `AppState.pipelineQueue`
-    /// var, which was likewise publicly settable). Production mutates it only via
-    /// `rebuild()` / `ensureQueue()`.
-    var queue: PipelineQueue
+    /// The active pipeline queue. Written by `rebuild()`, and in debug builds
+    /// by `installQueueForTesting`.
+    private(set) var queue: PipelineQueue
 
     private let settings: AppSettings
     let notifier: any AppNotifying
@@ -46,10 +44,50 @@ final class PipelineController {
     /// by `jobStatus(forID:)` for the automation API. Test-injectable.
     let terminalJobStore: TerminalJobStore
 
-    /// Source of the currently-active engine. Set by `activate`; nil before then
-    /// (so `makeQueue()` safely returns the current queue if called early — only
-    /// reachable at process teardown, since `rebuild`/`ensureQueue` are driven by
-    /// user actions while `AppState` is alive). Captures the owner weakly.
+    /// Where the queues this controller builds keep their data and how they
+    /// reach the output folder, beyond the settings: the logs and snapshot, the
+    /// staging folder they may relocate from, how the output folder's security
+    /// scope is opened, the recovery of that staging folder a new queue runs,
+    /// and how the output folder is resolved. Production uses `.production`,
+    /// the app's own data directories; a test passes temp folders so a queue it
+    /// builds never reads or writes the installed app's data.
+    struct QueueEnvironment {
+        var logDir: URL?
+        var stagingDir: URL
+        var securityScope: SecurityScopeAccess = .live
+        /// Rescues crashed recordings from the staging folder and enqueues
+        /// orphans into the queue it is handed; nil skips it.
+        var recoverStagedRecordings: (@MainActor (PipelineQueue) -> Void)?
+
+        var resolveOutputDir: @MainActor (OutputDirectoryResolver) -> URL = { $0.resolve() }
+        /// The queue the controller starts with; nil builds a bare one on this
+        /// environment's folders. A test passes one wired to mocks, so the
+        /// controller never holds a queue the test did not choose.
+        var initialQueue: PipelineQueue?
+    }
+
+    @ObservationIgnored private let queueEnvironment: QueueEnvironment
+
+    /// Called with the new queue whenever `rebuild()` replaces it, so a holder
+    /// of the old one can follow. The active `WatchLoop` is one: it enqueues
+    /// every recording it finishes into the queue it was given, so without
+    /// following a folder change its recordings would land in the old folder
+    /// through a queue nothing else shows.
+    @ObservationIgnored var onQueueReplaced: ((PipelineQueue) -> Void)?
+
+    /// The output-folder bookmark the current queue was built from, so a change
+    /// of folder can be noticed without resolving the bookmark again.
+    @ObservationIgnored private var queueBuiltFromBookmark: Data?
+
+    /// The queue `rebuild()` last installed, the only one a folder change may
+    /// replace: a queue the controller did not build (a test's, with mock
+    /// engines and its own logs) is left alone, as `ensureQueue()` leaves it.
+    @ObservationIgnored private weak var builtQueue: PipelineQueue?
+
+    /// Source of the currently-active engine. Set by `activate`; nil before
+    /// then, which makes `makeQueue()` return nil and `rebuild()` a no-op. Only
+    /// reachable at process teardown, since `rebuild`/`ensureQueue` are driven
+    /// by user actions while `AppState` is alive. Captures the owner weakly.
     private var engineProvider: (() -> (any TranscribingEngine)?)?
 
     /// Recordings a running merge is still reading. The Protocols window shows
@@ -69,19 +107,31 @@ final class PipelineController {
     /// record instead of trashing.
     var originalsRemover: any FileRemoving = TrashFileRemover()
 
-    init(settings: AppSettings, notifier: any AppNotifying, terminalJobStore: TerminalJobStore? = nil) {
+    init(
+        settings: AppSettings,
+        notifier: any AppNotifying,
+        terminalJobStore: TerminalJobStore? = nil,
+        queueEnvironment: QueueEnvironment = .production,
+    ) {
         self.settings = settings
         self.notifier = notifier
+        self.queueEnvironment = queueEnvironment
         self.outputDirectory = OutputDirectoryResolver(settings: settings, notifier: notifier)
         self.terminalJobStore = terminalJobStore
-            ?? TerminalJobStore(path: AppPaths.ipcDir.appendingPathComponent("terminal_jobs.json"))
-        self.queue = PipelineQueue()
+            ?? TerminalJobStore(
+                path: (queueEnvironment.logDir ?? AppPaths.ipcDir).appendingPathComponent("terminal_jobs.json"),
+            )
+        self.queue = queueEnvironment.initialQueue
+            ?? PipelineQueue(
+                logDir: queueEnvironment.logDir, stagingDir: queueEnvironment.stagingDir,
+            )
     }
 
     /// Wire the active-engine source. Called once from `AppState.init` after its
     /// stored-property init.
     func activate(engineProvider: @escaping () -> (any TranscribingEngine)?) {
         self.engineProvider = engineProvider
+        observeOutputFolder()
     }
 
     // MARK: - Queue lifecycle
@@ -100,19 +150,126 @@ final class PipelineController {
     ///    only on the current queue. A fresh queue restores the parked job from
     ///    the snapshot without that data, orphaning the user's pending naming.
     ///
-    /// When either holds, keep the existing queue and let it drain. Note this
-    /// defers queue-captured settings (engine choice, output dir, diarization,
-    /// VAD, numSpeakers) to the next idle watch-start rather than refreshing them
+    /// A third case needs the job states rather than `isProcessing`: a late
+    /// confirm or re-run from the naming dialog runs in a task of the naming
+    /// session, so the job sits in `.diarizing` or `.generatingProtocol` while
+    /// `isProcessing` is false and nothing is parked for naming. A fresh queue
+    /// would pick that job up from the snapshot and run it a second time.
+    ///
+    /// So the queue is replaced only when every job it holds is finished. Note
+    /// this defers queue-captured settings (engine choice, diarization, VAD,
+    /// numSpeakers) to the next idle watch-start rather than refreshing them
     /// automatically; live engine language/vocabulary still sync separately onto
-    /// the shared engine instances meanwhile.
-    func rebuild() {
-        guard !queue.isProcessing, queue.pendingSpeakerNamingJobs.isEmpty else {
-            logger.info("Skipping queue rebuild: a job is in flight or awaiting speaker naming")
+    /// the shared engine instances meanwhile. The output folder is the
+    /// exception, see `rebuildIfOutputFolderChanged()`.
+    ///
+    /// `recoversStagedRecordings: false` skips the staging-folder recovery; the
+    /// reason is at its one caller, `rebuildIfOutputFolderChanged()`.
+    func rebuild(recoversStagedRecordings: Bool = true) {
+        guard canReplaceQueue else {
+            logger.info("Skipping queue rebuild: a job is unfinished or awaiting speaker naming")
             return
         }
-        queue = makeQueue()
+        // Adopted from, rather than re-read from the file, whenever the queue
+        // being replaced is one this controller built: that is exactly the case
+        // where it has already loaded the snapshot and holds the newer state in
+        // memory. The first queue is not one of those, so it reads the file,
+        // which is how a run interrupted by a crash or a quit comes back.
+        //
+        // Captured before `makeQueue()`, which calls the owner's engine provider.
+        // `PipelineControllerTests.testTheAdoptionSourceIsDecidedBeforeTheEngineProviderRuns`
+        // says what reading the identity afterwards would cost.
+        let replaced = queueWasBuiltHere ? queue : nil
+        guard let built = makeQueue() else { return }
+        if let replaced {
+            built.adoptJobs(of: replaced)
+            replaced.retire()
+        } else {
+            built.loadSnapshot()
+        }
+        if recoversStagedRecordings { queueEnvironment.recoverStagedRecordings?(built) }
+        built.refreshKnownSpeakerNames()
+        queue = built
+        // Recorded only after an install, so a queue built for inspection and
+        // dropped cannot advance it; see
+        // `testAQueueBuiltWithoutBeingInstalledDoesNotDisarmTheFolderChange`.
+        queueBuiltFromBookmark = settings.customOutputDirBookmark
+        builtQueue = built
         configureCallbacks()
+        onQueueReplaced?(queue)
     }
+
+    /// Whether the installed queue is one this controller built, as opposed to
+    /// one it was given.
+    private var queueWasBuiltHere: Bool {
+        queue === builtQueue
+    }
+
+    /// Whether the queue holds no unfinished work: nothing processing, and
+    /// every job done or failed (a job parked for naming is neither).
+    private var canReplaceQueue: Bool {
+        !queue.isProcessing && queue.jobs.allSatisfy(\.state.isTerminal)
+    }
+
+    /// Rebuild the queue when the output folder has changed since it was built,
+    /// as soon as it holds no unfinished work.
+    ///
+    /// A queue writes into the folder it was built with and holds that folder's
+    /// security scope for its lifetime, so without this every import and
+    /// recording would keep landing in the old folder while Settings shows the
+    /// new one. A job already running finishes where it started; the rebuild
+    /// waits for it (`observeOutputFolder` re-checks on every job change).
+    /// Compared by bookmark data, not by resolving it: the check runs on every
+    /// job change, and a resolution can touch a slow volume.
+    func rebuildIfOutputFolderChanged() {
+        guard queueWasBuiltHere,
+              settings.customOutputDirBookmark != queueBuiltFromBookmark,
+              canReplaceQueue
+        else { return }
+        logger.info("Output folder changed, rebuilding the pipeline queue")
+        // Without the staging recovery: unlike a launch or a watch start, a
+        // folder change can come mid-recording, and the recovery tells a
+        // crashed recording from a live one only by how recently its files were
+        // written, so a track that has been silent for half a minute would be
+        // re-mixed or deleted underneath its writer. The recovery exists for
+        // what an earlier process left behind, and the next watch start runs
+        // it again.
+        rebuild(recoversStagedRecordings: false)
+    }
+
+    /// Re-check `rebuildIfOutputFolderChanged()` whenever the chosen folder
+    /// changes, and, while a change is still waiting for the queue to finish,
+    /// whenever the queue's jobs or processing flag change.
+    /// `withObservationTracking` fires once, so each firing re-arms.
+    private func observeOutputFolder() {
+        withObservationTracking {
+            let pending = settings.customOutputDirBookmark != queueBuiltFromBookmark
+            if pending {
+                _ = queue.isProcessing
+                _ = queue.jobs
+            }
+        } onChange: { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.rebuildIfOutputFolderChanged()
+                self?.observeOutputFolder()
+            }
+        }
+    }
+
+    #if DEBUG
+        /// Test-only: replace the live queue, for the one case that must do so
+        /// while `rebuild()` runs. Construction goes through
+        /// `QueueEnvironment.initialQueue`, production through `rebuild()`.
+        ///
+        /// Debug-only, unlike the repo's other test seams, because it assigns
+        /// where `rebuild()` adopts jobs, configures callbacks, updates the
+        /// bookmark, runs recovery and announces the replacement. A production
+        /// caller would hand the UI a queue the running watch loop does not
+        /// use, and the jobs in flight would vanish from view.
+        func installQueueForTesting(_ replacement: PipelineQueue) {
+            queue = replacement
+        }
+    #endif
 
     /// Rebuild only when the queue isn't already wired to an engine. The
     /// manual-recording + file-enqueue paths call this so an already-configured
@@ -122,12 +279,18 @@ final class PipelineController {
         rebuild()
     }
 
-    /// One-stop wired `PipelineQueue`: active engine from the provider, the
-    /// diarization/protocol factories, current settings, then load the persisted
-    /// snapshot + recover orphaned recordings off-main + refresh known names.
-    func makeQueue() -> PipelineQueue {
-        guard let engine = engineProvider?() else { return queue }
-        let q = PipelineQueue(
+    /// A `PipelineQueue` wired to the active engine, the diarization and
+    /// protocol factories and the current settings. Nil when no engine is wired
+    /// yet; see `engineProvider`.
+    ///
+    /// Wiring only; `rebuild` owns the steps that make a queue live.
+    ///
+    /// Not free of effect even so: a `PipelineQueue` takes the output folder's
+    /// security scope in its initialiser and holds it for its lifetime, so a
+    /// queue built and dropped takes and releases one.
+    func makeQueue() -> PipelineQueue? {
+        guard let engine = engineProvider?() else { return nil }
+        return PipelineQueue(
             engine: engine,
             diarizationFactory: { [self] in makeFluidDiarizer(mode: settings.diarizerMode) },
             diarizationFactoryWithMode: { [self] mode in makeFluidDiarizer(mode: mode) },
@@ -135,7 +298,9 @@ final class PipelineController {
             // Captured by value: this is the moment the destination of every job
             // this queue will run is decided, so a fallback is reported here and
             // not from `effectiveOutputDir`, which `body` reads on every render.
-            outputDir: outputDirectory.resolve(),
+            outputDir: queueEnvironment.resolveOutputDir(outputDirectory),
+            logDir: queueEnvironment.logDir,
+            stagingDir: queueEnvironment.stagingDir,
             diarizeEnabled: settings.diarize,
             echoDedupEnabled: settings.echoDedupEnabled,
             echoCancellationEnabled: { [settings] in settings.echoCancellationEnabled },
@@ -143,10 +308,12 @@ final class PipelineController {
             micLabel: settings.micName,
             includeFullTranscriptInProtocol: settings.includeFullTranscriptInProtocol,
             saveRawTranscriptSeparately: settings.saveRawTranscriptSeparately,
+            useAITitleForFilenames: settings.useAITitleForFilenames,
             transcriptOutputOptionsProvider: { [settings] in
                 TranscriptOutputOptions(
                     includeFullTranscriptInProtocol: settings.includeFullTranscriptInProtocol,
                     saveRawTranscriptSeparately: settings.saveRawTranscriptSeparately,
+                    useAITitleForFilenames: settings.useAITitleForFilenames,
                 )
             },
             speakerMatcherFactory: { SpeakerMatcher() },
@@ -157,31 +324,8 @@ final class PipelineController {
             },
             stageTimingLog: StageTimingLog(),
             terminalJobStore: terminalJobStore,
+            securityScope: queueEnvironment.securityScope,
         )
-        q.loadSnapshot()
-        // Fire-and-forget: dir scan + per-file attr probes run off-main so app
-        // startup (and the first call to `enqueueFiles`) isn't blocked by a slow
-        // filesystem. Recovered jobs appear in `queue.jobs` once the scan returns.
-        Task {
-            // Rescue recordings whose writer was killed mid-stream (#379), then
-            // hand off to the orphan scan which enqueues the results. Detached
-            // so the dir scans + per-file rewrites/re-mixes run off-main and
-            // don't block startup (same reason the orphan scan offloads its own
-            // filesystem work). Order matters:
-            //   1. repair unfinalized WAV headers so a crashed mic track reads,
-            //   2. re-mix crashed recordings (raw app .tmp + mic) into a _mix.wav,
-            //   3. delete any temp the re-mix couldn't use.
-            await Task.detached(priority: .utility) {
-                let repaired = WavHeaderRepair.repairUnfinalized(in: AppPaths.recordingsDir)
-                if repaired > 0 { logger.info("Repaired \(repaired) unfinalized recording(s) on launch") }
-                let recovered = DualSourceRecorder.recoverCrashedRecordings()
-                if recovered > 0 { logger.info("Recovered \(recovered) crashed recording(s) on launch") }
-                DualSourceRecorder.cleanupTempFiles()
-            }.value
-            await q.recoverOrphanedRecordings()
-        }
-        q.refreshKnownSpeakerNames()
-        return q
     }
 
     /// One-stop FluidDiarizer instantiation. Captures the current tuning fields

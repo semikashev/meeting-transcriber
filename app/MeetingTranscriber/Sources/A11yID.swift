@@ -35,11 +35,23 @@ enum A11yID {
         "consentDeniedAppRemove.\(index)"
     }
 
+    static func watchCustomAppRemove(_ index: Int) -> String {
+        "watchCustomAppRemove.\(index)"
+    }
+
+    /// Menu bar job row's Retry button, addressed by ROW INDEX like
+    /// `consentDeniedAppRemove`, so every row's button has its own handle and
+    /// no meeting title ends up in an identifier.
+    static func jobRetryButton(_ index: Int) -> String {
+        "jobRetryButton.\(index)"
+    }
+
     static let recordOnlyBanner = "recordOnlyBanner"
     static let transcriptionSection = "transcriptionSection"
     static let protocolSection = "protocolSection"
     static let includeFullTranscriptToggle = "includeFullTranscriptToggle"
     static let saveRawTranscriptToggle = "saveRawTranscriptToggle"
+    static let useAITitleForFilenamesToggle = "useAITitleForFilenamesToggle"
     static let outputFolderSection = "outputFolderSection"
     static let vadSection = "vadSection"
     static let echoCancellationToggle = "echoCancellationToggle"
@@ -49,6 +61,7 @@ enum A11yID {
     static let liveCaptionsOverlayToggle = "liveCaptionsOverlayToggle"
     static let liveCaptionsSizePicker = "liveCaptionsSizePicker"
     static let channelIndicatorSection = "channelIndicatorSection"
+    static let silentTrackWatchdogToggle = "silentTrackWatchdogToggle"
     static let experimentalTuningDisclosure = "experimentalTuningDisclosure"
     static let sortformerCapHint = "sortformer-cap-hint"
 

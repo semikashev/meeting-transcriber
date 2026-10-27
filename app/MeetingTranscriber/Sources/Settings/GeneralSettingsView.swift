@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 import UserNotifications
 
 struct GeneralSettingsView: View {
@@ -10,6 +11,8 @@ struct GeneralSettingsView: View {
     /// consent prompt is a notification), and nothing else in the app can say so
     /// without using the channel that is broken.
     var notificationVisibility: NotificationVisibility?
+
+    @State private var addAppRefusals: [String] = []
 
     /// Nil until the first permission check. The case, not just the message:
     /// how total the failure is decides the headline.
@@ -40,6 +43,7 @@ struct GeneralSettingsView: View {
                 Toggle("Tencent Meeting", isOn: $settings.watchTencentMeeting)
                 Toggle("FaceTime", isOn: $settings.watchFaceTime)
                 Toggle("WhatsApp", isOn: $settings.watchWhatsApp)
+                customApps
                 Toggle("Browser Web Meetings", isOn: $settings.watchBrowserMeetings)
                     .accessibilityIdentifier(A11yID.watchBrowserToggle)
                 Text(
@@ -148,6 +152,97 @@ struct GeneralSettingsView: View {
         )
         .font(.caption)
         .foregroundStyle(.secondary)
+    }
+
+    @ViewBuilder private var customApps: some View {
+        ForEach(Array(settings.watchCustomApps.enumerated()), id: \.element) { index, bundleID in
+            HStack {
+                Image(nsImage: Self.appIcon(bundleID: bundleID))
+                    .resizable()
+                    .frame(width: 16, height: 16)
+                Text(MicInputDetector.appDisplayName(bundleID: bundleID))
+                Spacer()
+                Button("Remove") {
+                    settings.watchCustomApps.removeAll { $0 == bundleID }
+                }
+                .accessibilityIdentifier(A11yID.watchCustomAppRemove(index))
+            }
+        }
+        VStack(alignment: .leading, spacing: 4) {
+            Button("Add App…", action: addCustomApps)
+            Text("Recording starts when an added app keeps the microphone busy for a few seconds.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            ForEach(addAppRefusals, id: \.self) { refusal in
+                Text(refusal)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+        }
+    }
+
+    private func addCustomApps() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.application]
+        panel.allowsMultipleSelection = true
+        panel.directoryURL = URL(fileURLWithPath: "/Applications")
+        guard panel.runModal() == .OK else { return }
+        addAppRefusals = addWatchedApps(at: panel.urls)
+    }
+
+    @discardableResult
+    func addWatchedApps(at urls: [URL]) -> [String] {
+        var refusals: [String] = []
+        for url in urls {
+            guard let bundle = Bundle(url: url), let bundleID = bundle.bundleIdentifier else { continue }
+            let name = url.deletingPathExtension().lastPathComponent
+            if let refusal = Self.watchRefusal(name: name, bundleID: bundleID, info: bundle.infoDictionary ?? [:]) {
+                if !refusals.contains(refusal) {
+                    refusals.append(refusal)
+                }
+            } else if !settings.watchCustomApps.contains(bundleID) {
+                settings.watchCustomApps.append(bundleID)
+            }
+        }
+        return refusals
+    }
+
+    static func watchRefusal(
+        name: String,
+        bundleID: String,
+        info: [String: Any],
+        ownBundleID: String? = Bundle.main.bundleIdentifier,
+    ) -> String? {
+        if bundleID == ownBundleID {
+            return "\(name) can't watch itself."
+        }
+        let executable = info["CFBundleExecutable"] as? String
+        let builtInName = MicInputDetector.defaultPatterns.first { $0.bundleIDs.contains(bundleID) }?.appName
+            ?? PowerAssertionDetector.defaultPatterns.first { executable.map($0.processNames.contains) ?? false }?.appName
+        if let builtInName {
+            return "\(builtInName) has its own toggle above."
+        }
+        guard isBrowser(info: info) else { return nil }
+        return "\(name) is a browser and can't be watched as an app. Browser meetings are detected by Browser Web Meetings."
+    }
+
+    private static func isBrowser(info: [String: Any]) -> Bool {
+        let urlTypes = info["CFBundleURLTypes"] as? [[String: Any]] ?? []
+        let schemes = urlTypes.flatMap { $0["CFBundleURLSchemes"] as? [String] ?? [] }
+        let documentTypes = info["CFBundleDocumentTypes"] as? [[String: Any]] ?? []
+        let contentTypes = documentTypes.flatMap { $0["LSItemContentTypes"] as? [String] ?? [] }
+        let extensions = documentTypes.flatMap { $0["CFBundleTypeExtensions"] as? [String] ?? [] }
+        let opensWeb = schemes.contains { ["http", "https"].contains($0.lowercased()) }
+        let opensHTML = contentTypes.contains { ["public.html", "public.xhtml"].contains($0) }
+            || extensions.contains { ["html", "htm", "xhtml", "shtml"].contains($0.lowercased()) }
+        return opensWeb && opensHTML
+    }
+
+    private static func appIcon(bundleID: String) -> NSImage {
+        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else {
+            return NSWorkspace.shared.icon(for: .application)
+        }
+        return NSWorkspace.shared.icon(forFile: url.path)
     }
 
     /// Apps the user answered "Never for this app" about.

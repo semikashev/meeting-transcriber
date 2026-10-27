@@ -640,6 +640,53 @@ final class MenuBarViewTests: XCTestCase {
         XCTAssertNoThrow(try body.find(text: "Failed"))
     }
 
+    /// Retry is the only way to run a failed job again without importing its
+    /// audio by hand. The queue has its own logDir: the default one is the
+    /// app's real data folder.
+    ///
+    /// Each row carries its own identifier, so the second row's button retries
+    /// the second job and leaves the first alone.
+    func testRetryButtonRequeuesTheJobOfItsOwnRow() throws {
+        let dir = try makeTempDirectory(prefix: "menubar_retry_test")
+        let queue = PipelineQueue(logDir: dir)
+        let first = try queue.insertJobForTesting(mixPath: emptyFile("first_mix.wav", in: dir), state: .error, error: "Failed")
+        let second = try queue.insertJobForTesting(mixPath: emptyFile("second_mix.wav", in: dir), state: .error, error: "Failed")
+
+        let sut = makeView(status: makeStatus(), pipelineQueue: queue)
+        try sut.inspect()
+            .find(viewWithAccessibilityIdentifier: A11yID.jobRetryButton(1))
+            .button()
+            .tap()
+
+        XCTAssertEqual(queue.jobs.first { $0.id == second }?.state, .waiting, "Retry did not requeue its own row's job")
+        XCTAssertEqual(queue.jobs.first { $0.id == first }?.state, .error, "Retry requeued another row's job")
+    }
+
+    /// The button follows the queue's own check rather than the job's state,
+    /// so it is absent for a failed job the queue would refuse to retry. The
+    /// full set of refusals is covered on the queue; this is the one case a
+    /// button keyed on the state alone would get wrong.
+    func testRetryButtonIsAbsentForAFailedJobTheQueueWouldRefuse() throws {
+        let dir = try makeTempDirectory(prefix: "menubar_retry_absent_test")
+        let queue = PipelineQueue(logDir: dir)
+        let mixPath = try emptyFile("shared_mix.wav", in: dir)
+        queue.insertJobForTesting(mixPath: mixPath, state: .transcribing)
+        queue.insertJobForTesting(mixPath: mixPath, state: .error, error: "This recording is already being processed")
+
+        let body = try makeView(status: makeStatus(), pipelineQueue: queue).inspect()
+
+        XCTAssertThrowsError(
+            try body.find(viewWithAccessibilityIdentifier: A11yID.jobRetryButton(1)),
+            "Retry offered while another job is still transcribing the same recording",
+        )
+    }
+
+    private func emptyFile(_ name: String, in dir: URL) throws -> URL {
+        let url = dir.appendingPathComponent(name)
+        try Data().write(to: url)
+        return url
+    }
+
     func testWarningJobShowsWarningText() throws {
         let queue = PipelineQueue()
         let job = PipelineJob(
@@ -940,6 +987,133 @@ final class MenuBarViewTests: XCTestCase {
         let sut = makeView(status: makeStatus(), pipelineQueue: queue)
         let body = try sut.inspect()
         XCTAssertNoThrow(try body.find(button: "Cancel"))
+    }
+
+    func testJobRowDoesNotContainSpacerOrHStack() throws {
+        // This checks the SwiftUI structure; ViewInspector cannot verify native
+        // NSMenu hit-testing or which row macOS highlights on hover.
+        let queue = PipelineQueue()
+        let job = PipelineJob(
+            meetingTitle: "Sprint",
+            appName: "Zoom",
+            mixPath: URL(fileURLWithPath: "/tmp/mix.wav"),
+            appPath: nil, micPath: nil, micDelay: 0,
+        )
+        queue.enqueue(job)
+
+        let sut = makeView(status: makeStatus(), pipelineQueue: queue)
+        let body = try sut.inspect()
+        XCTAssertThrowsError(try body.find(ViewType.Spacer.self))
+        XCTAssertThrowsError(try body.find(ViewType.HStack.self))
+    }
+
+    func testCompletedQueueShowsCompletedHeader() throws {
+        let dir = try makeTempDirectory(prefix: "menubar_completed_test")
+        let queue = PipelineQueue(logDir: dir)
+        var job = PipelineJob(
+            meetingTitle: "Sprint",
+            appName: "Zoom",
+            mixPath: URL(fileURLWithPath: "/tmp/mix.wav"),
+            appPath: nil, micPath: nil, micDelay: 0,
+        )
+        job.state = .done
+        queue.insertJobForTesting(job)
+
+        let sut = makeView(status: makeStatus(), pipelineQueue: queue)
+        let body = try sut.inspect()
+        XCTAssertNoThrow(try body.find(text: "Completed"))
+    }
+
+    func testJobLabelsAndCancelArePresent() throws {
+        let dir = try makeTempDirectory(prefix: "menubar_job_label_test")
+        let queue = PipelineQueue(logDir: dir)
+        let job = PipelineJob(
+            meetingTitle: "Sprint",
+            appName: "Zoom",
+            mixPath: URL(fileURLWithPath: "/tmp/mix.wav"),
+            appPath: nil, micPath: nil, micDelay: 0,
+        )
+        queue.enqueue(job)
+
+        let body = try makeView(status: makeStatus(), pipelineQueue: queue).inspect()
+        XCTAssertNoThrow(try body.find(text: "Sprint"))
+        XCTAssertNoThrow(try body.find(text: "Waiting..."))
+        XCTAssertFalse(try body.find(button: "Cancel").isDisabled())
+    }
+
+    /// Every job is a run of flat menu items, so the only thing that tells one
+    /// job's Cancel / Retry / Dismiss from the next is the separator between them.
+    func testJobsAreSeparatedByADivider() throws {
+        let dir = try makeTempDirectory(prefix: "menubar_job_divider_test")
+        let queue = PipelineQueue(logDir: dir)
+        func dividerCount() throws -> Int {
+            try makeView(status: makeStatus(), pipelineQueue: queue).inspect()
+                .findAll(ViewType.Divider.self).count
+        }
+        let first = try PipelineJob(
+            meetingTitle: "First", appName: "Teams",
+            mixPath: emptyFile("first_mix.wav", in: dir),
+            appPath: nil, micPath: nil, micDelay: 0,
+        )
+        queue.enqueue(first)
+        let withOneJob = try dividerCount()
+
+        let second = try PipelineJob(
+            meetingTitle: "Second", appName: "Zoom",
+            mixPath: emptyFile("second_mix.wav", in: dir),
+            appPath: nil, micPath: nil, micDelay: 0,
+        )
+        queue.enqueue(second)
+
+        XCTAssertEqual(try dividerCount(), withOneJob + 1)
+    }
+
+    func testCancelButtonCancelsOnlyItsOwnJob() throws {
+        let dir = try makeTempDirectory(prefix: "menubar_cancel_test")
+        let queue = PipelineQueue(logDir: dir)
+        let first = try PipelineJob(
+            meetingTitle: "First", appName: "Teams",
+            mixPath: emptyFile("first_mix.wav", in: dir),
+            appPath: nil, micPath: nil, micDelay: 0,
+        )
+        let second = try PipelineJob(
+            meetingTitle: "Second", appName: "Zoom",
+            mixPath: emptyFile("second_mix.wav", in: dir),
+            appPath: nil, micPath: nil, micDelay: 0,
+        )
+        queue.enqueue(first)
+        queue.enqueue(second)
+
+        let body = try makeView(status: makeStatus(), pipelineQueue: queue).inspect()
+        let cancelButtons = body.findAll(ViewType.Button.self).filter { button in
+            (try? button.labelView().text().string()) == "Cancel"
+        }
+        XCTAssertEqual(cancelButtons.count, 2)
+        try cancelButtons[1].tap()
+
+        XCTAssertTrue(queue.jobs.contains { $0.id == first.id })
+        XCTAssertFalse(queue.jobs.contains { $0.id == second.id })
+    }
+
+    func testActiveJobProgressLabelRendersTiming() throws {
+        let dir = try makeTempDirectory(prefix: "menu_active_progress_test")
+        let queue = PipelineQueue(logDir: dir)
+        let job = PipelineJob(
+            meetingTitle: "Sprint",
+            appName: "Zoom",
+            mixPath: URL(fileURLWithPath: "/tmp/mix.wav"),
+            appPath: nil, micPath: nil, micDelay: 0,
+        )
+        queue.enqueue(job)
+        queue.updateJobState(id: job.id, to: .transcribing)
+
+        let sut = makeView(status: makeStatus(), pipelineQueue: queue)
+        let body = try sut.inspect()
+        XCTAssertNoThrow(try body.find(button: "Cancel"))
+        XCTAssertNoThrow(try body.find(text: "Sprint"))
+        // Prefix, not the exact seconds: a loaded runner can take a second
+        // between `updateJobState` and `inspect()`.
+        XCTAssertNoThrow(try body.find(ViewType.Text.self) { try $0.string().hasPrefix("Transcribing... ") })
     }
 
     func testCancelButtonHiddenForDoneJob() throws {

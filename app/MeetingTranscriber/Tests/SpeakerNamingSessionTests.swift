@@ -9,159 +9,6 @@ import XCTest
 /// to no-ops instead of crashing.
 @MainActor
 final class SpeakerNamingSessionTests: XCTestCase {
-    // MARK: - Mock delegate
-
-    /// Records every delegate callback and models the minimal queue state the
-    /// session reads back (a per-id job whose `state` `updateJobState` mutates).
-    private final class MockDelegate: SpeakerNamingSessionDelegate {
-        var jobs: [UUID: PipelineJob] = [:]
-        private(set) var stateTransitions: [(id: UUID, state: JobState)] = []
-        private(set) var warnings: [(id: UUID, message: String)] = []
-        private(set) var generateProtocolCalls: [(jobID: UUID, title: String)] = []
-        private(set) var updateSpeakerDBCallCount = 0
-        /// The embeddings each write actually carried. Recorded separately from
-        /// the call count because the echo quarantine is invisible in the count:
-        /// the write still happens, it just carries less.
-        private(set) var updateSpeakerDBEmbeddings: [[String: [Float]]] = []
-        private(set) var updateSpeakerDBProvenance: [SampleProvenance] = []
-        /// The names each write would teach, label by label.
-        private(set) var updateSpeakerDBMappings: [[String: String]] = []
-        private(set) var metadataUpdates: [(jobID: UUID, slug: String?, mode: DiarizerMode?)] = []
-        private(set) var stageStartCount = 0
-        private(set) var stageEndCount = 0
-
-        func job(withID id: UUID) -> PipelineJob? {
-            jobs[id]
-        }
-
-        func updateJobState(id: UUID, to newState: JobState, error _: String?) {
-            jobs[id]?.state = newState
-            stateTransitions.append((id, newState))
-        }
-
-        func addWarning(id: UUID, _ message: String) {
-            warnings.append((id, message))
-        }
-
-        func setNamingMetadata(jobID: UUID, slug: String?, usedDiarizerMode: DiarizerMode?) {
-            metadataUpdates.append((jobID, slug, usedDiarizerMode))
-        }
-
-        func updateSpeakerDB(
-            matcher _: SpeakerMatcher, mapping: [String: String],
-            embeddings: [String: [Float]], speakingTimes _: [String: TimeInterval],
-            provenance: SampleProvenance,
-        ) {
-            updateSpeakerDBProvenance.append(provenance)
-            updateSpeakerDBCallCount += 1
-            updateSpeakerDBEmbeddings.append(embeddings)
-            updateSpeakerDBMappings.append(mapping)
-        }
-
-        func generateProtocol(jobID: UUID, transcript _: String, title: String, protocolsDir _: URL) {
-            generateProtocolCalls.append((jobID, title))
-        }
-
-        func runDualTrackDiarization(
-            diarizeProcess _: any DiarizationProvider,
-            tracks _: (app: URL, mic: URL, micDelay: TimeInterval, viability: DualTrackViability?),
-            speakerCount _: Int?, title _: String, jobID _: UUID,
-        ) throws -> DiarizationRun {
-            throw DiarizationError.notAvailable
-        }
-
-        func renderLabeledTranscript(
-            run _: DiarizationRun, cachedSegments _: [TimestampedSegment],
-            isDualSource _: Bool, autoNames _: [String: String], note _: String?,
-        ) -> String? {
-            nil
-        }
-
-        func namingStageDidStart(jobID _: UUID) {
-            stageStartCount += 1
-        }
-
-        func namingStageDidEnd() {
-            stageEndCount += 1
-        }
-    }
-
-    // MARK: - Helpers
-
-    private func makeSession(outputDir: URL?) -> SpeakerNamingSession {
-        SpeakerNamingSession(
-            namingStore: SpeakerNamingStore(outputDir: nil),
-            speakerMatcherFactory: PipelineQueue.throwawayMatcherFactory(),
-            outputDir: outputDir,
-        )
-    }
-
-    private func makeNamingData(jobID: UUID) -> PipelineQueue.SpeakerNamingData {
-        PipelineQueue.SpeakerNamingData(
-            jobID: jobID,
-            meetingTitle: "Standup",
-            mapping: ["SPEAKER_0": "SPEAKER_0"],
-            speakingTimes: ["SPEAKER_0": 12],
-            embeddings: ["SPEAKER_0": [0.1, 0.2, 0.3]],
-            audioPath: nil,
-            segments: [],
-            participants: [],
-            isDualSource: false,
-        )
-    }
-
-    /// A dual-track naming set: one speaker per track, prefixed the way
-    /// `mergeDualTrackDiarization` prefixes them.
-    private func makeDualTrackNamingData(
-        jobID: UUID, appSeconds: TimeInterval = 30, micSeconds: TimeInterval = 30,
-    ) -> PipelineQueue.SpeakerNamingData {
-        let remote = SpeakerKey(track: .app, id: "SPEAKER_0").encoded
-        let local = SpeakerKey(track: .mic, id: "SPEAKER_0").encoded
-        return PipelineQueue.SpeakerNamingData(
-            jobID: jobID,
-            meetingTitle: "Standup",
-            mapping: [remote: remote, local: local],
-            speakingTimes: [remote: appSeconds, local: micSeconds],
-            embeddings: [remote: [1, 0, 0], local: [0, 1, 0]],
-            audioPath: nil,
-            segments: [],
-            participants: [],
-            isDualSource: true,
-        )
-    }
-
-    private func pendingJob(
-        namingSlug: String?, transcriptPath: URL?, echo: EchoDetectionDTO? = nil,
-    ) -> PipelineJob {
-        var job = PipelineJob(
-            meetingTitle: "Standup", appName: "Test",
-            mixPath: nil, appPath: nil, micPath: nil, micDelay: 0,
-        )
-        job.echo = echo
-        job.state = .speakerNamingPending
-        job.namingSlug = namingSlug
-        job.transcriptPath = transcriptPath
-        return job
-    }
-
-    /// A detector result with the given per-window correlations, so the tests
-    /// go through the real `Result` → DTO mapping rather than asserting against
-    /// a hand-built verdict that could disagree with what the detector emits.
-    private func echoResult(correlations: [Double]) -> EchoBleedDetector.Result {
-        EchoBleedDetector.Result(
-            windowScores: correlations.map { correlation in
-                EchoBleedDetector.WindowScore(correlation: correlation, lagSeconds: 0.015)
-            },
-        )
-    }
-
-    private func waitUntil(_ condition: () -> Bool, timeout: TimeInterval = 2) async {
-        let deadline = Date().addingTimeInterval(timeout)
-        while !condition(), Date() < deadline {
-            try? await Task.sleep(nanoseconds: 5_000_000)
-        }
-    }
-
     // MARK: - Echo quarantine
 
     /// Drives the real confirm path, because the pure filter being correct is
@@ -173,16 +20,16 @@ final class SpeakerNamingSessionTests: XCTestCase {
         let transcriptPath = tmp.appendingPathComponent("transcript.txt")
         try "] R_SPEAKER_0: hello".write(to: transcriptPath, atomically: true, encoding: .utf8)
 
-        let session = makeSession(outputDir: tmp)
-        let mock = MockDelegate()
+        let session = NamingSessionFixture.session(outputDir: tmp)
+        let mock = NamingSessionMockDelegate()
         session.delegate = mock
 
-        let job = pendingJob(
+        let job = NamingSessionFixture.pendingJob(
             namingSlug: "standup_abcd1234", transcriptPath: transcriptPath,
-            echo: EchoDetectionDTO(echoResult(correlations: [0.9, 0.9, 0.9, 0.9])),
+            echo: EchoDetectionDTO(NamingSessionFixture.echoResult(correlations: [0.9, 0.9, 0.9, 0.9])),
         )
         mock.jobs[job.id] = job
-        session.speakerNamingDataByJob[job.id] = makeDualTrackNamingData(jobID: job.id)
+        session.speakerNamingDataByJob[job.id] = NamingSessionFixture.dualTrackNamingData(jobID: job.id)
 
         let local = SpeakerKey(track: .mic, id: "SPEAKER_0").encoded
         let remote = SpeakerKey(track: .app, id: "SPEAKER_0").encoded
@@ -192,7 +39,7 @@ final class SpeakerNamingSessionTests: XCTestCase {
             source: .dialog,
         )
 
-        await waitUntil { mock.jobs[job.id]?.state == .done }
+        await waitFor(mock.jobs[job.id]?.state == .done, timeout: .seconds(2))
         let written = try XCTUnwrap(mock.updateSpeakerDBEmbeddings.first)
         XCTAssertNil(
             written[local],
@@ -205,21 +52,173 @@ final class SpeakerNamingSessionTests: XCTestCase {
         )
     }
 
+    /// The protocol belongs beside the transcript it was made from, which sits
+    /// under the folder the job recorded. This session's folder is wherever the
+    /// output setting points now, so after a repoint a late confirm wrote the
+    /// protocol into one folder while its transcript stayed in another.
+    func testLateConfirmWritesTheProtocolUnderTheFolderTheJobRecorded() async throws {
+        let recorded = try makeTempDirectory(prefix: "LateConfirmRecorded")
+        let current = try makeTempDirectory(prefix: "LateConfirmCurrent")
+        let transcriptPath = recorded.appendingPathComponent("protocols/standup.txt")
+        try FileManager.default.createDirectory(
+            at: transcriptPath.deletingLastPathComponent(), withIntermediateDirectories: true,
+        )
+        try "] R_SPEAKER_0: hello".write(to: transcriptPath, atomically: true, encoding: .utf8)
+
+        let session = NamingSessionFixture.session(outputDir: current)
+        let mock = NamingSessionMockDelegate()
+        session.delegate = mock
+        var job = NamingSessionFixture.pendingJob(namingSlug: "standup_abcd1234", transcriptPath: transcriptPath)
+        job.recordSidecarOutputDir(recorded)
+        mock.jobs[job.id] = job
+        session.speakerNamingDataByJob[job.id] = NamingSessionFixture.namingData(jobID: job.id)
+
+        session.completeSpeakerNaming(
+            jobID: job.id, result: .confirmed(["SPEAKER_0": "Speaker A"]), source: .dialog,
+        )
+
+        await waitFor(mock.jobs[job.id]?.state == .done, timeout: .seconds(2))
+        XCTAssertEqual(
+            mock.generateProtocolCalls.map(\.protocolsDir),
+            [recorded.appendingPathComponent("protocols")],
+        )
+    }
+
+    /// The echo evidence is the persisted app track, and it sits under the
+    /// folder the job recorded. Read from this session's folder instead it is
+    /// simply absent, the answer is "no evidence", and the microphone voice of
+    /// the person at the machine is withheld although its own track proves it
+    /// was never bleed.
+    func testTheEchoEvidenceIsReadUnderTheFolderTheJobRecorded() async throws {
+        let recorded = try makeTempDirectory(prefix: "EchoEvidenceRecorded")
+        let current = try makeTempDirectory(prefix: "EchoEvidenceCurrent")
+        let slug = "standup_abcd1234"
+        let recordings = try makeRecordingsDir(in: recorded)
+        // Digital silence over the whole segment: the app track carried nothing
+        // while the local speaker talked, so that voice cannot be bleed.
+        try NamingSessionFixture.writeSilentTracks(
+            slug: slug,
+            suffixes: [SpeakerNamingStore.mixSuffix, SpeakerNamingStore.appTrackSuffix],
+            in: recordings,
+        )
+        let transcriptPath = recorded.appendingPathComponent("transcript.txt")
+        try "] R_SPEAKER_0: hello".write(to: transcriptPath, atomically: true, encoding: .utf8)
+
+        let session = NamingSessionFixture.session(outputDir: current)
+        let mock = NamingSessionMockDelegate()
+        session.delegate = mock
+        var job = NamingSessionFixture.pendingJob(
+            namingSlug: slug, transcriptPath: transcriptPath,
+            echo: EchoDetectionDTO(NamingSessionFixture.echoResult(correlations: [0.9, 0.9, 0.9, 0.9])),
+        )
+        job.recordSidecarOutputDir(recorded)
+        mock.jobs[job.id] = job
+
+        let local = SpeakerKey(track: .mic, id: "SPEAKER_0").encoded
+        let remote = SpeakerKey(track: .app, id: "SPEAKER_0").encoded
+        session.speakerNamingDataByJob[job.id] = NamingSessionFixture.dualTrackNamingData(
+            jobID: job.id, segments: [.init(start: 0, end: 2, speaker: local)],
+        )
+
+        session.completeSpeakerNaming(
+            jobID: job.id,
+            result: .confirmed([remote: "Speaker A", local: "Speaker B"]),
+            source: .dialog,
+        )
+
+        await waitFor(mock.jobs[job.id]?.state == .done, timeout: .seconds(2))
+        let written = try XCTUnwrap(mock.updateSpeakerDBEmbeddings.first)
+        XCTAssertEqual(
+            written[local], [0, 1, 0],
+            "the app track was silent while this voice spoke, so it is admitted",
+        )
+    }
+
+    /// The newest folder a job recorded is not proof that its files are there:
+    /// a write can have failed, or the user can have removed that folder, while
+    /// an earlier one still holds every sidecar. The read probes for the file
+    /// rather than trusting the order, or a late re-diarization fails and the
+    /// echo evidence reads as absent on a job whose files are one folder back.
+    func testTheEchoEvidenceIsFoundWhenOnlyAnEarlierFolderHoldsIt() async throws {
+        let withAudio = try makeTempDirectory(prefix: "ProbeWithAudio")
+        let empty = try makeTempDirectory(prefix: "ProbeEmpty")
+        let current = try makeTempDirectory(prefix: "ProbeCurrent")
+        let slug = "standup_abcd1234"
+        let recordings = try makeRecordingsDir(in: withAudio)
+        try NamingSessionFixture.writeSilentTracks(
+            slug: slug,
+            suffixes: [SpeakerNamingStore.mixSuffix, SpeakerNamingStore.appTrackSuffix],
+            in: recordings,
+        )
+        let transcriptPath = withAudio.appendingPathComponent("transcript.txt")
+        try "] R_SPEAKER_0: hello".write(to: transcriptPath, atomically: true, encoding: .utf8)
+
+        let session = NamingSessionFixture.session(outputDir: current)
+        let mock = NamingSessionMockDelegate()
+        session.delegate = mock
+        var job = NamingSessionFixture.pendingJob(
+            namingSlug: slug, transcriptPath: transcriptPath,
+            echo: EchoDetectionDTO(NamingSessionFixture.echoResult(correlations: [0.9, 0.9, 0.9, 0.9])),
+        )
+        job.recordSidecarOutputDir(withAudio)
+        // Recorded last, so the order alone would point here, and it holds
+        // nothing.
+        job.recordSidecarOutputDir(empty)
+        mock.jobs[job.id] = job
+
+        let local = SpeakerKey(track: .mic, id: "SPEAKER_0").encoded
+        let remote = SpeakerKey(track: .app, id: "SPEAKER_0").encoded
+        session.speakerNamingDataByJob[job.id] = NamingSessionFixture.dualTrackNamingData(
+            jobID: job.id, segments: [.init(start: 0, end: 2, speaker: local)],
+        )
+
+        session.completeSpeakerNaming(
+            jobID: job.id,
+            result: .confirmed([remote: "Speaker A", local: "Speaker B"]),
+            source: .dialog,
+        )
+
+        await waitFor(mock.jobs[job.id]?.state == .done, timeout: .seconds(2))
+        let written = try XCTUnwrap(mock.updateSpeakerDBEmbeddings.first)
+        XCTAssertEqual(
+            written[local], [0, 1, 0],
+            "the app track under the earlier folder was silent while this voice spoke",
+        )
+    }
+
+    /// Saving reports whether it landed, because only a folder that received
+    /// the payload may be recorded. A folder the write never reached would
+    /// otherwise take the front of the read order and answer with nothing.
+    func testSavingNamingDataReportsAFailedWrite() throws {
+        let blocked = try makeTempDirectory(prefix: "SaveBlocked")
+            .appendingPathComponent("a-file")
+        // A regular file where the store wants its folder, so creating
+        // `recordings/` underneath it cannot work.
+        try Data([0]).write(to: blocked)
+        let session = NamingSessionFixture.session(outputDir: blocked)
+
+        let saved = session.saveNamingData(
+            NamingSessionFixture.namingData(jobID: UUID()), slug: "meeting", in: blocked,
+        )
+
+        XCTAssertFalse(saved)
+    }
+
     func testConfirmOnACleanRecordingStillLearnsBothTracks() async throws {
         let tmp = try makeTempDirectory(prefix: "SpeakerNamingSessionTests")
         let transcriptPath = tmp.appendingPathComponent("transcript.txt")
         try "] R_SPEAKER_0: hello".write(to: transcriptPath, atomically: true, encoding: .utf8)
 
-        let session = makeSession(outputDir: tmp)
-        let mock = MockDelegate()
+        let session = NamingSessionFixture.session(outputDir: tmp)
+        let mock = NamingSessionMockDelegate()
         session.delegate = mock
 
-        let job = pendingJob(
+        let job = NamingSessionFixture.pendingJob(
             namingSlug: "standup_abcd1234", transcriptPath: transcriptPath,
-            echo: EchoDetectionDTO(echoResult(correlations: [0.2, 0.2, 0.2, 0.2])),
+            echo: EchoDetectionDTO(NamingSessionFixture.echoResult(correlations: [0.2, 0.2, 0.2, 0.2])),
         )
         mock.jobs[job.id] = job
-        session.speakerNamingDataByJob[job.id] = makeDualTrackNamingData(jobID: job.id)
+        session.speakerNamingDataByJob[job.id] = NamingSessionFixture.dualTrackNamingData(jobID: job.id)
 
         let local = SpeakerKey(track: .mic, id: "SPEAKER_0").encoded
         let remote = SpeakerKey(track: .app, id: "SPEAKER_0").encoded
@@ -229,7 +228,7 @@ final class SpeakerNamingSessionTests: XCTestCase {
             source: .dialog,
         )
 
-        await waitUntil { mock.jobs[job.id]?.state == .done }
+        await waitFor(mock.jobs[job.id]?.state == .done, timeout: .seconds(2))
         let written = try XCTUnwrap(mock.updateSpeakerDBEmbeddings.first)
         XCTAssertEqual(
             written[local],
@@ -240,81 +239,6 @@ final class SpeakerNamingSessionTests: XCTestCase {
         XCTAssertEqual(written[remote], [1, 0, 0])
     }
 
-    /// The cross-track rule rides the same confirm path as the quarantine, and
-    /// needs no echo verdict: the name alone says the two clusters are one person.
-    func testConfirmWithOneNameOnBothTracksLearnsOnlyTheLongerTrack() async throws {
-        let tmp = try makeTempDirectory(prefix: "SpeakerNamingSessionTests")
-        let transcriptPath = tmp.appendingPathComponent("transcript.txt")
-        try "] R_SPEAKER_0: hello".write(to: transcriptPath, atomically: true, encoding: .utf8)
-
-        let session = makeSession(outputDir: tmp)
-        let mock = MockDelegate()
-        session.delegate = mock
-
-        let job = pendingJob(
-            namingSlug: "standup_abcd1234", transcriptPath: transcriptPath,
-            echo: EchoDetectionDTO(echoResult(correlations: [0.2, 0.2, 0.2, 0.2])),
-        )
-        mock.jobs[job.id] = job
-        session.speakerNamingDataByJob[job.id] = makeDualTrackNamingData(
-            jobID: job.id, appSeconds: 240, micSeconds: 15,
-        )
-
-        let local = SpeakerKey(track: .mic, id: "SPEAKER_0").encoded
-        let remote = SpeakerKey(track: .app, id: "SPEAKER_0").encoded
-        session.completeSpeakerNaming(
-            jobID: job.id,
-            result: .confirmed([remote: "Speaker A", local: "Speaker A"]),
-            source: .dialog,
-        )
-
-        await waitUntil { mock.jobs[job.id]?.state == .done }
-        let written = try XCTUnwrap(mock.updateSpeakerDBEmbeddings.first)
-        XCTAssertNil(written[local], "The microphone copy of a remote voice is bleed and must not be learned")
-        XCTAssertEqual(written[remote], [1, 0, 0])
-        XCTAssertEqual(
-            mock.updateSpeakerDBProvenance.first,
-            SampleProvenance(origin: .meeting, jobID: job.id, meetingTitle: "Standup"),
-            "Each learned sample must say which recording taught it, or it cannot be undone",
-        )
-    }
-
-    // MARK: - Cleared suggestion
-
-    /// Wiring only; the outcomes are pinned in `NamingConfirmationTests`. The
-    /// confirm path, which the dialog and the automation API share, must teach
-    /// nothing for a cleared suggestion and take it off the transcript.
-    func testConfirmWithAClearedSuggestionNeitherLearnsNorKeepsIt() async throws {
-        let tmp = try makeTempDirectory(prefix: "SpeakerNamingSessionTests")
-        let transcriptPath = tmp.appendingPathComponent("transcript.txt")
-        try "[00:01] Alice: hi\n[00:02] Bob: hello\n".write(to: transcriptPath, atomically: true, encoding: .utf8)
-        let session = makeSession(outputDir: tmp)
-        let mock = MockDelegate()
-        session.delegate = mock
-        let job = pendingJob(namingSlug: "standup_abcd1234", transcriptPath: transcriptPath)
-        mock.jobs[job.id] = job
-        session.speakerNamingDataByJob[job.id] = PipelineQueue.SpeakerNamingData(
-            jobID: job.id, meetingTitle: "Standup",
-            mapping: ["SPEAKER_0": "Alice", "SPEAKER_1": "Bob"],
-            speakingTimes: ["SPEAKER_0": 30, "SPEAKER_1": 30],
-            embeddings: ["SPEAKER_0": [1, 0, 0], "SPEAKER_1": [0, 1, 0]],
-            audioPath: nil, segments: [], participants: [], isDualSource: false,
-        )
-
-        session.completeSpeakerNaming(
-            jobID: job.id, result: .confirmed(["SPEAKER_0": "", "SPEAKER_1": "Bob"]), source: .dialog,
-        )
-
-        await waitUntil { mock.jobs[job.id]?.state == .done }
-        let taught = try XCTUnwrap(mock.updateSpeakerDBMappings.first)
-        XCTAssertEqual(taught["SPEAKER_0"], "SPEAKER_0", "the cleared label goes back to unnamed")
-        XCTAssertEqual(taught["SPEAKER_1"], "Bob")
-        XCTAssertEqual(
-            try String(contentsOf: transcriptPath, encoding: .utf8),
-            "[00:01] SPEAKER_0: hi\n[00:02] Bob: hello\n",
-        )
-    }
-
     // MARK: - Confirm
 
     func testConfirmSynchronouslyTransitionsToGeneratingProtocolThenDone() async throws {
@@ -322,13 +246,13 @@ final class SpeakerNamingSessionTests: XCTestCase {
         let transcriptPath = tmp.appendingPathComponent("transcript.txt")
         try "] SPEAKER_0: hello".write(to: transcriptPath, atomically: true, encoding: .utf8)
 
-        let session = makeSession(outputDir: tmp)
-        let mock = MockDelegate()
+        let session = NamingSessionFixture.session(outputDir: tmp)
+        let mock = NamingSessionMockDelegate()
         session.delegate = mock
 
-        let job = pendingJob(namingSlug: "standup_abcd1234", transcriptPath: transcriptPath)
+        let job = NamingSessionFixture.pendingJob(namingSlug: "standup_abcd1234", transcriptPath: transcriptPath)
         mock.jobs[job.id] = job
-        session.speakerNamingDataByJob[job.id] = makeNamingData(jobID: job.id)
+        session.speakerNamingDataByJob[job.id] = NamingSessionFixture.namingData(jobID: job.id)
 
         session.completeSpeakerNaming(jobID: job.id, result: .confirmed(["SPEAKER_0": "Alice"]), source: .dialog)
 
@@ -339,7 +263,7 @@ final class SpeakerNamingSessionTests: XCTestCase {
 
         // The async re-apply then updates the DB, regenerates the protocol, and
         // finishes the job.
-        await waitUntil { mock.jobs[job.id]?.state == .done }
+        await waitFor(mock.jobs[job.id]?.state == .done, timeout: .seconds(2))
         XCTAssertEqual(mock.jobs[job.id]?.state, .done)
         XCTAssertEqual(mock.updateSpeakerDBCallCount, 1)
         XCTAssertEqual(mock.generateProtocolCalls.map(\.jobID), [job.id])
@@ -349,13 +273,13 @@ final class SpeakerNamingSessionTests: XCTestCase {
     // MARK: - Skip
 
     func testSkipWithoutProtocolFactoryTransitionsToDoneAndClearsData() {
-        let session = makeSession(outputDir: nil) // no protocol factory, no outputDir
-        let mock = MockDelegate()
+        let session = NamingSessionFixture.session(outputDir: nil) // no protocol factory, no outputDir
+        let mock = NamingSessionMockDelegate()
         session.delegate = mock
 
-        let job = pendingJob(namingSlug: "standup_abcd1234", transcriptPath: nil)
+        let job = NamingSessionFixture.pendingJob(namingSlug: "standup_abcd1234", transcriptPath: nil)
         mock.jobs[job.id] = job
-        session.speakerNamingDataByJob[job.id] = makeNamingData(jobID: job.id)
+        session.speakerNamingDataByJob[job.id] = NamingSessionFixture.namingData(jobID: job.id)
 
         session.completeSpeakerNaming(jobID: job.id, result: .skipped, source: .dialog)
 
@@ -368,8 +292,8 @@ final class SpeakerNamingSessionTests: XCTestCase {
     // MARK: - Missing data / dealloc
 
     func testCompleteWithNoNamingDataIsNoOp() {
-        let session = makeSession(outputDir: nil)
-        let mock = MockDelegate()
+        let session = NamingSessionFixture.session(outputDir: nil)
+        let mock = NamingSessionMockDelegate()
         session.delegate = mock
 
         // No speakerNamingDataByJob entry → guard returns immediately.
@@ -380,18 +304,18 @@ final class SpeakerNamingSessionTests: XCTestCase {
     }
 
     func testDeallocatedDelegateMakesOperationsNoOpsNotCrashes() {
-        let session = makeSession(outputDir: nil)
+        let session = NamingSessionFixture.session(outputDir: nil)
         let jobID = UUID()
 
         do {
-            let mock = MockDelegate()
+            let mock = NamingSessionMockDelegate()
             session.delegate = mock
             XCTAssertNotNil(session.delegate)
         }
         // `delegate` is weak → the mock is gone once its only strong ref left scope.
         XCTAssertNil(session.delegate, "delegate is weak and was released")
 
-        session.speakerNamingDataByJob[jobID] = makeNamingData(jobID: jobID)
+        session.speakerNamingDataByJob[jobID] = NamingSessionFixture.namingData(jobID: jobID)
         // Must not crash even though every delegate callback resolves to nil.
         session.completeSpeakerNaming(jobID: jobID, result: .skipped, source: .dialog)
 
@@ -430,7 +354,10 @@ final class SpeakerNamingSessionTests: XCTestCase {
 
         func addWarning(id _: UUID, _: String) {}
 
-        func setNamingMetadata(jobID _: UUID, slug _: String?, usedDiarizerMode _: DiarizerMode?) {}
+        func setNamingMetadata(
+            jobID _: UUID, slug _: String?, usedDiarizerMode _: DiarizerMode?,
+            wroteSidecarsIn _: URL?,
+        ) {}
 
         func updateSpeakerDB(
             matcher _: SpeakerMatcher, mapping _: [String: String],
@@ -457,9 +384,6 @@ final class SpeakerNamingSessionTests: XCTestCase {
         ) -> String? {
             nil
         }
-
-        func namingStageDidStart(jobID _: UUID) {}
-        func namingStageDidEnd() {}
     }
 
     /// Pins the strong per-flow delegate capture: the delegate is weak *at
@@ -474,21 +398,21 @@ final class SpeakerNamingSessionTests: XCTestCase {
         let transcriptPath = tmp.appendingPathComponent("transcript.txt")
         try "] SPEAKER_0: hello".write(to: transcriptPath, atomically: true, encoding: .utf8)
 
-        let session = makeSession(outputDir: tmp)
+        let session = NamingSessionFixture.session(outputDir: tmp)
         let recorder = FlowRecorder()
         var mock: GatedMockDelegate? = GatedMockDelegate(recorder: recorder)
         weak let weakMock = mock
         session.delegate = mock
 
-        let job = pendingJob(namingSlug: "standup_abcd1234", transcriptPath: transcriptPath)
+        let job = NamingSessionFixture.pendingJob(namingSlug: "standup_abcd1234", transcriptPath: transcriptPath)
         recorder.jobs[job.id] = job
-        session.speakerNamingDataByJob[job.id] = makeNamingData(jobID: job.id)
+        session.speakerNamingDataByJob[job.id] = NamingSessionFixture.namingData(jobID: job.id)
 
         session.completeSpeakerNaming(jobID: job.id, result: .confirmed(["SPEAKER_0": "Alice"]), source: .dialog)
 
         // Wait until the re-apply flow is provably in-flight (parked inside the
         // delegate's generateProtocol, i.e. mid-"LLM generation").
-        await waitUntil { recorder.generateProtocolEntered == 1 }
+        await waitFor(recorder.generateProtocolEntered == 1, timeout: .seconds(2))
         XCTAssertEqual(recorder.generateProtocolEntered, 1)
 
         // Release the test's only strong reference — models the controller
@@ -502,12 +426,12 @@ final class SpeakerNamingSessionTests: XCTestCase {
         // captured delegate, landing the final `.done`.
         recorder.protocolGate?.resume()
         recorder.protocolGate = nil
-        await waitUntil { recorder.transitions.contains(.done) }
+        await waitFor(recorder.transitions.contains(.done), timeout: .seconds(2))
         XCTAssertEqual(recorder.transitions, [.generatingProtocol, .done])
 
         // Once the flow ends, the weak-at-rest delegate zeroes — the per-flow
         // capture is bounded, not a leak.
-        await waitUntil { weakMock == nil }
+        await waitFor(weakMock == nil, timeout: .seconds(2))
         XCTAssertNil(weakMock, "delegate released once the flow completes")
         XCTAssertNil(session.delegate)
     }
@@ -515,11 +439,11 @@ final class SpeakerNamingSessionTests: XCTestCase {
     // MARK: - No-arg forwarder resolution
 
     func testHandlerIsInvokedAfterParking() async {
-        let session = makeSession(outputDir: nil)
-        let mock = MockDelegate()
+        let session = NamingSessionFixture.session(outputDir: nil)
+        let mock = NamingSessionMockDelegate()
         session.delegate = mock
 
-        let job = pendingJob(namingSlug: "standup_abcd1234", transcriptPath: nil)
+        let job = NamingSessionFixture.pendingJob(namingSlug: "standup_abcd1234", transcriptPath: nil)
         mock.jobs[job.id] = job
 
         let expectation = expectation(description: "handler invoked")
@@ -529,54 +453,91 @@ final class SpeakerNamingSessionTests: XCTestCase {
             return .skipped
         }
 
-        let data = makeNamingData(jobID: job.id)
+        let data = NamingSessionFixture.namingData(jobID: job.id)
         session.speakerNamingDataByJob[job.id] = data
         session.invokeHandler(jobID: job.id, data: data)
 
         await fulfillment(of: [expectation], timeout: 2)
     }
+
+    // MARK: - Cleanup without an explicit folder follows the job
+
+    /// A caller acting on a live job passes no folder, and that used to mean
+    /// "this session's own store", which is the folder the queue writes to
+    /// *now*. Once the user picks a new output folder, a job's sidecars sit
+    /// under the folder it recorded, so the cleanup looked in the new one, found
+    /// nothing, and left hundreds of megabytes of 16 kHz tracks behind for a
+    /// dual-source hour. Nothing else sweeps them: the job is gone from the
+    /// snapshot that would have named them.
+    ///
+    /// The restore path always passed the folder explicitly and was therefore
+    /// correct; these are the five call sites that did not, among them the late
+    /// confirmation, the auto-name accept and cancelling a job.
+    func testCleanupWithoutAFolderUsesTheOneTheJobRecorded() throws {
+        let recorded = try makeTempDirectory(prefix: "SidecarRecorded")
+        let current = try makeTempDirectory(prefix: "SidecarCurrent")
+        let recordings = recorded.appendingPathComponent("recordings", isDirectory: true)
+        try FileManager.default.createDirectory(at: recordings, withIntermediateDirectories: true)
+        let sidecars = try SidecarFixture.write(slug: "meeting", in: recordings)
+
+        // The session writes to `current`; the job recorded `recorded`. The
+        // session's own store gets `current` too, so a cleanup that ignores the
+        // job has a real folder to miss rather than no folder at all.
+        let session = SpeakerNamingSession(
+            namingStore: SpeakerNamingStore(outputDir: current),
+            speakerMatcherFactory: PipelineQueue.throwawayMatcherFactory(),
+            outputDir: current,
+        )
+        let delegate = NamingSessionMockDelegate()
+        session.delegate = delegate
+        var job = PipelineJob(
+            meetingTitle: "Meeting", appName: "Teams",
+            mixPath: recordings.appendingPathComponent("meeting_mix.wav"),
+            appPath: nil, micPath: nil, micDelay: 0,
+        )
+        job.namingSlug = "meeting"
+        job.recordSidecarOutputDir(recorded)
+        delegate.jobs[job.id] = job
+
+        session.removeNamingData(jobID: job.id, slug: "meeting")
+
+        assertSidecars(sidecars, exist: false)
+    }
+
+    /// A job that recorded no folder, so there is nothing to follow: the
+    /// session's own folder stays the answer, which is what every caller got
+    /// before the field existed.
+    ///
+    /// Green before and after the change, deliberately: it guards the fallback
+    /// rather than proving the fix. An implementation that resolved nil to a
+    /// store with no folder would do nothing at all and still look correct.
+    func testCleanupFallsBackToTheSessionFolderWhenTheJobRecordedNone() throws {
+        let current = try makeTempDirectory(prefix: "SidecarFallback")
+        let recordings = current.appendingPathComponent("recordings", isDirectory: true)
+        try FileManager.default.createDirectory(at: recordings, withIntermediateDirectories: true)
+        let sidecars = try SidecarFixture.write(slug: "meeting", in: recordings)
+
+        let session = SpeakerNamingSession(
+            namingStore: SpeakerNamingStore(outputDir: current),
+            speakerMatcherFactory: PipelineQueue.throwawayMatcherFactory(),
+            outputDir: current,
+        )
+        let delegate = NamingSessionMockDelegate()
+        session.delegate = delegate
+        var job = PipelineJob(
+            meetingTitle: "Meeting", appName: "Teams",
+            mixPath: recordings.appendingPathComponent("meeting_mix.wav"),
+            appPath: nil, micPath: nil, micDelay: 0,
+        )
+        job.namingSlug = "meeting"
+        delegate.jobs[job.id] = job
+
+        session.removeNamingData(jobID: job.id, slug: "meeting")
+
+        assertSidecars(sidecars, exist: false)
+    }
 }
 
 // Its own extension so the class body stays under the lint cap; private
 // helpers above are visible here because it is the same file.
-extension SpeakerNamingSessionTests {
-    /// A merged recording is the same call its parts were named in. Confirming
-    /// its names must replace what the parts taught instead of adding a second
-    /// copy of every voice next to the first.
-    func testConfirmingAMergedRecordingUndoesWhatItsPartsTaught() async throws {
-        let tmp = try makeTempDirectory(prefix: "SpeakerNamingSessionTests")
-        let transcriptPath = tmp.appendingPathComponent("transcript.txt")
-        try "[00:01] SPEAKER_0: hi\n".write(to: transcriptPath, atomically: true, encoding: .utf8)
-        let dbPath = tmp.appendingPathComponent("speakers.json")
-        let part = try XCTUnwrap(UUID(uuidString: "AAAAAAAA-1111-2222-3333-444444444444"))
-        let unrelated = UUID()
-        let seed = SpeakerMatcher(dbPath: dbPath)
-        seed.updateDB(
-            mapping: ["SPEAKER_0": "Alice"], embeddings: ["SPEAKER_0": [1, 0, 0]], speakingTimes: ["SPEAKER_0": 30],
-            provenance: SampleProvenance(jobID: part),
-        )
-        seed.updateDB(
-            mapping: ["SPEAKER_0": "Bob"], embeddings: ["SPEAKER_0": [0, 1, 0]], speakingTimes: ["SPEAKER_0": 30],
-            provenance: SampleProvenance(jobID: unrelated),
-        )
-        let session = SpeakerNamingSession(
-            namingStore: SpeakerNamingStore(outputDir: nil),
-            speakerMatcherFactory: { SpeakerMatcher(dbPath: dbPath) },
-            outputDir: tmp,
-        )
-        let mock = MockDelegate()
-        session.delegate = mock
-        var job = pendingJob(namingSlug: "standup_abcd1234", transcriptPath: transcriptPath)
-        job.mergedFromJobs = ["aaaaaaaa", "cccccccc"]
-        mock.jobs[job.id] = job
-        session.speakerNamingDataByJob[job.id] = makeNamingData(jobID: job.id)
-
-        session.completeSpeakerNaming(jobID: job.id, result: .confirmed(["SPEAKER_0": "Alice"]), source: .dialog)
-
-        await waitUntil { mock.jobs[job.id]?.state == .done }
-        let db = SpeakerMatcher(dbPath: dbPath).loadDB()
-        XCTAssertEqual(db.first { $0.name == "Alice" }?.samples.count, 0, "the part's sample is undone before the merge teaches")
-        XCTAssertEqual(db.first { $0.name == "Bob" }?.samples.map(\.jobID), [unrelated])
-        XCTAssertEqual(mock.updateSpeakerDBCallCount, 1, "the merged recording itself is still learned")
-    }
-}
+extension SpeakerNamingSessionTests {}

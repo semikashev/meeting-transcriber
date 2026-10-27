@@ -6,10 +6,14 @@ let package = Package(
     name: "MeetingTranscriber",
     platforms: [.macOS(.v14)],
     dependencies: [
-        .package(url: "https://github.com/nalexn/ViewInspector", from: "0.10.3"),
+        .package(url: "https://github.com/nalexn/ViewInspector", from: "0.10.5"),
         .package(url: "https://github.com/pointfreeco/swift-snapshot-testing", from: "1.19.1"),
         .package(url: "https://github.com/argmaxinc/WhisperKit.git", from: "1.0.0"),
-        .package(url: "https://github.com/FluidInference/FluidAudio.git", from: "0.13.4"),
+        // 0.15.5 is the first release whose offline diarizer reads the
+        // `computeUnits` of the configuration passed to `prepareModels`.
+        // Before it the argument compiles and is silently ignored, which
+        // would put the Metal routing back with no diagnostic.
+        .package(url: "https://github.com/FluidInference/FluidAudio.git", from: "0.15.5"),
         .package(path: "../../tools/audiotap"),
     ],
     targets: [

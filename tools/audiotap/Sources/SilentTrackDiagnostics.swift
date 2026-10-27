@@ -83,6 +83,15 @@ final class SilentTrackDiagnostics: @unchecked Sendable {
         /// The aggregate of the most recently installed tap, for the same
         /// reason as the processes above: at stop the session is often gone.
         var lastInstalledAggregateID = AudioObjectID(kAudioObjectUnknown)
+        /// The silent-track watchdog's state, nil unless the user opted in.
+        /// Nil rather than a disabled policy so that "off" holds no state at
+        /// all and every watchdog entry point below is a no-op by construction.
+        /// Behind the same lock as the observer because it is ticked on the
+        /// write queue and concluded on the diagnostics queue.
+        var watchdog: SilentTrackWatchdogPolicy?
+        /// Bumped by every adoption, so the watchdog can tell whether the tap
+        /// it judged is still the one installed.
+        var installGeneration = 0
     }
 
     private let state = OSAllocatedUnfairLock(initialState: State())
@@ -141,11 +150,7 @@ final class SilentTrackDiagnostics: @unchecked Sendable {
         armedNoBufferProbes = items.map(\.1)
         armedLock.unlock()
         for (offset, item) in items {
-            if let delayedWork {
-                delayedWork(offset, item)
-            } else {
-                queue.asyncAfter(deadline: .now() + offset, execute: item)
-            }
+            arm(item, after: offset, on: queue)
         }
     }
 
@@ -185,20 +190,164 @@ final class SilentTrackDiagnostics: @unchecked Sendable {
         state.withLock { $0.lastInstalledAggregateID }
     }
 
+    /// Turn the silent-track watchdog on for this capture (issue #672). Called
+    /// once, from `AppAudioCapture`'s init, before any buffer can tick it.
+    func armWatchdog() {
+        state.withLock { $0.watchdog = SilentTrackWatchdogPolicy() }
+    }
+
+    /// Run one step of the armed watchdog under the lock, in place. Every
+    /// entry point below goes through here, and each body reaches the policy
+    /// through optional chaining, so with the watchdog off (nil) nothing runs
+    /// and nothing changes. Unchecked because the body is generic: every
+    /// caller runs a few value-type mutations and returns plain values.
+    @discardableResult
+    private func withWatchdog<T>(_ body: (inout SilentTrackWatchdogPolicy?, Int) -> T?) -> T? {
+        state.withLockUnchecked { state in
+            body(&state.watchdog, state.installGeneration)
+        }
+    }
+
+    /// Feed one tick into the watchdog. Called on the write queue. The
+    /// generation says which installed tap the tick judged, so a rebuild
+    /// decided on it can be refused once another tap has replaced it.
+    func watchdogTick(
+        _ ages: ChannelSignalAges, now: TimeInterval,
+    ) -> (event: SilentTrackWatchdogPolicy.TickEvent, generation: Int)? {
+        withWatchdog { watchdog, generation in
+            watchdog?.tick(ages, now: now).map { ($0, generation) }
+        }
+    }
+
+    /// Close the open check. Called on the diagnostics queue.
+    func watchdogConclude(anyRunningOutput: Bool) -> SilentTrackWatchdogPolicy.CheckResult? {
+        withWatchdog { watchdog, _ in watchdog?.conclude(anyRunningOutput: anyRunningOutput) }
+    }
+
+    /// Re-check a requested rebuild on the main queue; nil means go ahead.
+    /// See `SilentTrackWatchdogPolicy.beginRebuild`.
+    func watchdogBeginRebuild(
+        _ ages: ChannelSignalAges, judgedGeneration: Int, captureRunning: Bool,
+    ) -> SilentTrackWatchdogPolicy.Abandoned? {
+        withWatchdog { watchdog, generation in
+            guard watchdog != nil else { return .captureNotRunning }
+            return watchdog?.beginRebuild(ages, sameTap: generation == judgedGeneration, captureRunning: captureRunning)
+        }
+    }
+
+    func watchdogRebuildStarted(now: TimeInterval) -> Int? {
+        withWatchdog { watchdog, _ in watchdog?.rebuildStarted(now: now) }
+    }
+
+    func watchdogRebuildNotStarted() {
+        withWatchdog { watchdog, _ in watchdog?.rebuildNotStarted() }
+    }
+
+    /// A restart gave up; returns the watchdog rebuild it ended, if one was
+    /// open. See `SilentTrackWatchdogPolicy.restartGaveUp`.
+    func watchdogRestartGaveUp() -> Int? {
+        withWatchdog { watchdog, _ in watchdog?.restartGaveUp() }
+    }
+
+    /// See `SilentTrackWatchdogPolicy.rebuiltTapInstalled`. The clock is
+    /// read under the lock, and only when a rebuild is open.
+    func watchdogRebuiltTapInstalled(now: () -> TimeInterval) -> (rebuild: Int, install: Int)? {
+        withWatchdog { watchdog, _ in watchdog?.rebuiltTapInstalled(now: now) }
+    }
+
+    /// See `SilentTrackWatchdogPolicy.rebuiltTapRemoved`.
+    func watchdogRebuiltTapRemoved() {
+        withWatchdog { watchdog, _ in watchdog?.rebuiltTapRemoved() }
+    }
+
+    /// See `SilentTrackWatchdogPolicy.rebuiltTapDeadlinePassed`.
+    func watchdogRebuiltTapDeadlinePassed(
+        rebuild: Int, install: Int, ages: ChannelSignalAges, now: TimeInterval,
+    ) -> SilentTrackWatchdogPolicy.DeadlineOutcome? {
+        withWatchdog { watchdog, _ in
+            watchdog?.rebuiltTapDeadlinePassed(rebuild: rebuild, install: install, ages: ages, now: now)
+        }
+    }
+
+    /// See `SilentTrackWatchdogPolicy.outputDeviceChanged`.
+    func watchdogOutputDeviceChanged(
+        _ ages: ChannelSignalAges, now: TimeInterval,
+    ) -> SilentTrackWatchdogPolicy.DeviceChangeOutcome? {
+        withWatchdog { watchdog, _ in watchdog?.outputDeviceChanged(ages, now: now) }
+    }
+
+    /// Run `work` after `delay` on a queue of its own, through the same
+    /// injected scheduler as the no-first-buffer probes. Not the diagnostics
+    /// queue: process-state reads run on it synchronously, and one wedged
+    /// inside coreaudiod (issue #588) would hold back the deadline that closes
+    /// a rebuild whose tap never delivered. The work needs no HAL access. Not
+    /// cancelled by a stop or a newer installation: the policy decides whether
+    /// the deadline still means anything when it lands.
+    func scheduleWatchdogDeadline(after delay: TimeInterval, _ work: @escaping @Sendable () -> Void) {
+        arm(DispatchWorkItem(block: work), after: delay, on: Self.deadlineQueue)
+    }
+
+    private static let deadlineQueue = DispatchQueue(label: "com.meetingtranscriber.audiotap.watchdog-deadline")
+
+    /// Run `item` on `queue` after `delay`, or hand it to the injected
+    /// scheduler, which then decides when it runs.
+    private func arm(_ item: DispatchWorkItem, after delay: TimeInterval, on queue: DispatchQueue) {
+        if let delayedWork {
+            delayedWork(delay, item)
+        } else {
+            queue.asyncAfter(deadline: .now() + delay, execute: item)
+        }
+    }
+
+    func watchdogClaimSkipLine() -> Bool {
+        withWatchdog { watchdog, _ in watchdog?.claimSkipLine() } ?? false
+    }
+
+    /// See `SilentTrackWatchdogPolicy.abandonCheck`.
+    func watchdogAbandonCheck() {
+        withWatchdog { watchdog, _ in watchdog?.abandonCheck() }
+    }
+
+    /// Called from `AppAudioCapture.stop()`, before the stop summary.
+    func stopWatchdog() {
+        withWatchdog { watchdog, _ in watchdog?.stop() }
+    }
+
+    /// True once the recording stopped, and when the watchdog was never armed.
+    var watchdogStopped: Bool {
+        state.withLock { $0.watchdog?.stopped ?? true }
+    }
+
+    /// What the stop summary reports, nil when the watchdog was never armed.
+    var watchdogCounters: SilentTrackWatchdogPolicy.Counters? {
+        state.withLock { $0.watchdog?.counters }
+    }
+
     /// Called from the tap adoption, on the main queue.
     func remember(_ processes: [TappedProcess], aggregateID: AudioObjectID) {
         state.withLock { state in
             state.lastInstalledProcesses = processes
             state.lastInstalledAggregateID = aggregateID
+            state.installGeneration += 1
         }
     }
 
     /// Take a process-state reading off every hot queue, unless one is already
     /// running. Returns whether this call started one, which is what makes the
     /// guard assertable.
+    ///
+    /// `reportToSink` false keeps the outcome out of the log, a skip included,
+    /// which is how a caller with its own log budget stays inside it; that
+    /// caller owns the skip line `Outcome` asks for. `then` hears the snapshot
+    /// on the diagnostics queue after the sink, and is how the watchdog acts on
+    /// the same read the log shows rather than taking a second one.
     @discardableResult
     func probeAsync(
-        _ processes: [TappedProcess], aggregateID: AudioObjectID, reason: String,
+        _ processes: [TappedProcess],
+        aggregateID: AudioObjectID,
+        reason: String,
+        reportToSink: Bool = true,
+        then: (@Sendable (ProbeSnapshot) -> Void)? = nil,
     ) -> Bool {
         let started = state.withLock { state -> Bool in
             guard !state.probeInFlight else { return false }
@@ -206,7 +355,9 @@ final class SilentTrackDiagnostics: @unchecked Sendable {
             return true
         }
         guard started else {
-            sink(reason, .skipped)
+            if reportToSink {
+                sink(reason, .skipped)
+            }
             return false
         }
 
@@ -226,7 +377,10 @@ final class SilentTrackDiagnostics: @unchecked Sendable {
             // flag only ever bounds how many blocks a wedged read can collect
             // behind it, and a clear the read must return to reach keeps that.
             self.state.withLock { $0.probeInFlight = false }
-            self.sink(reason, .read(snapshot))
+            if reportToSink {
+                self.sink(reason, .read(snapshot))
+            }
+            then?(snapshot)
         }
         return true
     }
