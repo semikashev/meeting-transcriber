@@ -101,16 +101,19 @@ final class WhisperVocabularyPromptTests: XCTestCase {
         )
     }
 
-    func testTermsFromFile_acceptsExactly256UniqueTerms() throws {
-        let contents = (0 ..< 256).map { "Term\($0)" }.joined(separator: "\n")
+    // Bound to the constant, not a literal: the limit was raised once and a
+    // literal here kept testing the old one.
+    func testTermsFromFile_acceptsExactlyTheMaximumUniqueTermCount() throws {
+        let limit = WhisperVocabularyPrompt.maximumTermCount
+        let contents = (0 ..< limit).map { "Term\($0)" }.joined(separator: "\n")
         let file = try makeVocabularyFile(contents: contents)
         defer { try? FileManager.default.removeItem(at: file) }
 
-        XCTAssertEqual(WhisperVocabularyPrompt.terms(fromFileAt: file.path)?.count, 256)
+        XCTAssertEqual(WhisperVocabularyPrompt.terms(fromFileAt: file.path)?.count, limit)
     }
 
-    func testTermsFromFile_rejects257UniqueTerms() throws {
-        let contents = (0 ... 256).map { "Term\($0)" }.joined(separator: "\n")
+    func testTermsFromFile_rejectsOneUniqueTermOverTheMaximum() throws {
+        let contents = (0 ... WhisperVocabularyPrompt.maximumTermCount).map { "Term\($0)" }.joined(separator: "\n")
         let file = try makeVocabularyFile(contents: contents)
         defer { try? FileManager.default.removeItem(at: file) }
 
