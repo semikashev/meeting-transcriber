@@ -321,10 +321,13 @@ let picker = try view.inspect()
 try picker.select(value: LiveCaptionsSize.small)
 ```
 
-Measured under the pinned ViewInspector 0.10.3, and pinned by
+Measured under ViewInspector 0.10.3 and again under the pinned 0.10.5, and pinned by
 `ViewInspectorIdentifierTests`: a `Picker` and a `Stepper` each carrying an
 identifier are found and driven, and an unknown identifier throws, so the lookup
-is not matching whatever it is handed. The label and document-order locators
+is not matching whatever it is handed. Built against the macOS 27 SDK, 0.10.3
+found no view by identifier at all (about 40 tests red, `ViewInspectorIdentifierTests`
+included); 0.10.5 carries the SwiftUI 27 introspection changes. When that test
+goes red after an Xcode update, suspect the ViewInspector pin before the views. The label and document-order locators
 still in `SettingsInteractionTests` predate this; they work, and they are not
 the shape to copy. `find(text:)` for a bare
 label only when the label itself is the behavior under test. An identifier makes a control
