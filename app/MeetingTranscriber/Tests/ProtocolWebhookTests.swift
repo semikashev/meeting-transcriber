@@ -2,9 +2,12 @@ import Foundation
 @testable import MeetingTranscriber
 import XCTest
 
-final class ProtocolWebhookTests: XCTestCase {
+final class ProtocolWebhookTests: XCTestCase { // swiftlint:disable:this balanced_xctest_lifecycle
     private let job = ProtocolWebhook.JobInfo(
-        jobID: UUID(uuidString: "11111111-2222-3333-4444-555555555555")!,
+        // 11111111-2222-3333-4444-555555555555
+        jobID: UUID(uuid: (
+            0x11, 0x11, 0x11, 0x11, 0x22, 0x22, 0x33, 0x33, 0x44, 0x44, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55,
+        )),
         title: "Weekly sync",
         appName: "Microsoft Teams",
         meetingStartTime: Date(timeIntervalSince1970: 1_790_000_000),
@@ -29,7 +32,8 @@ final class ProtocolWebhookTests: XCTestCase {
         MockURLProtocol.handler = { request in
             calls += 1
             let code = remaining.isEmpty ? 200 : remaining.removeFirst()
-            return (HTTPURLResponse(url: request.url!, statusCode: code, httpVersion: nil, headerFields: nil)!, Data())
+            let url = request.url ?? URL(fileURLWithPath: "/")
+            return (HTTPURLResponse(url: url, statusCode: code, httpVersion: nil, headerFields: nil) ?? HTTPURLResponse(), Data())
         }
         return { calls }
     }
@@ -123,9 +127,7 @@ final class ProtocolWebhookTests: XCTestCase {
 
     private func send(_ session: URLSession) async -> ProtocolWebhook.Outcome {
         let request = URLRequest(url: URL(string: "https://h/x")!)
-        return await ProtocolWebhook.send(
-            request, session: session, retryDelays: [.zero, .zero], sleep: { _ in },
-        )
+        return await ProtocolWebhook.send(request, session: session, retryDelays: [.zero, .zero]) { _ in }
     }
 
     func testDeliveredOn2xx() async {
@@ -156,7 +158,10 @@ final class ProtocolWebhookTests: XCTestCase {
             return URLError(.cannotConnectToHost)
         }
         let outcome = await send(mockSession())
-        guard case .failed = outcome else { return XCTFail("expected failure, got \(outcome)") }
+        guard case .failed = outcome else {
+            XCTFail("expected failure, got \(outcome)")
+            return
+        }
         XCTAssertEqual(calls, 3)
     }
 }
