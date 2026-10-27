@@ -771,12 +771,10 @@ extension PipelineQueue {
             let rawSegments = try await engine.transcribeSegments(audioPath: mix16k)
             cachedSegments = normalize(rawSegments, with: transcription.terminologyNormalizer)
         }
-        return renderLabeledTranscript(
+        return mergedLabeledSegments(
             run: run, cachedSegments: cachedSegments,
             isDualSource: transcription.isDualSource, autoNames: autoNames,
-            note: transcription.note,
-            normalizer: transcription.terminologyNormalizer,
-        )
+        ).map { normalize($0, with: transcription.terminologyNormalizer).transcriptText(note: transcription.note) }
     }
 
     /// Render the speaker-labeled transcript text from a diarization run +
@@ -793,18 +791,24 @@ extension PipelineQueue {
     ) -> String? {
         // A late re-run has no job snapshot of the rules; it applies the
         // current ones, like a new job would.
-        renderLabeledTranscript(
-            run: run, cachedSegments: cachedSegments,
-            isDualSource: isDualSource, autoNames: autoNames, note: note,
-            normalizer: terminologyNormalizer(),
-        )
+        mergedLabeledSegments(
+            run: run, cachedSegments: cachedSegments, isDualSource: isDualSource, autoNames: autoNames,
+        ).map { normalize($0, with: terminologyNormalizer()).transcriptText(note: note) }
     }
 
-    private func renderLabeledTranscript(
+    /// Speaker-labeled segments with consecutive same-speaker blocks merged;
+    /// nil when the run carries no usable diarization. Callers apply the
+    /// terminology rules to these merged lines: ASR segments end at `. ! ?`
+    /// and every 20 tokens, so a phrase can straddle two of them and slip past
+    /// the per-segment rules, and the merged speaker line is the first text
+    /// that holds it whole. Rules run over the text only, never the speaker
+    /// label; a second pass over text they already rewrote is a no-op as long
+    /// as the rule set is idempotent. Optional on purpose: nil means "no
+    /// usable diarization", which an empty segment list cannot express.
+    private func mergedLabeledSegments(
         run: DiarizationRun, cachedSegments: [TimestampedSegment],
-        isDualSource: Bool, autoNames: [String: String], note: String?,
-        normalizer: TerminologyNormalizer,
-    ) -> String? {
+        isDualSource: Bool, autoNames: [String: String],
+    ) -> [TimestampedSegment]? { // swiftlint:disable:this discouraged_optional_collection
         // Suppressed copies leave before anything gets a speaker. Left in,
         // they would be labeled like real speech and merged into adjacent
         // same-speaker blocks, where the trailing `transcriptText` filter can
@@ -833,13 +837,7 @@ extension PipelineQueue {
         }
         guard let topology else { return nil }
         let labeled = DiarizationProcess.labelSegments(topology, autoNames: autoNames)
-        // ASR segments end at `. ! ?` and every 20 tokens, so a phrase can
-        // straddle two of them and slip past the per-segment rules. The merged
-        // speaker line is the first text that holds it whole. Rules run over
-        // the text only, never the speaker label; a second pass over text they
-        // already rewrote is a no-op as long as the rule set is idempotent.
-        let merged = DiarizationProcess.mergeConsecutiveSpeakers(labeled)
-        return normalize(merged, with: normalizer).transcriptText(note: note)
+        return DiarizationProcess.mergeConsecutiveSpeakers(labeled)
     }
 
     /// Stage 3 — persist the transcript + audio, run protocol generation
@@ -989,8 +987,7 @@ extension PipelineQueue {
                     participantEmails: job?.participantEmails ?? [],
                 ),
                 protocolPath: mdPath,
-                warn: { [weak self] message in self?.addWarning(id: jobID, message) },
-            )
+            ) { [weak self] message in self?.addWarning(id: jobID, message) }
             stopElapsedTimer()
         } catch {
             // Every ProtocolGenerating error's message is now guaranteed
