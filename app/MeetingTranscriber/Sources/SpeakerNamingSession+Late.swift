@@ -55,6 +55,7 @@ extension SpeakerNamingSession {
             let held = unquarantined.count - admissible.count
             logger.info("cross_track_bleed held=\(held, privacy: .public) of=\(unquarantined.count, privacy: .public)")
         }
+        undoMergedParts(of: job, in: matcher)
         delegate.updateSpeakerDB(
             matcher: matcher,
             mapping: fullMapping,
@@ -134,6 +135,17 @@ extension SpeakerNamingSession {
             logger.info("echo_quarantine_admitted count=\(proven.count, privacy: .public) spoke only over a silent app track")
         }
         return proven
+    }
+
+    /// A merge is the call its parts were already named in: replace what they
+    /// taught instead of learning every voice a second time (see
+    /// `PipelineJob.mergedFromJobs`). Runs before the merge's own write, so
+    /// the sample admission judges the merge against a database without its
+    /// parts.
+    private func undoMergedParts(of job: PipelineJob, in matcher: SpeakerMatcher) {
+        guard let parts = job.mergedFromJobs, !parts.isEmpty else { return }
+        let changed = matcher.removeContributions(ofJobsWithShortIDs: Set(parts))
+        logger.info("merge_parts_undone parts=\(parts.count, privacy: .public) speakers=\(changed.count, privacy: .public)")
     }
 
     // MARK: - Late Re-diarization

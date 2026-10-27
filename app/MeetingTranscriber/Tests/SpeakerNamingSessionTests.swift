@@ -536,3 +536,47 @@ final class SpeakerNamingSessionTests: XCTestCase {
         await fulfillment(of: [expectation], timeout: 2)
     }
 }
+
+// Its own extension so the class body stays under the lint cap; private
+// helpers above are visible here because it is the same file.
+extension SpeakerNamingSessionTests {
+    /// A merged recording is the same call its parts were named in. Confirming
+    /// its names must replace what the parts taught instead of adding a second
+    /// copy of every voice next to the first.
+    func testConfirmingAMergedRecordingUndoesWhatItsPartsTaught() async throws {
+        let tmp = try makeTempDirectory(prefix: "SpeakerNamingSessionTests")
+        let transcriptPath = tmp.appendingPathComponent("transcript.txt")
+        try "[00:01] SPEAKER_0: hi\n".write(to: transcriptPath, atomically: true, encoding: .utf8)
+        let dbPath = tmp.appendingPathComponent("speakers.json")
+        let part = try XCTUnwrap(UUID(uuidString: "AAAAAAAA-1111-2222-3333-444444444444"))
+        let unrelated = UUID()
+        let seed = SpeakerMatcher(dbPath: dbPath)
+        seed.updateDB(
+            mapping: ["SPEAKER_0": "Alice"], embeddings: ["SPEAKER_0": [1, 0, 0]], speakingTimes: ["SPEAKER_0": 30],
+            provenance: SampleProvenance(jobID: part),
+        )
+        seed.updateDB(
+            mapping: ["SPEAKER_0": "Bob"], embeddings: ["SPEAKER_0": [0, 1, 0]], speakingTimes: ["SPEAKER_0": 30],
+            provenance: SampleProvenance(jobID: unrelated),
+        )
+        let session = SpeakerNamingSession(
+            namingStore: SpeakerNamingStore(outputDir: nil),
+            speakerMatcherFactory: { SpeakerMatcher(dbPath: dbPath) },
+            outputDir: tmp,
+        )
+        let mock = MockDelegate()
+        session.delegate = mock
+        var job = pendingJob(namingSlug: "standup_abcd1234", transcriptPath: transcriptPath)
+        job.mergedFromJobs = ["aaaaaaaa", "cccccccc"]
+        mock.jobs[job.id] = job
+        session.speakerNamingDataByJob[job.id] = makeNamingData(jobID: job.id)
+
+        session.completeSpeakerNaming(jobID: job.id, result: .confirmed(["SPEAKER_0": "Alice"]), source: .dialog)
+
+        await waitUntil { mock.jobs[job.id]?.state == .done }
+        let db = SpeakerMatcher(dbPath: dbPath).loadDB()
+        XCTAssertEqual(db.first { $0.name == "Alice" }?.samples.count, 0, "the part's sample is undone before the merge teaches")
+        XCTAssertEqual(db.first { $0.name == "Bob" }?.samples.map(\.jobID), [unrelated])
+        XCTAssertEqual(mock.updateSpeakerDBCallCount, 1, "the merged recording itself is still learned")
+    }
+}

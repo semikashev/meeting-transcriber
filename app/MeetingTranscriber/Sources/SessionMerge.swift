@@ -278,7 +278,7 @@ enum SessionMerge {
         request: SessionMergeRequest, plan: Plan, audio: RenderedAudio,
         participants: [String], emails: [String],
     ) -> PipelineJob {
-        PipelineJob(
+        var job = PipelineJob(
             meetingTitle: request.title,
             appName: "Merged recording",
             mixPath: audio.mix, appPath: audio.app, micPath: audio.mic,
@@ -287,6 +287,8 @@ enum SessionMerge {
             participantEmails: emails.isEmpty ? nil : emails,
             meetingStartTime: plan.sources.first?.entry.recordedAt,
         )
+        job.mergedFromJobs = plan.sources.map(\.entry.jobShortID)
+        return job
     }
 
     /// Union in first-seen order, ignoring case and blanks.

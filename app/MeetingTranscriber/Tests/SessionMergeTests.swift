@@ -112,6 +112,21 @@ final class SessionMergeTests: XCTestCase {
         XCTAssertEqual(job.micDelay, 0)
     }
 
+    /// The parts already taught the voice database when they were named; the
+    /// job has to say which recordings it is, or naming it teaches the same
+    /// call a second time.
+    func testJobRemembersWhichRecordingsItJoins() throws {
+        let first = try dualSession("20260929_1000_A_aaaaaaaa", title: "Sync", at: date(10), appSeconds: 1, micSeconds: 1)
+        let second = try dualSession("20260929_1100_B_bbbbbbbb", title: "Sync 2", at: date(11), appSeconds: 1, micSeconds: 1)
+        let request = SessionMergeRequest(entries: [second, first], title: "", deleteOriginals: false)
+        let plan = try SessionMerge.plan(for: request.entries)
+        let audio = try SessionMerge.render(plan, into: dir.appendingPathComponent("out"), basename: "base")
+
+        let job = SessionMerge.makeJob(request: request, plan: plan, audio: audio, participants: [], emails: [])
+
+        XCTAssertEqual(job.mergedFromJobs, ["aaaaaaaa", "bbbbbbbb"])
+    }
+
     func testUnionKeepsFirstSpellingAndDropsDuplicatesAndBlanks() {
         XCTAssertEqual(
             SessionMerge.union([["Anna", " boris "], ["ANNA", "", "Carl"]]),

@@ -150,6 +150,26 @@ final class StoredSpeakerHistoryTests: XCTestCase { // swiftlint:disable:this ba
         )
     }
 
+    /// A merged recording knows its parts only by the eight hex digits every
+    /// output stem ends in, so undoing them goes by that short form.
+    func testUndoingRecordingsByShortIDRemovesOnlyTheirSamples() throws {
+        let matcher = SpeakerMatcher(dbPath: dbPath)
+        let part = try XCTUnwrap(UUID(uuidString: "AAAAAAAA-1111-2222-3333-444444444444"))
+        let other = try XCTUnwrap(UUID(uuidString: "BBBBBBBB-1111-2222-3333-444444444444"))
+        matcher.updateDB(
+            mapping: ["R_S0": "A"], embeddings: ["R_S0": [1, 0, 0]], speakingTimes: ["R_S0": 30],
+            provenance: SampleProvenance(jobID: part),
+        )
+        matcher.updateDB(
+            mapping: ["R_S0": "A"], embeddings: ["R_S0": [0.9, 0.1, 0]], speakingTimes: ["R_S0": 30],
+            provenance: SampleProvenance(jobID: other),
+        )
+
+        XCTAssertEqual(matcher.removeContributions(ofJobsWithShortIDs: ["aaaaaaaa"]), ["A"])
+        XCTAssertEqual(matcher.loadDB().first?.samples.map(\.jobID), [other])
+        XCTAssertEqual(matcher.removeContributions(ofJobsWithShortIDs: []), [])
+    }
+
     func testPinningIsPersisted() throws {
         let matcher = SpeakerMatcher(dbPath: dbPath)
         matcher.updateDB(mapping: ["S0": "A"], embeddings: ["S0": [1, 0]], speakingTimes: ["S0": 10])

@@ -24,6 +24,11 @@ struct ProtocolEntry: Identifiable, Equatable {
     var id: String {
         stem
     }
+
+    /// The job's `shortID`, which every stem ends in (`stemPattern`).
+    var jobShortID: String {
+        String(stem.suffix(8))
+    }
 }
 
 /// What "delete" takes with it. Audio is where the space goes (three WAVs
