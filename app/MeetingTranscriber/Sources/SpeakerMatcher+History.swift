@@ -24,10 +24,28 @@ extension SpeakerMatcher {
     /// beyond reach. Returns the names of the speakers that changed.
     @discardableResult
     func removeContributions(ofJob jobID: UUID) -> [String] {
+        removeSamples { $0.jobID == jobID }
+    }
+
+    /// `removeContributions(ofJob:)` for jobs known only by their `shortID`,
+    /// the eight hex digits an output stem ends in (a merge's parts, see
+    /// `PipelineJob.mergedFromJobs`). Two jobs sharing those digits would both
+    /// go; with a few hundred recordings that is a one-in-millions chance.
+    @discardableResult
+    func removeContributions(ofJobsWithShortIDs shortIDs: Set<String>) -> [String] {
+        guard !shortIDs.isEmpty else { return [] }
+        return removeSamples { sample in
+            sample.jobID.map { shortIDs.contains(PipelineJob.shortID(for: $0)) } ?? false
+        }
+    }
+
+    /// Drop every matching sample from every speaker; returns the names of
+    /// the speakers that changed.
+    private func removeSamples(where undone: (VoiceSample) -> Bool) -> [String] {
         mutateDB { stored in
             var changed: [String] = []
-            for idx in stored.indices where stored[idx].samples.contains(where: { $0.jobID == jobID }) {
-                stored[idx] = stored[idx].withSamples(stored[idx].samples.filter { $0.jobID != jobID })
+            for idx in stored.indices where stored[idx].samples.contains(where: undone) {
+                stored[idx] = stored[idx].withSamples(stored[idx].samples.filter { !undone($0) })
                 changed.append(stored[idx].name)
             }
             return changed

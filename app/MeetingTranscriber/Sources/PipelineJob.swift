@@ -170,6 +170,18 @@ struct PipelineJob: Identifiable, Codable {
     /// code did before this field existed.
     var sidecarOutputDir: URL?
 
+    /// Short IDs (`shortID`) of the recordings a merge joined into this job,
+    /// in call order; nil for every other job and for snapshots written before
+    /// the field existed.
+    ///
+    /// The merged audio is the same call its parts were already named in, so
+    /// confirming its names first undoes what the parts taught the voice
+    /// database. Without that every voice of the call was learned twice, and
+    /// the two copies sat 0.01 apart in the recent-sample anchors. Matching
+    /// still sees the parts on purpose: they prefill the merged dialog with
+    /// the names already confirmed for the same voices.
+    var mergedFromJobs: [String]? // swiftlint:disable:this discouraged_optional_collection
+
     init(
         meetingTitle: String,
         appName: String,
