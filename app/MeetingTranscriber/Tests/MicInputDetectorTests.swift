@@ -17,6 +17,10 @@ private func snapshot(
     MicInputDetector.AudioProcessSnapshot(bundleID: bundleID, pid: pid, isRunningInput: running)
 }
 
+private func customPattern(appName: String, bundleID: String) -> MicInputDetector.MicPattern {
+    MicInputDetector.MicPattern(appName: appName, bundleIDs: [bundleID], matchesHelpers: true, usesBuiltInMeetingPattern: false)
+}
+
 // MARK: - Detection Tests
 
 final class MicInputDetectorTests: XCTestCase {
@@ -177,5 +181,119 @@ final class MicInputDetectorTests: XCTestCase {
         XCTAssertTrue(none.isEmpty)
         let one = MicInputDetector.patterns(watching: ["WeChat"])
         XCTAssertEqual(one.map(\.appName), ["WeChat"])
+    }
+
+    func testCustomAppDetectsViaHelperAndTapsMainApp() throws {
+        let detector = MicInputDetector(
+            patterns: MicInputDetector.patterns(watching: [], customBundleIDs: ["com.example.callapp"]),
+            confirmationCount: 1,
+        )
+        detector.windowListProvider = { [] }
+        detector.mainAppPIDProvider = { $0 == "com.example.callapp" ? 100 : nil }
+        detector.processProvider = { [snapshot("com.example.callapp.helper", pid: 555)] }
+
+        let result = try XCTUnwrap(detector.checkOnce())
+        XCTAssertEqual(result.windowPID, 100)
+        XCTAssertTrue(detector.isMeetingActive(result))
+    }
+
+    func testCustomAppMainProcessKeepsItsOwnPID() {
+        let detector = MicInputDetector(
+            patterns: MicInputDetector.patterns(watching: [], customBundleIDs: ["com.example.callapp"]),
+            confirmationCount: 1,
+        )
+        detector.windowListProvider = { [] }
+        detector.mainAppPIDProvider = { _ in 100 }
+        detector.processProvider = { [snapshot("com.example.callapp", pid: 555)] }
+
+        XCTAssertEqual(detector.checkOnce()?.windowPID, 555)
+    }
+
+    func testCustomAppIgnoresBundleSharingOnlyAPrefix() {
+        let detector = MicInputDetector(
+            patterns: MicInputDetector.patterns(watching: [], customBundleIDs: ["com.example.callapp"]),
+            confirmationCount: 1,
+        )
+        detector.windowListProvider = { [] }
+        detector.processProvider = { [snapshot("com.example.callappextra", pid: 555)] }
+
+        XCTAssertNil(detector.checkOnce())
+    }
+
+    func testUnrelatedCustomAppNamedLikeABuiltInStaysActiveWhileItsHelperHoldsTheMic() throws {
+        let detector = MicInputDetector(
+            patterns: MicInputDetector.patterns(watching: ["WeChat"])
+                + [customPattern(appName: "WeChat", bundleID: "com.example.wechat")],
+            confirmationCount: 1,
+        )
+        detector.windowListProvider = { [] }
+        detector.mainAppPIDProvider = { _ in nil }
+        detector.processProvider = { [snapshot("com.example.wechat.helper")] }
+
+        let meeting = try XCTUnwrap(detector.checkOnce())
+        XCTAssertTrue(detector.isMeetingActive(meeting))
+    }
+
+    func testCustomAppNamedLikeABuiltInInAnotherCaseStaysActiveAndCoolsDown() throws {
+        let detector = MicInputDetector(
+            patterns: [customPattern(appName: "Whatsapp", bundleID: "com.example.whatsapp")],
+            confirmationCount: 1,
+        )
+        detector.windowListProvider = { [] }
+        detector.processProvider = { [snapshot("com.example.whatsapp")] }
+
+        let meeting = try XCTUnwrap(detector.checkOnce())
+        XCTAssertEqual(meeting.pattern.appName, "Whatsapp")
+        XCTAssertTrue(detector.isMeetingActive(meeting))
+
+        detector.reset(appName: meeting.pattern.appName)
+        XCTAssertNil(detector.checkOnce(), "cooldown must apply under the name the meeting was reported with")
+    }
+
+    @MainActor
+    func testDefaultDetectorReadsCustomWatchedApps() throws {
+        func detector(customApps: [String]) throws -> MicInputDetector {
+            let suite = "CustomWatchWiring-\(getpid())-\(UUID().uuidString)"
+            addTeardownBlock { DefaultsSuite.remove(suite) }
+            let settings = try AppSettings(defaults: XCTUnwrap(UserDefaults(suiteName: suite)))
+            settings.watchCustomApps = customApps
+            let mic = try XCTUnwrap(
+                WatchingController.defaultDetectors(settings: settings)
+                    .compactMap { $0 as? MicInputDetector }.first,
+            )
+            mic.windowListProvider = { [] }
+            mic.processProvider = { [snapshot("com.example.callapp")] }
+            return mic
+        }
+
+        let watched = try detector(customApps: ["com.example.callapp"])
+        _ = watched.checkOnce()
+        XCTAssertNotNil(watched.checkOnce(), "a custom watched app holding the mic must fire")
+
+        let unwatched = try detector(customApps: [])
+        _ = unwatched.checkOnce()
+        XCTAssertNil(unwatched.checkOnce(), "without the entry the same app must be ignored")
+    }
+
+    func testCustomAppDoesNotInheritTheBuiltInMeetingPatternOfItsName() {
+        let meetingPattern = customPattern(appName: "Zoom", bundleID: "com.example.zoom").meetingPattern
+        XCTAssertEqual(meetingPattern.ownerNames, ["Zoom"])
+        XCTAssertTrue(meetingPattern.meetingPatterns.isEmpty)
+        XCTAssertFalse(MicInputDetector.customPattern(bundleID: "com.example.zoom").usesBuiltInMeetingPattern)
+    }
+
+    func testBuiltInPatternsDoNotMatchHelpers() {
+        let detector = makeDetector()
+        detector.processProvider = { [snapshot("com.tencent.xinWeChat.MiniProgram")] }
+        XCTAssertNil(detector.checkOnce())
+    }
+
+    func testAppDisplayNameUsesInstalledAppNameAndFallsBackToBundleID() {
+        XCTAssertEqual(MicInputDetector.appDisplayName(bundleID: "com.apple.finder"), "Finder")
+        XCTAssertEqual(MicInputDetector.appDisplayName(bundleID: "com.example.not-installed"), "com.example.not-installed")
+    }
+
+    func testDefaultMainAppPIDProviderFindsNothingForAnAppThatIsNotRunning() {
+        XCTAssertNil(makeDetector().mainAppPIDProvider("com.example.not-installed"))
     }
 }

@@ -10,6 +10,7 @@ private let logger = Logger(subsystem: AppPaths.logSubsystem, category: "Pipelin
 struct TranscriptOutputOptions {
     let includeFullTranscriptInProtocol: Bool
     let saveRawTranscriptSeparately: Bool
+    let useAITitleForFilenames: Bool
 }
 
 /// Raw diarization output for one run of the diarize loop. `combined` is the
@@ -67,6 +68,21 @@ class PipelineQueue {
     let diarizationFactoryWithMode: ((DiarizerMode) -> any DiarizationProvider)?
     let protocolGeneratorFactory: (() -> (any ProtocolGenerating)?)?
     let outputDir: URL?
+    /// Opens and closes security-scoped access on `outputDir`. Injectable so a
+    /// test can record where and when the scope is held; see `SecurityScopeAccess`.
+    let securityScope: SecurityScopeAccess
+    /// `outputDir`, when this queue holds the security scope on it.
+    ///
+    /// Opened once in `init`, on the URL object this queue was built with (the
+    /// one that resolved from the bookmark), and closed in `deinit`. Everything
+    /// the queue and its naming session read or write under the output folder
+    /// therefore runs inside it, with no call site opening a scope of its own.
+    /// One scope for the lifetime rather than one per call, because the defect
+    /// this replaces was a call site that opened none, or opened it on the
+    /// wrong URL. A rebuilt queue opens its own; the queue it replaces keeps
+    /// its scope until it is deallocated, which a running job delays, since
+    /// the processing task holds the queue until the job returns.
+    private let scopedOutputDir: URL?
     /// Where `DualSourceRecorder` writes, i.e. the audio this app produced and
     /// may therefore relocate. Injectable so a test can exercise the hand-off
     /// without writing into the real user directory; see `AudioPersistencePolicy`.
@@ -139,8 +155,6 @@ class PipelineQueue {
     /// PipelineQueue+Stages.swift reads and writes it.
     var vad: FluidVAD?
 
-    /// Elapsed seconds since the current pipeline stage started.
-    private(set) var activeJobElapsed: TimeInterval = 0
     /// Internal setter (not `private(set)`) because `processNext` in
     /// PipelineQueue+Stages.swift clears this flag across the file boundary.
     var isProcessing = false
@@ -156,13 +170,15 @@ class PipelineQueue {
     /// When the current `.transcribing`/`.diarizing`/`.generatingProtocol` state
     /// was entered, per job — so `updateJobState` can record the state's duration
     /// on exit (keyed by job to stay correct if transitions ever interleave).
-    private var stageStartByJob: [UUID: ContinuousClock.Instant] = [:]
+    /// Ignored by observation on purpose: no view needs a re-render when a stage
+    /// starts, because `jobs[].state` is observed on its own, and a view that read
+    /// this dictionary would be rebuilt on every transition for no gain.
+    @ObservationIgnored private var stageStartByJob: [UUID: ContinuousClock.Instant] = [:]
     /// Audio length (seconds) each job processed, captured when transcription
     /// completes, so stage durations can be normalised into an RTF.
     /// Internal (not private) because `transcribe` in PipelineQueue+Stages.swift stamps it.
     var jobAudioSeconds: [UUID: Double] = [:]
 
-    private var elapsedTimer: Task<Void, Never>?
     private var processTask: Task<Void, Never>?
     /// Internal (not private) because `processNext` in PipelineQueue+Stages.swift
     /// reads this to distinguish a cancellation from a real pipeline error.
@@ -261,8 +277,13 @@ class PipelineQueue {
     let snapshotWriter: @Sendable ([PipelineJob], URL) throws -> Void
 
     /// Simple init for skeleton tests and basic queue usage.
+    ///
+    /// `stagingDir` is a parameter rather than always `AppPaths.recordingsDir`
+    /// because this queue decides from it whether finished audio is the app's
+    /// own to relocate; a caller working in temp folders must be able to say so.
     init(
         logDir: URL? = nil,
+        stagingDir: URL = AppPaths.recordingsDir,
         speakerMatcherFactory: @escaping () -> SpeakerMatcher = PipelineQueue.throwawayMatcherFactory(),
         snapshotWriter: @escaping @Sendable ([PipelineJob], URL) throws -> Void = PipelineSnapshot.save,
         stageTimingLog: StageTimingLog? = nil,
@@ -280,7 +301,9 @@ class PipelineQueue {
         self.diarizationFactoryWithMode = nil
         self.protocolGeneratorFactory = nil
         self.outputDir = nil
-        stagingDir = AppPaths.recordingsDir
+        securityScope = .live
+        scopedOutputDir = nil
+        self.stagingDir = stagingDir
         self.diarizeEnabled = false
         echoDedupEnabled = true
         isEchoCancellationEnabled = echoCancellationEnabled
@@ -290,6 +313,7 @@ class PipelineQueue {
         let outputOptions = TranscriptOutputOptions(
             includeFullTranscriptInProtocol: true,
             saveRawTranscriptSeparately: true,
+            useAITitleForFilenames: false,
         )
         fallbackTranscriptOutputOptions = outputOptions
         transcriptOutputOptionsProvider = { outputOptions }
@@ -375,6 +399,7 @@ class PipelineQueue {
         micLabel: String = "Me",
         includeFullTranscriptInProtocol: Bool = true,
         saveRawTranscriptSeparately: Bool = true,
+        useAITitleForFilenames: Bool = false,
         transcriptOutputOptionsProvider: (() -> TranscriptOutputOptions)? = nil,
         speakerMatcherFactory: @escaping () -> SpeakerMatcher = PipelineQueue.throwawayMatcherFactory(),
         snapshotWriter: @escaping @Sendable ([PipelineJob], URL) throws -> Void = PipelineSnapshot.save,
@@ -385,6 +410,7 @@ class PipelineQueue {
         completedJobLifetime: TimeInterval = 60,
         terminalJobStore: TerminalJobStore? = nil,
         inFlightRuns: InFlightRunRegistry? = nil,
+        securityScope: SecurityScopeAccess = .live,
     ) {
         self.logDir = logDir ?? AppPaths.ipcDir
         self.processedLedger = ProcessedRecordingsLedger(logDir: self.logDir)
@@ -394,6 +420,8 @@ class PipelineQueue {
         self.diarizationFactoryWithMode = diarizationFactoryWithMode
         self.protocolGeneratorFactory = protocolGeneratorFactory
         self.outputDir = outputDir
+        self.securityScope = securityScope
+        scopedOutputDir = securityScope.start(outputDir) ? outputDir : nil
         self.stagingDir = stagingDir
         self.diarizeEnabled = diarizeEnabled
         self.echoDedupEnabled = echoDedupEnabled
@@ -412,6 +440,7 @@ class PipelineQueue {
         let outputOptions = TranscriptOutputOptions(
             includeFullTranscriptInProtocol: includeFullTranscriptInProtocol,
             saveRawTranscriptSeparately: saveRawTranscriptSeparately,
+            useAITitleForFilenames: useAITitleForFilenames,
         )
         fallbackTranscriptOutputOptions = outputOptions
         self.transcriptOutputOptionsProvider = transcriptOutputOptionsProvider ?? { outputOptions }
@@ -435,6 +464,15 @@ class PipelineQueue {
         )
         naming.delegate = self
         refreshStageAverages()
+    }
+
+    /// May run off the main actor: the snapshot worker can hold the last
+    /// reference. `SecurityScopeAccess` requires `stop` to be callable from
+    /// any thread for that reason.
+    deinit {
+        if let scopedOutputDir {
+            securityScope.stop(scopedOutputDir)
+        }
     }
 
     var activeJobs: [PipelineJob] {
@@ -471,6 +509,8 @@ class PipelineQueue {
                 ?? fallbackTranscriptOutputOptions.includeFullTranscriptInProtocol,
             saveRawTranscriptSeparately: job.saveRawTranscriptSeparately
                 ?? fallbackTranscriptOutputOptions.saveRawTranscriptSeparately,
+            useAITitleForFilenames: job.useAITitleForFilenames
+                ?? fallbackTranscriptOutputOptions.useAITitleForFilenames,
         )
     }
 
@@ -484,6 +524,9 @@ class PipelineQueue {
         }
         if job.saveRawTranscriptSeparately == nil {
             job.saveRawTranscriptSeparately = outputOptions.saveRawTranscriptSeparately
+        }
+        if job.useAITitleForFilenames == nil {
+            job.useAITitleForFilenames = outputOptions.useAITitleForFilenames
         }
     }
 
@@ -511,6 +554,34 @@ class PipelineQueue {
         }
     }
 
+    /// Every folder a job's sidecars may sit in, newest last. What a cleanup
+    /// wants: it has to reach all of them, since a job can have written under
+    /// more than one root.
+    ///
+    /// One place for a decision that was spelled out at each call site in three
+    /// different ways. An empty record in the job means it predates the field or
+    /// never wrote sidecars, and then the folder this queue writes to is what
+    /// the code did before the field existed.
+    func allSidecarDirs(of job: PipelineJob) -> [URL] {
+        job.sidecarDirs(orCurrent: outputDir)
+    }
+
+    /// The same folders a read should try, newest first.
+    ///
+    /// Newest first because that is where the latest write put the file, and
+    /// several rather than one because a recorded folder is not proof that the
+    /// file arrived: saving naming data logs its failure and carries on, so the
+    /// newest folder can be one the write never reached while an earlier one
+    /// still holds a usable cache.
+    ///
+    /// The same folders, not more: adding this queue's own folder for a job
+    /// that recorded some would let a `_naming.json` the user already resolved,
+    /// left behind in the current folder by a build that recorded only one
+    /// folder, make the resume read the job as still needing a full run.
+    func sidecarDirsNewestFirst(of job: PipelineJob) -> [URL] {
+        allSidecarDirs(of: job).reversed()
+    }
+
     func removeJob(id: UUID) {
         if let index = jobs.firstIndex(where: { $0.id == id }) {
             processedLedger.markProcessed(mixPath: jobs[index].mixPath)
@@ -521,7 +592,13 @@ class PipelineQueue {
             // folder for them and the job is gone from the snapshot that would
             // have named them. Resolved jobs have nothing left here, so this
             // costs them a no-op.
-            naming.removeNamingData(jobID: id, slug: jobs[index].namingSlug)
+            // The folder is passed explicitly although `nil` would now resolve
+            // to the same one: the discard path next door has to pass it (its
+            // jobs are not in the list any more), and spelling it out at every
+            // queue-side call keeps the three readable side by side.
+            naming.removeNamingData(
+                jobID: id, slug: jobs[index].namingSlug, in: allSidecarDirs(of: jobs[index]),
+            )
             jobs.remove(at: index)
         }
         stageStartByJob.removeValue(forKey: id)
@@ -587,6 +664,12 @@ class PipelineQueue {
         guard oldState != newState || error != nil else { return }
         jobs[index].state = newState
         if let error { jobs[index].error = error }
+        // The stale-naming day counts from the first entry, see
+        // `namingDeadlineStart`. Returning from a late re-diarization is the
+        // same wait, not a new one.
+        if newState == .speakerNamingPending, jobs[index].namingStartedAt == nil {
+            jobs[index].namingStartedAt = Date()
+        }
         if newState == .done {
             removeRawTranscriptArtifactsIfSafe(for: index)
         } else if newState == .error,
@@ -639,12 +722,6 @@ class PipelineQueue {
 
         let transcriptPath = jobs[index].transcriptPath
         let slug = jobs[index].namingSlug
-        let isAccessingOutputDir = outputDir?.startAccessingSecurityScopedResource() ?? false
-        defer {
-            if isAccessingOutputDir {
-                outputDir?.stopAccessingSecurityScopedResource()
-            }
-        }
         if let transcriptPath {
             do {
                 try FileManager.default.removeItem(at: transcriptPath)
@@ -737,27 +814,13 @@ class PipelineQueue {
         jobs[index].echo?.removed = removed
     }
 
-    /// Reset the elapsed timer for a new pipeline stage.
-    /// Internal (not private) because the stage methods in PipelineQueue+Stages.swift call it.
-    func startElapsedTimer() {
-        elapsedTimer?.cancel()
-        activeJobElapsed = 0
-        elapsedTimer = Task { [weak self] in
-            let start = ContinuousClock.now
-            while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(1))
-                let elapsed = ContinuousClock.now - start
-                self?.activeJobElapsed = Double(elapsed.components.seconds)
-                    + Double(elapsed.components.attoseconds) / 1e18
-            }
-        }
-    }
-
-    /// Stop the elapsed timer.
-    /// Internal (not private) because the stage methods in PipelineQueue+Stages.swift call it.
-    func stopElapsedTimer() {
-        elapsedTimer?.cancel()
-        elapsedTimer = nil
+    /// Sample this job's current stage directly. Naming follow-ups may overlap
+    /// another job, so they must not reset or stop a shared elapsed counter.
+    /// Ignoring the stage-start dictionary keeps clock reads out of SwiftUI
+    /// observation; the native menu updater owns the changing text.
+    func elapsedSeconds(forJobID id: UUID, at instant: ContinuousClock.Instant = ContinuousClock.now) -> TimeInterval {
+        guard let start = stageStartByJob[id] else { return 0 }
+        return (instant - start).inSeconds
     }
 
     // MARK: - Stage timing metrics
@@ -772,10 +835,7 @@ class PipelineQueue {
         // boundary; ignore it so it neither logs a partial event nor resets the start.
         guard oldState != newState else { return }
         if let leaving = StageKind(jobState: oldState), let start = stageStartByJob.removeValue(forKey: jobID) {
-            let elapsed = ContinuousClock.now - start
-            let seconds = Double(elapsed.components.seconds)
-                + Double(elapsed.components.attoseconds) / 1e18
-            logStageTiming(stage: leaving, wallClock: seconds, jobID: jobID)
+            logStageTiming(stage: leaving, wallClock: (ContinuousClock.now - start).inSeconds, jobID: jobID)
         }
         if StageKind(jobState: newState) != nil {
             stageStartByJob[jobID] = ContinuousClock.now
@@ -871,70 +931,48 @@ class PipelineQueue {
         logDirCreated = true
     }
 
-    // Latest jobs array queued for the snapshot worker. Overwritten on
-    // each `saveSnapshot()` so a burst of state changes collapses into a
-    // single write of the final state instead of N sequential writes.
-    // nil ≠ `[]`: nil means "nothing to write", `[]` would mean "write
-    // the empty-jobs state" (valid when the last job was removed).
-    // swiftlint:disable:next discouraged_optional_collection
-    private var pendingSnapshotJobs: [PipelineJob]?
-    private var snapshotWorker: Task<Void, Never>?
-
-    /// Dedicated actor that owns the `replaceItemAt` syscall. Calling
-    /// `await snapshotWriterActor.write(...)` from inside the detached task
-    /// is a genuine cross-actor hop — guaranteed to leave the caller's
-    /// executor (in particular MainActor) and run on the actor's own
-    /// executor. This sidesteps Swift Concurrency's synchronous-start
-    /// optimization that would otherwise keep `Task.detached`'s body on
-    /// the caller's thread until the first real suspension. A stalled
-    /// `renamex_np` (Spotlight indexer race on macOS 26) now blocks only
-    /// this actor — never the UI, RPC, or watch loop.
-    private let snapshotWriterActor = SnapshotWriterActor()
-
-    /// Persist the current `jobs` array to disk. The write runs on a
-    /// detached task and hops to `snapshotWriterActor` for the actual I/O —
-    /// a stalled `replaceItemAt` (macOS 26 `mds_stores` rename deadlock)
-    /// can't freeze the UI / RPC / watch loop. Rapid successive calls
-    /// coalesce: only the last state is actually written.
+    /// Persist the current `jobs` array to disk. The write runs off the main
+    /// actor through the one `PipelineSnapshotStore` for this `logDir`, which
+    /// every queue writing there shares, so a stalled `replaceItemAt` cannot
+    /// freeze the UI / RPC / watch loop, rapid successive calls coalesce into
+    /// a write of the last state, and the order on disk follows the order of
+    /// the saves even across a queue replacement.
     func saveSnapshot() {
+        guard !isRetired else {
+            logger.info("Snapshot save skipped: this queue was replaced")
+            return
+        }
         ensureLogDir()
-        pendingSnapshotJobs = jobs
-        guard snapshotWorker == nil else { return }
-        let dir = logDir
-        let writer = snapshotWriter
-        let writeActor = snapshotWriterActor
-        snapshotWorker = Task.detached(priority: .utility) { [weak self] in
-            while let next = await self?.takeNextSnapshotBatch() {
-                await writeActor.write(jobs: next, to: dir, using: writer)
-            }
-        }
+        PipelineSnapshotStore.save(jobs, to: logDir, using: snapshotWriter)
     }
 
-    // swiftlint:disable discouraged_optional_collection
-    @MainActor
-    private func takeNextSnapshotBatch() -> [PipelineJob]? {
-        guard let next = pendingSnapshotJobs else {
-            snapshotWorker = nil
-            return nil
-        }
-        pendingSnapshotJobs = nil
-        return next
+    /// Set by `PipelineController.rebuild()` on the queue it replaced. Its
+    /// list stopped being the app's at the swap, so a save from it would put
+    /// that list back over the active queue's: the store orders writes by
+    /// when they were saved, not by which queue is current. Work that
+    /// outlives the swap still runs on it (the staging recovery it started
+    /// when it was built holds it until its scan returns); it just no longer
+    /// writes the snapshot or takes on recovered recordings.
+    private(set) var isRetired = false
+
+    func retire() {
+        isRetired = true
     }
 
-    // swiftlint:enable discouraged_optional_collection
-
-    /// Wait for any queued snapshot writes to land on disk. Used by tests
-    /// asserting on the file; production code may call this before quit if
-    /// it needs the last snapshot durable, but the recovery path doesn't
-    /// require it (orphans are re-scanned at next launch).
+    /// Wait until every snapshot write into this queue's `logDir` has landed,
+    /// whichever queue saved it, including writes saved while this waited.
+    /// The quit path waits through it (`PipelineController.awaitSnapshotFlushes`),
+    /// and tests asserting on the file use it too.
     func awaitSnapshotFlush() async {
-        await snapshotWorker?.value
+        await PipelineSnapshotStore.flush(logDir)
     }
 
-    /// Test-only: true while a background snapshot worker is running.
-    /// Lets tests assert the worker drains and clears itself.
+    /// True while a snapshot write into this queue's `logDir` has not landed
+    /// yet, whichever queue saved it. The quit path reads it to decide whether
+    /// there is anything to wait for; tests read it to assert the writer
+    /// drains and clears itself.
     var isSnapshotWorkerActive: Bool {
-        snapshotWorker != nil
+        PipelineSnapshotStore.existing(for: logDir) != nil
     }
 }
 
@@ -949,21 +987,26 @@ extension PipelineQueue: SpeakerNamingSessionDelegate {
     /// Persist the per-job naming metadata on the (queue-owned) job. `nil` for
     /// either field means "leave unchanged". Mutates `jobs` in place (no
     /// snapshot write — matches the previous inline mutations).
-    func setNamingMetadata(jobID: UUID, slug: String?, usedDiarizerMode: DiarizerMode?) {
+    func setNamingMetadata(
+        jobID: UUID, slug: String?, usedDiarizerMode: DiarizerMode?, wroteSidecarsIn: URL?,
+    ) {
         guard let idx = jobs.firstIndex(where: { $0.id == jobID }) else { return }
         if let slug { jobs[idx].namingSlug = slug }
         if let usedDiarizerMode { jobs[idx].usedDiarizerMode = usedDiarizerMode }
+        // Only the folder the caller says it wrote to. Stage 3 records its own,
+        // but a run that fails before it would leave the naming data where
+        // nothing that reads the job finds it once the setting moves. Recording
+        // a folder the write never reached is worse than not recording it: the
+        // read trusts this order to find the newest payload, so a folder that
+        // holds nothing would take the front of the queue. Records rather than
+        // overwrites; see `previousSidecarOutputDirs`.
+        if let wroteSidecarsIn { jobs[idx].recordSidecarOutputDir(wroteSidecarsIn) }
     }
+}
 
-    /// Enter the diarizing stage for a late re-run: transition + start the
-    /// menu's elapsed timer (in that order, matching the original inline flow).
-    func namingStageDidStart(jobID: UUID) {
-        updateJobState(id: jobID, to: .diarizing)
-        startElapsedTimer()
-    }
-
-    /// Leave a timed naming stage.
-    func namingStageDidEnd() {
-        stopElapsedTimer()
+private extension Duration {
+    /// Whole and fractional seconds as one `Double`.
+    var inSeconds: TimeInterval {
+        Double(components.seconds) + Double(components.attoseconds) / 1e18
     }
 }

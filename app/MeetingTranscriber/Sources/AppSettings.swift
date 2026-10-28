@@ -169,6 +169,10 @@ final class AppSettings {
         didSet { defaults.set(watchWhatsApp, forKey: "watchWhatsApp") }
     }
 
+    var watchCustomApps: [String] {
+        didSet { defaults.set(watchCustomApps, forKey: "watchCustomApps") }
+    }
+
     /// Auto-start watching on app launch.
     var autoWatch: Bool {
         didSet { defaults.set(autoWatch, forKey: "autoWatch") }
@@ -237,6 +241,16 @@ final class AppSettings {
     /// Default: on.
     var perChannelIndicatorEnabled: Bool {
         didSet { defaults.set(perChannelIndicatorEnabled, forKey: "perChannelIndicatorEnabled") }
+    }
+
+    /// Rebuild the app-audio tap when its track has sat at exact zeros for a
+    /// minute while the meeting app still reports audio output (issue #672).
+    /// Default: off. Whether a rebuild restores a tap that went silent is
+    /// unmeasured, each rebuild costs a moment of audio and is exposed to the
+    /// restart wedge of issue #588, and a far end that is genuinely silent can
+    /// trip it. Read when a recording starts, like the other capture options.
+    var silentTrackWatchdogEnabled: Bool {
+        didSet { defaults.set(silentTrackWatchdogEnabled, forKey: "silentTrackWatchdogEnabled") }
     }
 
     /// PoC: when on, mic-channel audio is also fed to a live `StreamingTranscriber`
@@ -472,12 +486,17 @@ final class AppSettings {
         didSet { defaults.set(saveRawTranscriptSeparately, forKey: "saveRawTranscriptSeparately") }
     }
 
+    /// Format output filenames using the AI-generated meeting title in snake_case without timestamps.
+    var useAITitleForFilenames: Bool {
+        didSet { defaults.set(useAITitleForFilenames, forKey: "useAITitleForFilenames") }
+    }
+
     static let protocolLanguages = [
         "German", "English", "French", "Spanish", "Italian",
         "Dutch", "Portuguese", "Japanese", "Chinese", "Korean",
-        "Russian", "Arabic", "Turkish", "Hindi", "Swedish",
-        "Danish", "Finnish", "Polish", "Czech", "Greek",
-        "Hungarian", "Romanian",
+        "Russian", "Arabic", "Turkish", "Hindi", "Indonesian",
+        "Swedish", "Danish", "Finnish", "Polish", "Czech",
+        "Greek", "Hungarian", "Romanian",
     ]
 
     #if !APPSTORE
@@ -600,6 +619,7 @@ final class AppSettings {
         watchTencentMeeting = defaults.object(forKey: "watchTencentMeeting") as? Bool ?? false
         watchFaceTime = defaults.object(forKey: "watchFaceTime") as? Bool ?? false
         watchWhatsApp = defaults.object(forKey: "watchWhatsApp") as? Bool ?? false
+        watchCustomApps = defaults.stringArray(forKey: "watchCustomApps") ?? []
         autoWatch = defaults.object(forKey: "autoWatch") as? Bool ?? false
         calendarTitlesEnabled = defaults.object(forKey: "calendarTitlesEnabled") as? Bool ?? false
         autoRecordCalendarMeetings = defaults.object(forKey: "autoRecordCalendarMeetings") as? Bool ?? false
@@ -612,6 +632,7 @@ final class AppSettings {
         micDeviceUID = defaults.object(forKey: "micDeviceUID") as? String ?? ""
         micName = defaults.object(forKey: "micName") as? String ?? "Me"
         perChannelIndicatorEnabled = defaults.object(forKey: "perChannelIndicatorEnabled") as? Bool ?? true
+        silentTrackWatchdogEnabled = defaults.object(forKey: "silentTrackWatchdogEnabled") as? Bool ?? false
         liveTranscriptionEnabled = defaults.object(forKey: "liveTranscriptionEnabled") as? Bool ?? false
         liveCaptionsOverlayEnabled = defaults.object(forKey: "liveCaptionsOverlayEnabled") as? Bool ?? true
         liveCaptionsSize = defaults.string(forKey: "liveCaptionsSize")
@@ -656,6 +677,7 @@ final class AppSettings {
         protocolLanguage = defaults.string(forKey: "protocolLanguage") ?? "German"
         includeFullTranscriptInProtocol = defaults.object(forKey: "includeFullTranscriptInProtocol") as? Bool ?? true
         saveRawTranscriptSeparately = defaults.object(forKey: "saveRawTranscriptSeparately") as? Bool ?? true
+        useAITitleForFilenames = defaults.object(forKey: "useAITitleForFilenames") as? Bool ?? false
 
         openAIEndpoint = defaults.object(forKey: "openAIEndpoint") as? String
             ?? Self.defaultOpenAIEndpoint

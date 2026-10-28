@@ -1,4 +1,3 @@
-import AppKit
 import AudioTapLib
 
 // `@preconcurrency`: AVFoundation types lack Sendable annotations —
@@ -37,10 +36,8 @@ struct CaptureFormat {
 @MainActor
 @Observable
 class DualSourceRecorder: RecordingProvider {
-    /// The session capturing right now, nil between recordings. Stored as the
-    /// `AudioCapturing` role rather than the concrete `AudioCaptureSession`,
-    /// which is what removes the `@available` gate from this property — the
-    /// reason the storage used to be a type-erased `AnyObject` plus a cast.
+    /// The session capturing right now, nil between recordings. Held as the `AudioCapturing` role,
+    /// which removes the `@available` gate the old type-erased `AnyObject` storage worked around.
     private var captureSession: (any AudioCapturing)?
     private(set) var isRecording = false
     private(set) var recordingStartDate: Date = .distantPast
@@ -68,6 +65,14 @@ class DualSourceRecorder: RecordingProvider {
 
     var micCaptureGaveUp: Bool {
         captureSession?.micCaptureGaveUp ?? false
+    }
+
+    var appSilentTrackWatchdogGaveUp: Bool {
+        captureSession?.appSilentTrackWatchdogGaveUp ?? false
+    }
+
+    var micCaptureStall: MicCaptureStall {
+        captureSession?.micCaptureStall ?? MicCaptureStall()
     }
 
     /// Requested app-audio capture format (what the CATap aggregate device is
@@ -125,16 +130,17 @@ class DualSourceRecorder: RecordingProvider {
     /// without the guard an unconditional delete could race a live temp and
     /// silently drop its app track. Same guard as `recoverCrashedRecordings`.
     nonisolated static func cleanupTempFiles(
-        recordingsDir: URL = AppPaths.recordingsDir,
+        recordingsDir: URL,
         minAge: TimeInterval = 30,
         reapMarkersWrittenBefore: Date? = nil,
+        now: Date = Date(),
     ) {
         let fm = FileManager.default
         guard let entries = try? fm.contentsOfDirectory(
             at: recordingsDir,
             includingPropertiesForKeys: nil,
         ) else { return }
-        let cutoff = Date().addingTimeInterval(-minAge)
+        let cutoff = now.addingTimeInterval(-minAge)
         let markerCutoff = reapMarkersWrittenBefore ?? launchedAt
 
         for file in entries where RecordingFileSuffix.stripAppRaw(from: file.lastPathComponent) != nil {
@@ -143,6 +149,7 @@ class DualSourceRecorder: RecordingProvider {
             try? fm.removeItem(at: file)
             logger.info("Removed orphaned temp file: \(file.lastPathComponent)")
         }
+        removeStaleMixStaging(in: entries, olderThan: cutoff)
 
         // Markers whose recording can never be rescued. A start that threw
         // before capture opened leaves one with no tracks at all; a track that
@@ -294,6 +301,12 @@ class DualSourceRecorder: RecordingProvider {
     /// would otherwise be lost.
     @discardableResult
     nonisolated static func recoverCrashedRecording(stem: String, in recDir: URL) throws -> URL {
+        // A stem another recovery has already mixed is done. Its raw app temp
+        // is gone by then, so what is left looks like a microphone-only
+        // recording, and rebuilding it would rename a microphone-only mix
+        // over the complete one.
+        let existingMix = recDir.appendingPathComponent(stem + RecordingFileSuffix.mix)
+        if FileManager.default.fileExists(atPath: existingMix.path) { return existingMix }
         let temp = crashedTemp(stem: stem, in: recDir)
         let micWav = recDir.appendingPathComponent(stem + RecordingFileSuffix.mic)
         let hasMic = FileManager.default.fileExists(atPath: micWav.path)
@@ -338,14 +351,19 @@ class DualSourceRecorder: RecordingProvider {
     /// gap). The queue-build Task that calls this is fired by a watch-start
     /// immediately before the loop may begin a new recording, so the guard is
     /// load-bearing — not cosmetic.
+    ///
+    /// Not safe to run twice at once on one folder: two overlapping calls
+    /// select the same stem before either has mixed it. Production calls it
+    /// through `StagingRecoveryGate`.
     @discardableResult
     nonisolated static func recoverCrashedRecordings(
-        in dir: URL = AppPaths.recordingsDir,
+        in dir: URL,
         minAge: TimeInterval = 30,
+        now: Date = Date(),
     ) -> Int {
         let fm = FileManager.default
         let names = (try? fm.contentsOfDirectory(atPath: dir.path)) ?? []
-        let cutoff = Date().addingTimeInterval(-minAge)
+        let cutoff = now.addingTimeInterval(-minAge)
         var recovered = 0
         for stem in crashedRecordingStems(in: names) {
             // Freshness is read off the TRACKS, not the marker: the marker is
@@ -377,6 +395,13 @@ class DualSourceRecorder: RecordingProvider {
     /// existing file write. Default nil = batch-only behaviour preserved.
     var micLiveSink: LiveAudioSink?
     var appLiveSink: LiveAudioSink?
+
+    /// Whether the next capture session runs the opt-in silent-track watchdog
+    /// (issue #672). Set before `start(...)`, like the sinks above, by the
+    /// recorder factory from `AppSettings.silentTrackWatchdogEnabled`. A
+    /// property rather than another `start` argument so the `RecordingProvider`
+    /// doubles, which record nothing, do not all have to learn it.
+    var silentTrackWatchdogEnabled = false
 
     /// Start recording whichever channels `source` asks for.
     func start(
@@ -435,6 +460,7 @@ class DualSourceRecorder: RecordingProvider {
                 channels: appChannels,
                 micDeviceUID: (micDeviceUID?.isEmpty ?? true) ? nil : micDeviceUID,
                 debugLogging: debugLogging,
+                silentTrackWatchdog: silentTrackWatchdogEnabled,
                 appLiveSink: appLiveSink,
                 micLiveSink: micLiveSink,
             ))
@@ -456,17 +482,30 @@ class DualSourceRecorder: RecordingProvider {
         logger.info("Recording started: \(source.logDescription), \(self.recordRate) Hz, \(self.appChannels)ch")
     }
 
-    /// Stop recording and produce a mixed WAV. The capture session is the only
-    /// hardware-bound part; everything after `session.stop()` is delegated to
-    /// the testable `buildRecording`.
+    /// Stop recording and produce a mixed WAV: `stopCapture` is the only
+    /// hardware-bound part, `finish` the testable file work.
     func stop() throws -> RecordingResult {
+        try Self.finish(stopCapture())
+    }
+
+    /// `stop()` with `finish` on a detached task: file work that takes
+    /// seconds at the end of a long recording (17 s an hour, debug build).
+    /// `stopCapture` stays on the main actor: the capture objects serialize
+    /// their device and restart callbacks on the main queue, and their stop
+    /// mutates the same state.
+    func stopOffMain() async throws -> RecordingResult {
+        let stopped = try stopCapture()
+        return try await Task.detached(priority: .userInitiated) { try Self.finish(stopped) }.value
+    }
+
+    /// End the capture session and take what the file work needs.
+    private func stopCapture() throws -> StoppedCapture {
         guard isRecording else {
             throw RecorderError.notRecording
         }
 
         isRecording = false
 
-        // Stop capture session and get result
         guard let session = captureSession else {
             throw RecorderError.noAudioData
         }
@@ -480,55 +519,13 @@ class DualSourceRecorder: RecordingProvider {
         // not the device-facing recordRate/appChannels — is the expected file
         // format; a buildRecording mismatch warning then means the resampler
         // fallback wrote raw native-rate audio.
-        let recording = try Self.buildRecording(
-            from: captureResult,
+        return StoppedCapture(
+            captureResult: captureResult,
             recordingsDir: recordingsDir,
             timestamp: ts,
             recordingStartDate: recordingStartDate,
             format: CaptureFormat(requestedChannels: 1, requestedRate: targetRate, targetRate: targetRate),
         )
-
-        // Dropped only once the mix exists, exactly where `buildRecording`
-        // drops the raw app temp. A stop whose mix write fails has not
-        // finished anything, and the failure (a full disk, say) usually
-        // survives to the next launch: keeping the marker lets that launch
-        // re-mix from the surviving tracks, which is what the app-audio path
-        // has always got from its temp. The mix itself is what stops a
-        // completed recording from being recovered twice.
-        try? FileManager.default.removeItem(at: Self.inProgressMarker(stem: ts, in: recordingsDir))
-        return recording
-    }
-
-    /// Resolve the PID set to tap for a meeting-matched root PID.
-    ///
-    /// Returns `[rootPID]` alone when the running-application bundle URL is
-    /// unavailable (command-line tool, detached process) or enumeration
-    /// finds no PIDs under it. Otherwise returns every PID under the bundle,
-    /// prepending the root if enumeration somehow missed it — order matters
-    /// for the aggregate device's cosmetic name tag (root first).
-    static func resolveTapPIDs(rootPID: pid_t) -> [pid_t] {
-        // Safari's audio runs in WebKit XPC outside Safari.app — see ProcessResponsibility.tapPIDs.
-        ProcessResponsibility.tapPIDs(rootPID: rootPID, bundleDerived: resolveTapPIDs(
-            rootPID: rootPID,
-            bundleURL: NSRunningApplication(processIdentifier: rootPID)?.bundleURL,
-            enumerate: ProcessTreeEnumerator.pidsRooted(in:),
-        ))
-    }
-
-    /// Test seam — same PID-set decision as `resolveTapPIDs(rootPID:)` but with
-    /// the running-app bundle lookup + child-PID enumeration injected, so the
-    /// empty-enumeration fallback, the already-includes-root passthrough, and the
-    /// load-bearing root-prepend ordering (aggregate device name tag; #84) are
-    /// unit-testable without real running processes.
-    static func resolveTapPIDs(
-        rootPID: pid_t,
-        bundleURL: URL?,
-        enumerate: (URL) -> [pid_t],
-    ) -> [pid_t] {
-        guard let bundleURL else { return [rootPID] }
-        let enumerated = enumerate(bundleURL)
-        // Empty `enumerated` needs no guard: it falls through to `[rootPID] + []`, the root alone.
-        return enumerated.contains(rootPID) ? enumerated : [rootPID] + enumerated
     }
 
     /// Downmix interleaved multi-channel audio to mono. Passthrough if already

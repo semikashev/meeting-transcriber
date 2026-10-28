@@ -192,15 +192,21 @@ struct MenuBarView: View {
         .keyboardShortcut("p")
     }
 
+    private var queueHeader: QueueHeader {
+        QueueHeader.compute(jobStates: pipelineQueue.jobs.map(\.state), isProcessing: pipelineQueue.isProcessing)
+    }
+
     @ViewBuilder private var processingQueue: some View {
         if !pipelineQueue.jobs.isEmpty {
             Divider()
-            Label("Processing", systemImage: "gearshape.2.fill")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            Label(queueHeader.title, systemImage: queueHeader.systemImage)
 
-            ForEach(pipelineQueue.jobs) { job in
-                jobRow(job)
+            ForEach(Array(pipelineQueue.jobs.enumerated()), id: \.element.id) { index, job in
+                // A native separator, not a grouping view: each job is a run of
+                // flat menu items, and without one the repeated Cancel / Retry /
+                // Dismiss rows of neighbouring jobs read as one list.
+                if index > 0 { Divider() }
+                jobRow(job, index: index)
             }
         }
     }
@@ -264,85 +270,53 @@ struct MenuBarView: View {
 
     // MARK: - Helpers
 
-    private func jobRow(_ job: PipelineJob) -> some View {
-        HStack {
-            Circle()
-                .fill(jobColor(job))
-                .frame(width: 8, height: 8)
-            VStack(alignment: .leading) {
-                Text(job.meetingTitle)
-                    .font(.caption)
-                jobStateLabel(job)
-            }
-            Spacer()
-            if job.state == .done, let path = job.protocolPath ?? job.transcriptPath {
-                Button("Open") { onOpenProtocol(path) }
-                    .font(.caption2)
-            }
-            if job.state == .speakerNamingPending {
-                Button("Name Speakers") { onNameSpeakers?() }
-                    .font(.caption2)
-            }
-            if job.state == .waiting || job.state == .transcribing
-                || job.state == .diarizing || job.state == .generatingProtocol {
-                Button("Cancel") { pipelineQueue.cancelJob(id: job.id) }
-                    .font(.caption2)
-            }
-            if job.state == .done || job.state == .error || job.state == .speakerNamingPending {
-                Button("Dismiss") { onDismissJob(job.id) }
-                    .font(.caption2)
-            }
+    /// Each job is a run of flat rows: a title, then a state row, then its
+    /// actions. `MenuStageProgressUpdater` finds a job's state row by that order
+    /// (below the queue heading, jobs in queue order), so a disabled row put
+    /// between the title and the state row, or a changed order, breaks the
+    /// live progress text without any compile error. Keep the order, or change
+    /// the updater and its tests with it.
+    @ViewBuilder
+    private func jobRow(_ job: PipelineJob, index: Int) -> some View {
+        Text(job.meetingTitle)
+        jobStateLabel(job)
+
+        if job.state == .done, let path = job.protocolPath ?? job.transcriptPath {
+            Button("Open") { onOpenProtocol(path) }
         }
-        .padding(.horizontal, 4)
+        if job.state == .speakerNamingPending {
+            Button("Name Speakers") { onNameSpeakers?() }
+        }
+        if job.state == .waiting || job.state == .transcribing
+            || job.state == .diarizing || job.state == .generatingProtocol {
+            Button("Cancel") { pipelineQueue.cancelJob(id: job.id) }
+        }
+        retryButton(job, index: index)
+        if job.state == .done || job.state == .error || job.state == .speakerNamingPending {
+            Button("Dismiss") { onDismissJob(job.id) }
+        }
     }
 
+    /// Runs a failed job again from its audio, instead of the user having to
+    /// find the staged recording and import it by hand.
+    @ViewBuilder
+    private func retryButton(_ job: PipelineJob, index: Int) -> some View {
+        if pipelineQueue.canRetryJob(id: job.id) {
+            Button("Retry") { pipelineQueue.retryJob(id: job.id) }
+                .accessibilityIdentifier(A11yID.jobRetryButton(index))
+        }
+    }
+
+    @ViewBuilder
     private func jobStateLabel(_ job: PipelineJob) -> some View {
-        Group {
-            if [.transcribing, .diarizing, .generatingProtocol].contains(job.state) {
-                Text(stageProgressText(job))
-                    .foregroundStyle(.secondary)
-            } else if job.state == .error, let msg = job.error {
-                Text(msg)
-                    .foregroundStyle(.red)
-            } else if job.state == .done, !job.warnings.isEmpty {
-                Text(job.warnings.joined(separator: "; "))
-                    .foregroundStyle(.orange)
-            } else {
-                Text(job.state.label)
-                    .foregroundStyle(.secondary)
-            }
-        }
-        .font(.caption2)
-    }
-
-    /// Live elapsed for the active stage, plus the historical average ("· Ø
-    /// m:ss") when one exists, and a "longer than usual" hint once the live run
-    /// runs meaningfully past that average — so the user can tell at a glance
-    /// whether the current run is normal. Purely informational.
-    private func stageProgressText(_ job: PipelineJob) -> String {
-        let elapsed = pipelineQueue.activeJobElapsed
-        let base = "\(job.state.label) \(formattedElapsed(elapsed))"
-        guard let stage = StageKind(jobState: job.state),
-              let avg = pipelineQueue.averageSeconds(forJobID: job.id, stage: stage), avg > 0 else { return base }
-        let suffix = StageTimingStats.isSlowerThanUsual(elapsed: elapsed, average: avg)
-            ? " · longer than usual (Ø \(formattedElapsed(avg)))"
-            : " · Ø \(formattedElapsed(avg))"
-        return base + suffix
-    }
-
-    private func formattedElapsed(_ seconds: TimeInterval) -> String {
-        formattedTime(seconds)
-    }
-
-    private func jobColor(_ job: PipelineJob) -> Color {
-        switch job.state {
-        case .waiting: .gray
-        case .transcribing: .blue
-        case .diarizing: .purple
-        case .generatingProtocol: .orange
-        case .speakerNamingPending: .purple
-        case .done: job.warnings.isEmpty ? .green : .yellow
-        case .error: .red
+        if StageKind(jobState: job.state) != nil {
+            MenuStageProgressLabel(text: MenuStageProgressUpdater.progressText(job: job, queue: pipelineQueue))
+        } else if job.state == .error, let msg = job.error {
+            Text(msg)
+        } else if job.state == .done, !job.warnings.isEmpty {
+            Text(job.warnings.joined(separator: "; "))
+        } else {
+            Text(job.state.label)
         }
     }
 }
@@ -361,5 +335,19 @@ enum CaptionOverlayItem: Equatable {
             return
         }
         self = overlayEnabled ? .shown : .hidden
+    }
+}
+
+/// Keep SwiftUI's text stable for the active row's lifetime. The native updater
+/// owns subsequent stage and timer changes so Cancel keeps its hover highlight.
+private struct MenuStageProgressLabel: View {
+    @State private var text: String
+
+    init(text: String) {
+        _text = State(initialValue: text)
+    }
+
+    var body: some View {
+        Text(text)
     }
 }

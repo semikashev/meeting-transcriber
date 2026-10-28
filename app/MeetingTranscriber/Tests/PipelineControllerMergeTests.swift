@@ -51,13 +51,16 @@ final class PipelineControllerMergeTests: XCTestCase {
     }
 
     private func makeController() -> PipelineController {
-        let pc = PipelineController(settings: AppSettings(), notifier: notifier)
-        pc.queue = PipelineQueue(
+        let queue = PipelineQueue(
             engine: MockEngine(),
             diarizationFactory: { MockDiarization() },
             protocolGeneratorFactory: { MockProtocolGen() },
             outputDir: outputDir,
             logDir: dir.appendingPathComponent("logs"),
+        )
+        let pc = PipelineController(
+            settings: AppSettings(), notifier: notifier,
+            queueEnvironment: IsolatedQueueEnvironment.make(logDir: dir, initialQueue: queue),
         )
         // The merged job is only enqueued here; running it is the pipeline's own business.
         pc.queue.isProcessing = true

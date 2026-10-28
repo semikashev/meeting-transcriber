@@ -48,6 +48,9 @@ final class WatchingController {
     /// back on when that recording ends; see `resumeWatchingAfterManualIfNeeded`.
     var resumeWatchingAfterManual = false
 
+    /// Set by `finishForQuit`: a start parked on a permission prompt gives up.
+    var isQuitting = false
+
     let settings: AppSettings
     let notifier: any AppNotifying
     private let pipeline: PipelineController
@@ -117,7 +120,7 @@ final class WatchingController {
     /// staging directory that orphan recovery scans, which is not somewhere a
     /// unit test may leave files. (It does start on the hosted CI runners, so
     /// this is about where the bytes land, not about whether capture works.)
-    private let makeRecorder: @MainActor () -> any RecordingProvider
+    let makeRecorder: @MainActor () -> any RecordingProvider
 
     /// Engine-sync hook, wired by `activate`. Bridges to
     /// `EngineController.syncEngineSettings()`; nil until `activate` runs, in
@@ -158,6 +161,10 @@ final class WatchingController {
         // filtered by the "Apps to Watch" toggles, re-read at each watch start.
         self.makeDetector = makeDetector ?? { [settings] in
             Self.defaultDetector(settings: settings)
+        }
+        // See `PipelineController.onQueueReplaced`.
+        pipeline.onQueueReplaced = { [weak self] queue in
+            self?.watchLoop?.pipelineQueue = queue
         }
     }
 
@@ -230,7 +237,7 @@ final class WatchingController {
                 // from replacing the queue the manual loop is already wired to.
                 // Nothing leaks: `loop.start()` has not run, so there is no
                 // self-retaining watch task yet.
-                guard !isManualRecording else { return }
+                guard !isManualRecording, !isQuitting else { return }
 
                 syncEngines?()
                 pipeline.rebuild()
@@ -284,17 +291,6 @@ final class WatchingController {
         if userInitiated, settings.watchTeams {
             requestAccessibility()
         }
-    }
-
-    /// Whether a manual start may take over the loop it found, given what that
-    /// loop is doing. False while it is recording: taking it over stops it, and
-    /// a recording in progress is not something a later start may end.
-    ///
-    /// A pure function over the phase rather than an inline comparison, because
-    /// the guard it backs only fires in a race that no test can schedule
-    /// reliably — this is the layer that can be pinned.
-    static func mayTakeOverLoop(in state: WatchLoop.State) -> Bool {
-        state != .recording
     }
 
     // MARK: - Settling in-flight starts (shared by both control surfaces)
@@ -457,6 +453,7 @@ final class WatchingController {
         }
 
         _ = await ensureMicAccess()
+        guard !isQuitting else { return .failed }
 
         pipeline.ensureQueue()
 
@@ -514,6 +511,9 @@ final class WatchingController {
                 body: "Recording: \(loop.manualRecordingInfo?.title ?? "")",
             )
             return .started
+        } catch is CancellationError {
+            watchLoop = nil // a quit began while the recorder was built: not an error
+            return .failed
         } catch {
             notifier.notify(title: "Error", body: error.localizedDescription)
             watchLoop = nil
@@ -532,25 +532,5 @@ final class WatchingController {
     func stopManualRecording() {
         watchLoop?.stopManualRecording()
         watchLoop = nil
-    }
-
-    // MARK: - Recorder factory
-
-    /// Build the `recorderFactory` closure for `WatchLoop`. Returns a fresh
-    /// `DualSourceRecorder` on each invocation; when live captions are eligible,
-    /// the coordinator installs mic + app live sinks that pipe captured buffers to
-    /// the `LiveTranscriptionController`. `async` so the coordinator can await the
-    /// prior recording's stop-time flush before reusing a kept EOU session.
-    private func makeRecorderFactory() -> @MainActor () async -> any RecordingProvider {
-        { [weak self, makeRecorder] in
-            let recorder = makeRecorder()
-            // Live captions tap the concrete recorder's buffer sinks, so this is
-            // the production recorder or nothing. An injected double has no
-            // sinks and needs none: captions are off in every test that uses one.
-            if let dualSource = recorder as? DualSourceRecorder {
-                await self?.liveTranscription.attachSinks(to: dualSource)
-            }
-            return recorder
-        }
     }
 }

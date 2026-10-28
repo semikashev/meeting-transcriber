@@ -70,6 +70,34 @@ final class SettingsInteractionTests: XCTestCase {
         XCTAssertEqual(settings.protocolProvider, .openAICompatible)
     }
 
+    func testProtocolLanguagePickerOffersIndonesianAndWritesBack() throws {
+        let settings = makeSettings()
+        let view = OutputSettingsView(settings: settings)
+
+        let picker = try view.inspect().find(ViewType.Picker.self) { picker in
+            try picker.labelView().text().string() == "Protocol Language"
+        }
+        // `select(value:)` only writes the binding and never checks the tags, so
+        // the option's presence has to be asserted separately.
+        XCTAssertNoThrow(try picker.find(text: "Indonesian"))
+        try picker.select(value: "Indonesian")
+
+        XCTAssertEqual(settings.protocolLanguage, "Indonesian")
+    }
+
+    func testProtocolLanguagePickerKeepsAStoredLanguageMissingFromTheList() throws {
+        let settings = makeSettings()
+        settings.protocolLanguage = "Thai"
+        XCTAssertFalse(AppSettings.protocolLanguages.contains("Thai"), "precondition: the stored value must be off-list")
+        let view = OutputSettingsView(settings: settings)
+
+        let picker = try view.inspect().find(ViewType.Picker.self) { picker in
+            try picker.labelView().text().string() == "Protocol Language"
+        }
+
+        XCTAssertNoThrow(try picker.find(text: "Thai"))
+    }
+
     // MARK: - Transcript output toggles
 
     func testIncludeFullTranscriptToggleWritesBackToSettings() throws {
@@ -96,6 +124,19 @@ final class SettingsInteractionTests: XCTestCase {
         try toggle.tap()
 
         XCTAssertFalse(settings.saveRawTranscriptSeparately)
+    }
+
+    func testUseAITitleForFilenamesToggleWritesBackToSettings() throws {
+        let settings = makeSettings()
+        settings.useAITitleForFilenames = false
+        let view = OutputSettingsView(settings: settings)
+
+        let toggle = try view.inspect()
+            .find(viewWithAccessibilityIdentifier: A11yID.useAITitleForFilenamesToggle)
+            .find(ViewType.Toggle.self)
+        try toggle.tap()
+
+        XCTAssertTrue(settings.useAITitleForFilenames)
     }
 
     // MARK: - Stepper write-back

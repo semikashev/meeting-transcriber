@@ -136,6 +136,9 @@ struct PipelineJob: Identifiable, Codable {
     // See `includeFullTranscriptInProtocol`.
     // swiftlint:disable:next discouraged_optional_boolean
     var saveRawTranscriptSeparately: Bool?
+    // See `includeFullTranscriptInProtocol`.
+    // swiftlint:disable:next discouraged_optional_boolean
+    var useAITitleForFilenames: Bool?
     /// Diarizer mode that produced the *current* `speakerNamingDataByJob`
     /// entry. Set by `PipelineQueue` after diarisation completes (in the
     /// initial pipeline run and after `lateDiarization`). Used by the
@@ -157,7 +160,7 @@ struct PipelineJob: Identifiable, Codable {
     // swiftlint:disable:next discouraged_optional_boolean
     var autoSkipNaming: Bool?
 
-    /// The output directory this job's naming sidecars were written under,
+    /// The output directory this job's naming sidecars were written under last,
     /// captured when they were written.
     ///
     /// A queue's `outputDir` is the *current* setting. Repointing the output
@@ -168,7 +171,94 @@ struct PipelineJob: Identifiable, Codable {
     /// `nil` for legacy snapshots and for jobs that never wrote sidecars;
     /// callers fall back to the current output directory, which is what the
     /// code did before this field existed.
-    var sidecarOutputDir: URL?
+    ///
+    /// Settable only from inside this file, for the same reason as the audio
+    /// paths above: `recordSidecarOutputDir` below is the single writer, and it
+    /// is what keeps this field and `previousSidecarOutputDirs` from naming the
+    /// same folder twice or losing one.
+    private(set) var sidecarOutputDir: URL?
+
+    /// Folders an earlier write recorded and that may still hold this job's
+    /// sidecars, oldest first. Cleanup visits these as well as the current one.
+    ///
+    /// A job writes sidecars at two moments under one output root each: the
+    /// naming data when it is saved, the audio tracks only in stage 3. The root
+    /// is a `let` on the queue, so the two differ only across a rebuild or a
+    /// restart, which a restored job runs into after the output folder setting
+    /// has moved. One URL cannot name both roots, and overwriting it was the
+    /// defect: whichever folder it then named, the other one's files had no
+    /// reference left, and nothing sweeps an output folder for orphans.
+    ///
+    /// Carrying the earlier root makes the record over-complete rather than
+    /// wrong, which is the safe direction when every reader is a cleanup:
+    /// deleting in a folder that holds nothing is a no-op. Deleting the old
+    /// root's files eagerly instead would take away the audio a live job can
+    /// still be re-diarized from, so removal stays where it already was.
+    ///
+    /// Kept as a separate field rather than folding `sidecarOutputDir` into a
+    /// list, because the old key is what shipped snapshots carry: a renamed key
+    /// would decode as nil without throwing and silently reinstate the bug this
+    /// field exists to prevent, and reusing the name with a new type would make
+    /// one legacy job throw and drop the whole restored queue.
+    private(set) var previousSidecarOutputDirs: [URL]? // swiftlint:disable:this discouraged_optional_collection
+
+    /// Every folder this job's sidecars may sit in, newest last.
+    var sidecarOutputDirs: [URL] {
+        (previousSidecarOutputDirs ?? []) + [sidecarOutputDir].compactMap(\.self)
+    }
+
+    /// Every folder this job's sidecars may sit in, oldest first, falling back
+    /// to `current` for a job that recorded none.
+    ///
+    /// The one place that answers it, because the queue asks for the cleanup's
+    /// list, the queue's readers ask for the same list reversed, and the naming
+    /// session asks for the newest alone. Three spellings of one rule is what
+    /// the field's accessor was introduced to end.
+    func sidecarDirs(orCurrent current: URL?) -> [URL] {
+        let recorded = sidecarOutputDirs
+        return recorded.isEmpty ? [current].compactMap(\.self) : recorded
+    }
+
+    /// Record that sidecars were written under `dir`, keeping any folder a
+    /// previous write recorded.
+    ///
+    /// The single writer for both fields, so no two call sites that record a
+    /// folder can come to disagree about what happens to the old one.
+    ///
+    /// Identity by `standardizedFileURL.path`, as everywhere else a path is
+    /// compared here. That folds `.` and `..` segments and a trailing slash,
+    /// and nothing else: it resolves no symlinks and no case, so `/tmp/x` and
+    /// `/private/tmp/x` still count as two folders. Carrying one folder twice
+    /// costs a duplicate entry and a second pass of missing unlinks, not
+    /// correctness, which is why this stays on the house spelling rather than
+    /// taking on `resolvingSymlinksInPath`.
+    ///
+    /// Newest last, which is what reading the list from the end relies on.
+    mutating func recordSidecarOutputDir(_ dir: URL) {
+        let key = dir.standardizedFileURL.path
+        let currentKey = sidecarOutputDir?.standardizedFileURL.path
+        guard currentKey != key else { return }
+        // Both keys drop out of the list and the folder being replaced is then
+        // appended, so it lands at the newest end even if a decoded state
+        // already held it somewhere older. Filtering alone would leave it where
+        // it was and make the read order claim the wrong folder was written
+        // last; this runs with no current folder too, so the no-duplicates
+        // invariant holds for any decoded state rather than only for states
+        // this writer produced.
+        var previous = (previousSidecarOutputDirs ?? []).filter { folder in
+            let path = folder.standardizedFileURL.path
+            return path != key && path != currentKey
+        }
+        if let current = sidecarOutputDir { previous.append(current) }
+        previousSidecarOutputDirs = previous.isEmpty ? nil : previous
+        sidecarOutputDir = dir
+    }
+
+    /// When the job first entered `.speakerNamingPending` in this run, or nil
+    /// if it has not since this field existed. Read through
+    /// `namingDeadlineStart`. Optional so older snapshots decode, and an older
+    /// build reading a newer snapshot ignores the key.
+    var namingStartedAt: Date?
 
     /// Short IDs (`shortID`) of the recordings a merge joined into this job,
     /// in call order; nil for every other job and for snapshots written before
@@ -198,6 +288,8 @@ struct PipelineJob: Identifiable, Codable {
         includeFullTranscriptInProtocol: Bool? = nil,
         // swiftlint:disable:next discouraged_optional_boolean
         saveRawTranscriptSeparately: Bool? = nil,
+        // swiftlint:disable:next discouraged_optional_boolean
+        useAITitleForFilenames: Bool? = nil,
     ) {
         self.id = UUID()
         self.meetingTitle = meetingTitle
@@ -219,7 +311,44 @@ struct PipelineJob: Identifiable, Codable {
         self.namingSlug = nil
         self.includeFullTranscriptInProtocol = includeFullTranscriptInProtocol
         self.saveRawTranscriptSeparately = saveRawTranscriptSeparately
+        self.useAITitleForFilenames = useAITitleForFilenames
         self.usedDiarizerMode = nil
         self.autoSkipNaming = autoSkipNaming
+    }
+
+    /// When the stale-naming cleanup starts counting for this job: when it
+    /// entered the naming dialog. `enqueuedAt` is only the fallback for jobs
+    /// restored from a snapshot written before that was recorded. Measured
+    /// from `enqueuedAt`, a job that waited long in the queue, or was retried
+    /// days after it first ran, was stale the moment it reached the dialog,
+    /// and `enqueuedAt` cannot move because the output basename is anchored on
+    /// it.
+    var namingDeadlineStart: Date {
+        namingStartedAt ?? enqueuedAt
+    }
+
+    /// Drop what the failed run concluded, before the job is queued again.
+    ///
+    /// The error, the warnings, the two per-run verdicts, the diarizer mode and
+    /// the naming start all describe the run that failed; the retry sets them
+    /// again from its own run, and a leftover one would describe a recording
+    /// the retry never saw that way. The paths stay: the audio is the input
+    /// the retry needs, and the slug and transcript path name files the retry
+    /// overwrites under the same basename.
+    mutating func prepareForRetry() {
+        error = nil
+        warnings = []
+        trackViability = nil
+        echo = nil
+        usedDiarizerMode = nil
+        namingStartedAt = nil
+        // The recorded folders deliberately survive a retry. The retry deletes
+        // the sidecars in each of them first, so the record is usually a list
+        // of folders that hold nothing, and carrying it costs a dead entry per
+        // distinct folder the job has used. Clearing it would be cheaper and is
+        // wrong: that deletion is best effort, and a folder that was read-only,
+        // unmounted or out of reach of the sandbox keeps its files while the
+        // deletion only logs. Dropping the record then orphans exactly the
+        // files this field exists to keep findable.
     }
 }

@@ -75,14 +75,35 @@ private struct WindowAccessor: NSViewRepresentable {
 // Not @main — AppLauncher owns the entry point so a selftest launch can
 // divert before this scene (and AppState with it) is ever constructed.
 struct MeetingTranscriberApp: App {
-    @State private var appState = AppState(notifier: NotificationManager.shared)
+    // Holds every quit open until the pending pipeline snapshot is on disk.
+    // Handed `appState` in `init`, through `AppDelegate.install`. Never read:
+    // declaring the adaptor is what makes SwiftUI install the delegate, and
+    // the analyzer cannot see that use.
+    @NSApplicationDelegateAdaptor(AppDelegate.self)
+    private var appDelegate // swiftlint:disable:this unused_declaration
+    @State private var appState: AppState
     @State private var captionsWindow: LiveCaptionsWindowController?
     /// Rows of the Protocols window; rescanned whenever it opens or acts.
     @State private var protocolEntries: [ProtocolEntry] = []
+
+    // Keeps the progress updater alive for the app's lifetime; it is seeded in
+    // `init` and observes menu tracking on its own, so nothing reads it back and
+    // the analyzer cannot see that use.
+    @State private var menuProgressUpdater: MenuStageProgressUpdater // swiftlint:disable:this unused_declaration
     @Environment(\.openWindow)
     private var openWindow
 
     init() {
+        // Built first, as the property initialiser it replaces was. Handed to
+        // the application delegate here because `init` runs before the run
+        // loop, so every quit request finds it, however early it comes and
+        // whether or not the menu-bar item is ever shown.
+        let state = AppState(notifier: NotificationManager.shared)
+        _appState = State(initialValue: state)
+        AppDelegate.install(state)
+        let updater = MenuStageProgressUpdater()
+        updater.observe { [weak state] in state?.pipelineQueue }
+        _menuProgressUpdater = State(initialValue: updater)
         AppPaths.migrateIfNeeded()
         NotificationManager.shared.setUp()
         // The verdict was taken in `AppLauncher.main()`, before `AppState` was
@@ -90,7 +111,8 @@ struct MeetingTranscriberApp: App {
         // the notification centre is set up (issue #703).
         Self.reportPreviousExit(AppLauncher.previousExit, to: NotificationManager.shared)
         // Temp-file cleanup moved into the queue-build recovery flow
-        // (`PipelineController.makeQueue`): a crashed `_app_raw.tmp` must be
+        // (`PipelineController.recoverStagedRecordings`): a crashed
+        // `_app_raw.tmp` must be
         // re-mixed by `recoverCrashedRecordings` BEFORE it's cleaned up, so the
         // delete can no longer run first here (issue #379).
         // Edit shortcuts in text fields must not depend on the main menu of
@@ -484,8 +506,10 @@ struct MeetingTranscriberApp: App {
         NSWorkspace.shared.open(protocols)
     }
 
+    /// Only asks to terminate: stopping watching and finishing a recording
+    /// happen in `AppDelegate`, which every quit path goes through, and this
+    /// one alone used to do them.
     private func quit() {
-        appState.watching.watchLoop?.stop()
         NSApplication.shared.terminate(nil)
     }
 

@@ -61,6 +61,29 @@ final class WatchingControllerResumeWatchingTests: XCTestCase {
         XCTAssertTrue(controller.isWatching)
     }
 
+    /// Quitting ends the manual recording too, and that end must not bring
+    /// watching back: a loop started inside the quit could begin a new
+    /// recording while the quit is held open for the snapshot flush, which is
+    /// the window `finishForQuit` exists to close.
+    func testQuittingDuringAManualRecordingDoesNotResumeWatching() async {
+        let (controller, _) = controllerWithWatchingOn()
+        addTeardownBlock { await controller.watchLoop?.stop() }
+
+        controller.startMicrophoneRecording()
+        await waitFor(controller.watchLoop?.isManualRecording == true, timeout: .seconds(2))
+
+        await controller.finishForQuit()
+        // Give a wrongly scheduled start every chance to land before asserting.
+        try? await Task.sleep(nanoseconds: 500_000_000)
+
+        XCTAssertFalse(
+            controller.resumeWatchingAfterManual,
+            "the resume did run: the recording's end spent the flag, and the quit stopped the start",
+        )
+        XCTAssertFalse(controller.isWatching, "watching must stay off once the app is quitting")
+        XCTAssertNil(controller.watchLoop)
+    }
+
     func testWatchingStaysOffWhenItWasOffBefore() async {
         let controller = makeWatchingController(logDir: tmpDir, permissionHealth: .allHealthy)
         XCTAssertFalse(controller.isWatching, "precondition")

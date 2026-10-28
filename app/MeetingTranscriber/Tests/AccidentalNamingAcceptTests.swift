@@ -43,7 +43,10 @@ final class AccidentalNamingAcceptTests: XCTestCase {
             warnings.append(message)
         }
 
-        func setNamingMetadata(jobID _: UUID, slug _: String?, usedDiarizerMode _: DiarizerMode?) {}
+        func setNamingMetadata(
+            jobID _: UUID, slug _: String?, usedDiarizerMode _: DiarizerMode?,
+            wroteSidecarsIn _: URL?,
+        ) {}
 
         func updateSpeakerDB(
             matcher _: SpeakerMatcher, mapping: [String: String],
@@ -85,10 +88,6 @@ final class AccidentalNamingAcceptTests: XCTestCase {
         ) -> String? {
             nil
         }
-
-        func namingStageDidStart(jobID _: UUID) {}
-
-        func namingStageDidEnd() {}
     }
 
     // MARK: - Helpers

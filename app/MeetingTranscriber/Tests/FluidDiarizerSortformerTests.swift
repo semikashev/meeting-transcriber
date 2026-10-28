@@ -1,9 +1,15 @@
+import CoreML
+import FluidAudio
 @testable import MeetingTranscriber
 import XCTest
 
 final class FluidDiarizerSortformerTests: XCTestCase {
-    func testDiarizerModeDefault() {
-        let settings = AppSettings()
+    func testDiarizerModeDefault() throws {
+        // Its own suite: on `.standard` this reads whatever another run left in
+        // the test host's real domain, which is not the default.
+        let suite = "FluidDiarizerSortformerTests-\(getpid())-\(UUID().uuidString)"
+        defer { DefaultsSuite.remove(suite) }
+        let settings = try AppSettings(defaults: XCTUnwrap(UserDefaults(suiteName: suite)))
         XCTAssertEqual(settings.diarizerMode, .offline)
     }
 
@@ -20,6 +26,34 @@ final class FluidDiarizerSortformerTests: XCTestCase {
     func testFluidDiarizerAcceptsSortformerMode() {
         let diarizer = FluidDiarizer(mode: .sortformer)
         XCTAssertEqual(diarizer.mode, .sortformer)
+    }
+
+    /// The Sortformer load must ask FluidAudio for CPU + Neural Engine
+    /// explicitly. Passing nothing lets FluidAudio pick `.all` for the default
+    /// config, which was measurably slower. The stub hands back a diarizer
+    /// with no model in it, so nothing is downloaded or compiled and the run
+    /// fails at the audio, after the load this test is about.
+    func testSortformerLoadRequestsCpuAndNeuralEngine() async {
+        var requested: [MLComputeUnits] = []
+        let diarizer = FluidDiarizer(mode: .sortformer) { computeUnits in
+            requested.append(computeUnits)
+            return (SortformerDiarizer(), computeUnits)
+        }
+
+        for _ in 0 ..< 2 {
+            do {
+                _ = try await diarizer.run(
+                    audioPath: URL(fileURLWithPath: "/nonexistent/never-read.wav"),
+                    numSpeakers: nil,
+                    meetingTitle: "compute-units",
+                )
+                XCTFail("The stub diarizer has no model, so run must throw")
+            } catch {
+                // Expected: the audio does not exist and no model is loaded.
+            }
+        }
+
+        XCTAssertEqual(requested, [.cpuAndNeuralEngine], "Asked once, and for CPU + Neural Engine; the second run reuses the diarizer")
     }
 
     // MARK: - Phase 1 (issue #165): overlap-exclusion mask builder

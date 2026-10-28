@@ -65,9 +65,14 @@ extension XCTestCase {
     ///   reports. A silent refusal is the failure mode several of its guards
     ///   exist to avoid, so "was the user told" is part of the behaviour, not a
     ///   detail. Defaults to a fresh spy when a test does not care.
+    ///   Any `AppNotifying` spy works; a test that needs more than titles and
+    ///   bodies brings its own.
+    /// - Parameter channelFaultWindow: the channel-health window. Zero (the
+    ///   default) lets the first tick decide; see
+    ///   `WatchingControllerChannelFaultTests` for when that is not enough.
     func makeWatchingController(
         logDir: URL,
-        notifier: RecordingNotifier = RecordingNotifier(),
+        notifier: any AppNotifying = RecordingNotifier(),
         ensureMicAccess: @escaping () async -> Bool = { true },
         requestScreenRecording: @escaping () -> Void = {},
         requestAccessibility: @escaping () -> Void = {},
@@ -75,6 +80,7 @@ extension XCTestCase {
         noMic: Bool = false,
         permissionHealth: HealthCheckResult? = nil,
         startJoinTimeout: Duration = WatchingController.defaultStartJoinTimeout,
+        channelFaultWindow: TimeInterval = 0,
         makeDetector: @escaping () -> any MeetingDetecting = { makeSilentDetector() },
         makeRecorder: @escaping @MainActor () -> any RecordingProvider = { makeMockRecorder() },
     ) -> WatchingController {
@@ -116,11 +122,14 @@ extension XCTestCase {
         )
         settings.watchTeams = watchTeams
         settings.noMic = noMic
-        let pipeline = PipelineController(settings: settings, notifier: notifier)
-        pipeline.queue = PipelineQueue(logDir: logDir)
+        let pipeline = PipelineController(
+            settings: settings,
+            notifier: notifier,
+            queueEnvironment: IsolatedQueueEnvironment.make(logDir: logDir),
+        )
         let channelHealth = ChannelHealthController(
             notifier: notifier,
-            debounceSeconds: { 0 },
+            debounceSeconds: { channelFaultWindow },
             indicatorEnabled: { false },
         )
         let permissions = PermissionsController(notifier: notifier)
