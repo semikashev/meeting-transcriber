@@ -33,6 +33,14 @@ protocol AppNotifying {
     /// (no prompt) for notifiers without a real coordinator.
     func resolveBrowserConsent(granted: Bool) -> Bool
 
+    /// Take back a parked `askToRecord` prompt, which then returns
+    /// `.withdrawn`: the app settled the question itself (see
+    /// `BrowserTitleVouch`). Unlike `resolveBrowserConsent` it touches only
+    /// the browser prompt, never an in-room one parked beside it. Defaults to
+    /// doing nothing, for notifiers with no prompt to take back.
+    @MainActor
+    func withdrawBrowserConsent()
+
     /// How a posted notification would be presented. On the same seam as
     /// `askToRecord` because it answers whether that prompt could be SEEN, which
     /// decides whether browser meetings work at all (see
@@ -88,6 +96,9 @@ extension AppNotifying {
     func askToRecordMicrophone(title: String, body: String) async -> ConsentAnswer {
         await askToRecord(title: title, body: body)
     }
+
+    @MainActor
+    func withdrawBrowserConsent() {}
 
     /// Nothing to report by default. Notably this keeps
     /// `UNUserNotificationCenter.current()` out of every headless context: it

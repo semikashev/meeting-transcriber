@@ -43,6 +43,11 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate, App
     /// UNUserNotificationCenter add + delegate callback to it.
     private let consentCoordinator = ConsentPromptCoordinator(timeout: NotificationManager.consentPromptTimeout)
 
+    /// The browser prompt now parked, so `withdrawBrowserConsent` can take back
+    /// that one question by its id. Only read and written on the main actor,
+    /// from `ask` and `withdrawBrowserConsent`.
+    private var parkedBrowserPromptID: String?
+
     #if !APPSTORE
         /// Bounded in-memory log of every notification posted through
         /// `notify(...)`, read by the dev-only debug RPC `/state.notifications`
@@ -312,9 +317,11 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate, App
 
         guard deliverable else { return .declined }
         let id = UUID().uuidString
+        if categoryID == Self.consentCategoryID { parkedBrowserPromptID = id }
         let answer = await consentCoordinator.awaitDecision(id: id) { [self] in
             postConsentNotification(id: id, title: title, body: body, categoryID: categoryID)
         }
+        if parkedBrowserPromptID == id { parkedBrowserPromptID = nil }
         // However it resolved — tapped, expired, or answered over RPC — the
         // question is settled, so the prompt must not stay in Notification
         // Center asking about a meeting that has moved on.
@@ -342,6 +349,16 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate, App
     /// MainActor hop (unlike the scene actions).
     func resolveBrowserConsent(granted: Bool) -> Bool {
         consentCoordinator.resolvePending(granted: granted)
+    }
+
+    /// Take back the parked browser prompt, which `ask` then removes from
+    /// Notification Center like any settled question. By id rather than
+    /// `resolvePending`, which would answer an in-room prompt parked beside it
+    /// too, and answer it with whatever this call passed.
+    @MainActor
+    func withdrawBrowserConsent() {
+        guard let id = parkedBrowserPromptID else { return }
+        consentCoordinator.resolve(id: id, answer: .withdrawn)
     }
 
     /// Post the actionable consent notification (the request-building is the pure

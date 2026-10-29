@@ -89,6 +89,9 @@ class WatchLoop {
     let autoRecordCalendarMeetings: () -> Bool
     /// Names a recording after the calendar event it falls into; see `WatchLoop+CalendarTitle.swift`.
     let calendarLookup: any CalendarMeetingLookup
+    /// Dynamic accessor: window-title keywords that let a browser meeting skip
+    /// the consent prompt (`BrowserTitleVouch`); empty means always ask.
+    let browserTitleKeywords: () -> [String]
 
     /// The app whose consent prompt is currently parked, nil when no question
     /// is open. The answer is awaited in `consentTask` rather than inline, so
@@ -139,6 +142,7 @@ class WatchLoop {
             try await Task.sleep(for: .seconds(interval))
         },
         pidAliveCheck: @escaping (pid_t) -> Bool = { kill($0, 0) == 0 },
+        browserTitleKeywords: @escaping () -> [String] = { [] },
         consentPolicy: BrowserConsentPolicy = BrowserConsentPolicy(),
         denyListStore: any ConsentDenyListStoring = InMemoryConsentDenyListStore(),
         autoRecordCalendarMeetings: @escaping () -> Bool = { false },
@@ -164,6 +168,7 @@ class WatchLoop {
         self.denyListStore = denyListStore
         self.autoRecordCalendarMeetings = autoRecordCalendarMeetings
         self.calendarLookup = calendarLookup
+        self.browserTitleKeywords = browserTitleKeywords
     }
 
     nonisolated static var defaultOutputDir: URL {

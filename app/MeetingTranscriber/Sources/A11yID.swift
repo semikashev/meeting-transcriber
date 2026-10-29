@@ -20,6 +20,7 @@ enum A11yID {
     // Settings — section anchors + record-only controls.
     static let recordOnlyToggle = "recordOnlyToggle"
     static let watchBrowserToggle = "watchBrowserToggle"
+    static let browserAutoRecordTitlesField = "browserAutoRecordTitlesField"
     static let calendarTitlesToggle = "calendarTitlesToggle"
     static let autoRecordCalendarMeetingsToggle = "autoRecordCalendarMeetingsToggle"
     static let promptInRoomMeetingsToggle = "promptInRoomMeetingsToggle"

@@ -50,12 +50,13 @@ struct GeneralSettingsView: View {
                     """
                     Detects web meetings (Google Meet, Whereby, web Zoom/Teams) by the WebRTC \
                     signal, so any browser works. Other apps that place calls can trigger it too; \
-                    it asks before recording (unless the calendar option below vouches for the \
-                    call), and "Never for this app" stops one for good.
+                    it asks before recording (unless the title below or the calendar option \
+                    vouches for the call), and "Never for this app" stops one for good.
                     """,
                 )
                 .font(.caption)
                 .foregroundStyle(.secondary)
+                browserTitleRow
                 browserConsentWarning
                 consentDenyList
             }
@@ -148,6 +149,29 @@ struct GeneralSettingsView: View {
             When an event with other attendees but no call link begins while watching is on and \
             nothing is recording, asks whether to record the microphone. Asked once more if the \
             first prompt went unanswered; Ignore settles it. Watching resumes when the recording ends.
+            """,
+        )
+        .font(.caption)
+        .foregroundStyle(.secondary)
+    }
+
+    /// The shortcut for calls that never reach the calendar, such as a link
+    /// pasted into a chat: a page whose title says it is a call records
+    /// without the prompt. Disabled while browser meetings are not watched,
+    /// since nothing reads it then.
+    @ViewBuilder private var browserTitleRow: some View {
+        TextField(
+            "Record without asking when the title contains",
+            text: $settings.browserAutoRecordTitleKeywords,
+            prompt: Text("Jitsi Meet"),
+        )
+        .accessibilityIdentifier(A11yID.browserAutoRecordTitlesField)
+        .disabled(!settings.watchBrowserMeetings)
+        Text(
+            """
+            Comma-separated, any case. Checked against the title of the browser's front window, \
+            so a call in a tab you are not looking at still asks, and records once you switch to \
+            it. "Never for this app" and a recent Ignore still win.
             """,
         )
         .font(.caption)
