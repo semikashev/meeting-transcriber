@@ -36,21 +36,23 @@ enum InRoomMeetingPolicy {
     }
 
     /// Whether the event describes a meeting in the room that is on now.
-    static func isInRoomMeeting(_ event: CalendarEventCandidate, now: Date) -> Bool {
+    /// `extraDomains` are the user's own conference domains: a link to one of
+    /// them is a call to join like any built-in service's.
+    static func isInRoomMeeting(_ event: CalendarEventCandidate, now: Date, extraDomains: [String] = []) -> Bool {
         guard !event.isAllDay, !event.isDeclined,
               !event.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               !event.attendees.isEmpty,
-              !CalendarMeetingMatcher.hasConferenceLink(event, forApp: "Microphone") else { return false }
+              !CalendarMeetingMatcher.hasConferenceLink(event, forApp: "Microphone", extraDomains: extraDomains) else { return false }
         return event.start <= now && now < event.end && now <= event.start.addingTimeInterval(lateWindow)
     }
 
     /// The event to ask about now, if any: the one that started most recently
     /// among those not yet settled or asked out.
     static func candidate(
-        now: Date, among events: [CalendarEventCandidate], history: [Key: Record],
+        now: Date, among events: [CalendarEventCandidate], history: [Key: Record], extraDomains: [String] = [],
     ) -> CalendarEventCandidate? {
         events
-            .filter { isInRoomMeeting($0, now: now) }
+            .filter { isInRoomMeeting($0, now: now, extraDomains: extraDomains) }
             .filter { event in
                 let record = history[Key(event)] ?? Record()
                 return !record.isSettled && record.asks < maxAsks

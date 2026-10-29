@@ -212,6 +212,15 @@ final class AppSettings {
         didSet { defaults.set(promptInRoomMeetings, forKey: "promptInRoomMeetings") }
     }
 
+    /// Conference domains the built-in list does not know, comma-separated
+    /// (see `CalendarMeetingMatcher.customDomains`). An event linking to one
+    /// counts as a call: it can vouch for a browser meeting and is never
+    /// offered as an in-room meeting. Kept as typed, like
+    /// `browserAutoRecordTitleKeywords`.
+    var extraConferenceDomains: String {
+        didSet { defaults.set(extraConferenceDomains, forKey: "extraConferenceDomains") }
+    }
+
     // MARK: - Recording
 
     var pollInterval: Double {
@@ -634,6 +643,7 @@ final class AppSettings {
         calendarTitlesEnabled = defaults.object(forKey: "calendarTitlesEnabled") as? Bool ?? false
         autoRecordCalendarMeetings = defaults.object(forKey: "autoRecordCalendarMeetings") as? Bool ?? false
         promptInRoomMeetings = defaults.object(forKey: "promptInRoomMeetings") as? Bool ?? false
+        extraConferenceDomains = defaults.string(forKey: "extraConferenceDomains") ?? ""
 
         pollInterval = defaults.object(forKey: "pollInterval") as? Double ?? 3.0
         endGrace = defaults.object(forKey: "endGrace") as? Double ?? 15.0

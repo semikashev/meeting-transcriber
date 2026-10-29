@@ -15,10 +15,20 @@ protocol CalendarMeetingLookup {
     /// (`InRoomMeetingPolicy`). Defaults to none, so a lookup that only names
     /// recordings need not know about it.
     func events(around now: Date) -> [CalendarEventCandidate]
+
+    /// The user's own conference domains, for a caller that ranks `events`
+    /// itself and has to tell a call from an in-room meeting the same way
+    /// `meeting` does. A requirement rather than an extension member, so a
+    /// conformer's own list is what an existential reads.
+    var extraConferenceDomains: [String] { get }
 }
 
 extension CalendarMeetingLookup {
     func events(around _: Date) -> [CalendarEventCandidate] {
+        []
+    }
+
+    var extraConferenceDomains: [String] {
         []
     }
 }
@@ -43,6 +53,8 @@ final class EventKitMeetingLookup: CalendarMeetingLookup {
     /// Attendee spelling → the name speaker labels use; see
     /// `ParticipantDisplayName`. Read per lookup, like `isEnabled`.
     private let attendeeAliases: () -> [String: String]
+    /// Read per lookup, like `isEnabled`; see `CalendarMeetingMatcher.customDomains`.
+    private let conferenceDomains: () -> [String]
     private let store = EKEventStore()
 
     /// The window scanned either side of the recording start. Wide enough for
@@ -53,9 +65,24 @@ final class EventKitMeetingLookup: CalendarMeetingLookup {
     init(
         isEnabled: @escaping () -> Bool,
         attendeeAliases: @escaping () -> [String: String] = { ParticipantDisplayName.aliasesFromDefaults() },
+        conferenceDomains: @escaping () -> [String] = { [] },
     ) {
         self.isEnabled = isEnabled
         self.attendeeAliases = attendeeAliases
+        self.conferenceDomains = conferenceDomains
+    }
+
+    /// The lookup as the settings configure it. The one way production builds
+    /// it, so no caller can switch the feature on and forget the domains.
+    convenience init(settings: AppSettings) {
+        self.init(
+            isEnabled: { [settings] in settings.calendarTitlesEnabled },
+            conferenceDomains: { [settings] in CalendarMeetingMatcher.customDomains(from: settings.extraConferenceDomains) },
+        )
+    }
+
+    var extraConferenceDomains: [String] {
+        conferenceDomains()
     }
 
     static var hasAccess: Bool {
@@ -87,7 +114,9 @@ final class EventKitMeetingLookup: CalendarMeetingLookup {
     func meeting(startingAt start: Date, appName: String) -> CalendarMeeting? {
         guard isEnabled(), Self.hasAccess else { return nil }
         let candidates = events(around: start)
-        guard let match = CalendarMeetingMatcher.bestMatch(recordingStart: start, appName: appName, among: candidates) else {
+        guard let match = CalendarMeetingMatcher.bestMatch(
+            recordingStart: start, appName: appName, among: candidates, extraDomains: extraConferenceDomains,
+        ) else {
             logger.info("No calendar event covers the recording start")
             return nil
         }

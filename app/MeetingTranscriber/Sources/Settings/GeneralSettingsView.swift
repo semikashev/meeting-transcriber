@@ -153,6 +153,18 @@ struct GeneralSettingsView: View {
         )
         .font(.caption)
         .foregroundStyle(.secondary)
+        TextField("Other conference domains", text: $settings.extraConferenceDomains, prompt: Text("meet.example.com"))
+            .accessibilityIdentifier(A11yID.extraConferenceDomainsField)
+            .disabled(!settings.calendarTitlesEnabled)
+        Text(
+            """
+            Comma-separated, for a service that is not built in, such as a company's own Jitsi. An \
+            event linking to one counts as an online call: it can record a browser meeting without \
+            asking and is never offered as an in-person meeting.
+            """,
+        )
+        .font(.caption)
+        .foregroundStyle(.secondary)
     }
 
     /// The shortcut for calls that never reach the calendar, such as a link
