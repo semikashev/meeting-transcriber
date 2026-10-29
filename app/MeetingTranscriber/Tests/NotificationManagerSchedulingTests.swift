@@ -184,6 +184,43 @@ final class NotificationManagerSchedulingTests: XCTestCase {
         XCTAssertEqual(fake.removedIdentifiers, [posted.identifier])
     }
 
+    /// The app's own answer to a browser prompt: the window title vouched for
+    /// the call while the question was open. Only that question is taken back;
+    /// an in-room prompt parked beside it is still the user's to answer, which
+    /// is why this is not `resolveBrowserConsent`, which resolves every prompt.
+    func testWithdrawingTakesBackOnlyTheBrowserPrompt() async {
+        let (manager, fake) = makeManager()
+        manager.setUp()
+        let browser = Task { await manager.askToRecord(title: "Record browser meeting?", body: "A meeting is active.") }
+        await waitFor(fake.added.count == 1)
+        let microphone = Task { await manager.askToRecordMicrophone(title: "Record \"Weekly\" from the microphone?", body: "Now.") }
+        await waitFor(fake.added.count == 2)
+        guard fake.added.count == 2 else {
+            XCTFail("both prompts should be posted")
+            return
+        }
+        let browserID = fake.added[0].identifier
+        let microphoneID = fake.added[1].identifier
+
+        manager.withdrawBrowserConsent()
+
+        let browserAnswer = await browser.value
+        XCTAssertEqual(browserAnswer, .withdrawn)
+        XCTAssertEqual(fake.removedIdentifiers, [browserID], "the browser prompt leaves Notification Center")
+        manager.resolveConsent(responseIdentifier: microphoneID, actionIdentifier: NotificationManager.ignoreActionID)
+        let microphoneAnswer = await microphone.value
+        XCTAssertEqual(microphoneAnswer, .declined, "the microphone prompt was still waiting for the user")
+    }
+
+    func testWithdrawingWithNothingParkedDoesNothing() {
+        let (manager, fake) = makeManager()
+        manager.setUp()
+
+        manager.withdrawBrowserConsent()
+
+        XCTAssertTrue(fake.removedIdentifiers.isEmpty)
+    }
+
     // MARK: - urgency
 
     /// The mapping that makes a capture failure survive Do Not Disturb. The

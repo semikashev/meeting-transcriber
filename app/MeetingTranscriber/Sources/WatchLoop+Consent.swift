@@ -7,7 +7,8 @@ private let logger = Logger(subsystem: AppPaths.logSubsystem, category: "WatchLo
 /// to keep its body under the line-length cap. Only patterns with
 /// `requiresRecordingConsent` reach it; native meetings auto-start unchanged.
 /// A browser meeting the calendar vouches for may skip the prompt too, when
-/// the user opted into that (`calendarVouches(for:)`).
+/// the user opted into that (`calendarVouches(for:)`), and so may one whose
+/// window title carries a keyword the user listed (`titleVouches(for:)`).
 ///
 /// The answer is awaited in its own task rather than inline in the poll loop
 /// (issue #543). Inline, `detector.checkOnce()` was not called at all while a
@@ -28,7 +29,15 @@ extension WatchLoop {
         // One question at a time. The WebRTC assertion re-detects the same call
         // every poll, so without this the loop would post a fresh prompt every
         // few seconds while the first one is still on screen.
-        guard pendingConsentApp == nil else { return true }
+        if let asking = pendingConsentApp {
+            // The one thing that settles the open question before the user
+            // does: the call's own tab coming to the front. The call was
+            // detected under another tab's title, and the user, now looking at
+            // the call, is the least likely person to notice the prompt.
+            guard asking == meeting.pattern.appName, titleVouches(for: meeting) else { return true }
+            withdrawParkedConsent()
+            return false
+        }
 
         let app = meeting.pattern.appName
         guard case .ask = consentPolicy.decision(
@@ -39,8 +48,8 @@ extension WatchLoop {
         }
         // Checked after the policy, not before it: "Never for this app" and a
         // decline still fresh in the cooldown are answers the user gave, and
-        // the calendar must not talk over them.
-        if calendarVouches(for: meeting) { return false }
+        // neither the title nor the calendar may talk over them.
+        if titleVouches(for: meeting) || calendarVouches(for: meeting) { return false }
 
         pendingConsentApp = app
         // `app` is already the concrete browser: a browser meeting is carried
@@ -78,6 +87,27 @@ extension WatchLoop {
         return true
     }
 
+    /// Whether the browser window's title answers the consent question: it
+    /// carries a keyword the user listed for pages that are always calls.
+    /// Read from the meeting this poll detected, so a title that changed since
+    /// the prompt went out is the one judged.
+    private func titleVouches(for meeting: DetectedMeeting) -> Bool {
+        let app = meeting.pattern.appName
+        guard BrowserTitleVouch.vouches(
+            windowTitle: meeting.windowTitle, appName: app, keywords: browserTitleKeywords(),
+        ) else { return false }
+        logger.info("Recording \(app, privacy: .public) without asking: window title \(meeting.windowTitle, privacy: .private) matches a keyword")
+        return true
+    }
+
+    /// Take back the open question because the title answered it. The state is
+    /// cleared here rather than when the prompt's task sees `.withdrawn`, so
+    /// the poll that withdrew it can start the recording at once.
+    private func withdrawParkedConsent() {
+        notifier.withdrawBrowserConsent()
+        clearConsentState()
+    }
+
     /// Take the approved meeting, if any, clearing it. The poll loop is the
     /// only caller: recordings start there and nowhere else, so two of them
     /// cannot overlap.
@@ -101,6 +131,10 @@ extension WatchLoop {
     /// Land the user's answer. Main-actor isolated like the rest of
     /// `WatchLoop`, so it cannot race the poll loop's reads.
     private func finishConsent(for meeting: DetectedMeeting, answer: ConsentAnswer) {
+        // Taken back by `withdrawParkedConsent`, which already cleared the
+        // state and handed the call to the loop. Nothing here is about this
+        // prompt any more, and clearing again could only hit a newer one.
+        guard answer != .withdrawn else { return }
         let app = meeting.pattern.appName
         clearConsentState()
 

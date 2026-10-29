@@ -242,10 +242,8 @@ final class WatchingController {
                 syncEngines?()
                 pipeline.rebuild()
 
-                let detector = makeDetector()
-
                 let loop = WatchLoop(
-                    detector: detector,
+                    detector: makeDetector(),
                     recorderFactory: makeRecorderFactory(),
                     pipelineQueue: pipeline.queue,
                     pollInterval: settings.pollInterval,
@@ -261,6 +259,7 @@ final class WatchingController {
                         .production(parent: pipeline.outputDirectory.resolve())
                     },
                     notifier: notifier,
+                    browserTitleKeywords: { [settings] in BrowserTitleVouch.keywords(from: settings.browserAutoRecordTitleKeywords) },
                     denyListStore: ConsentDenyListStore(settings: settings),
                     autoRecordCalendarMeetings: { [settings] in settings.autoRecordCalendarMeetings },
                     calendarLookup: EventKitMeetingLookup { [settings] in settings.calendarTitlesEnabled },

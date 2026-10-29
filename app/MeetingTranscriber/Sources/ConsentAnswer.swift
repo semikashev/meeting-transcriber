@@ -26,6 +26,13 @@ enum ConsentAnswer: Equatable {
     /// and is only undone in Settings. Mapping it onto `.declined` would
     /// re-prompt ten minutes later, which is the thing the user just said no to.
     case never
+    /// Nobody answered and nobody needs to: the app took the question back
+    /// because the browser's window title vouched for the call while the
+    /// prompt was open (`WatchLoop+Consent`). Its own case because it is not a
+    /// fact about the user at all, so it must buy no cooldown, and because the
+    /// recording it stands for is started by whoever withdrew the prompt, not
+    /// by this answer.
+    case withdrawn
 
     /// Whether a recording may start.
     var isGranted: Bool {

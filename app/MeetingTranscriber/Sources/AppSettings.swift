@@ -151,6 +151,15 @@ final class AppSettings {
         didSet { defaults.set(consentDeniedApps, forKey: "consentDeniedApps") }
     }
 
+    /// Window-title keywords, comma-separated, that let a browser meeting
+    /// record without the consent prompt (see `BrowserTitleVouch`). Kept as
+    /// the text the user typed and parsed where it is read, so the field does
+    /// not rewrite itself under the cursor. Empty by default: it is a way to
+    /// start a recording nobody clicked for.
+    var browserAutoRecordTitleKeywords: String {
+        didSet { defaults.set(browserAutoRecordTitleKeywords, forKey: "browserAutoRecordTitleKeywords") }
+    }
+
     /// Mic-input-detected call apps (see `MicInputDetector`). Off by default —
     /// additive opt-in so existing installs see no new auto-recording behavior.
     var watchWeChat: Bool {
@@ -615,6 +624,7 @@ final class AppSettings {
         watchWebex = defaults.object(forKey: "watchWebex") as? Bool ?? true
         watchBrowserMeetings = defaults.object(forKey: "watchBrowserMeetings") as? Bool ?? false
         consentDeniedApps = defaults.stringArray(forKey: "consentDeniedApps") ?? []
+        browserAutoRecordTitleKeywords = defaults.string(forKey: "browserAutoRecordTitleKeywords") ?? ""
         watchWeChat = defaults.object(forKey: "watchWeChat") as? Bool ?? false
         watchTencentMeeting = defaults.object(forKey: "watchTencentMeeting") as? Bool ?? false
         watchFaceTime = defaults.object(forKey: "watchFaceTime") as? Bool ?? false
