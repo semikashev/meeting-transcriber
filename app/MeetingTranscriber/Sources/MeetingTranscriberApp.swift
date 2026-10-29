@@ -477,7 +477,7 @@ struct MeetingTranscriberApp: App {
                     request,
                     outputDir: settings.effectiveOutputDir,
                     calendar: settings.calendarTitlesEnabled
-                        ? EventKitMeetingLookup { [settings] in settings.calendarTitlesEnabled }
+                        ? EventKitMeetingLookup(settings: settings)
                         : NoCalendarLookup(),
                 )
             } catch {

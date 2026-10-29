@@ -44,6 +44,22 @@ final class GeneralSettingsAutoRecordTests: XCTestCase {
         XCTAssertFalse(open.isDisabled())
     }
 
+    /// The conference-domain field rides on the same lookup, so the same gate.
+    func testTheConferenceDomainFieldWritesTheSettingBehindTheSameGate() throws {
+        func field(_ settings: AppSettings) throws -> InspectableView<ViewType.TextField> {
+            try GeneralSettingsView(settings: settings, notificationVisibility: nil).inspect()
+                .find(viewWithAccessibilityIdentifier: A11yID.extraConferenceDomainsField)
+                .find(ViewType.TextField.self)
+        }
+        XCTAssertTrue(try field(makeSettings(calendarTitles: false)).isDisabled())
+        let settings = try makeSettings(calendarTitles: true)
+        XCTAssertFalse(try field(settings).isDisabled())
+
+        try field(settings).setInput("meet.example.com")
+
+        XCTAssertEqual(settings.extraConferenceDomains, "meet.example.com")
+    }
+
     func testTappingTheRowWritesTheSetting() throws {
         let settings = try makeSettings(calendarTitles: true)
         let view = GeneralSettingsView(settings: settings, notificationVisibility: nil)

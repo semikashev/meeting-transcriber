@@ -72,6 +72,9 @@ enum CalendarMeetingMatcher {
     /// Every conference service a browser might be showing. Also what decides
     /// that an event has no call to join at all (`InRoomMeetingPolicy`), so a
     /// service missing here turns its online meetings into in-room prompts.
+    /// A self-hosted service (a company's own Jitsi, say) cannot be listed
+    /// here, so the user adds its domain in Settings and every caller takes it
+    /// as `extraDomains` (see `customDomains(from:)`).
     static let anyConferenceDomains = [
         "zoom.us", "teams.microsoft.com", "teams.live.com", "webex.com", "meet.google.com", "whereby.com",
         "telemost.yandex", "telemost.360.yandex", "salutejazz.ru", "jazz.sber.ru", "ktalk.ru", "dion.vc", "vk.com/call", "calls.mail.ru",
@@ -79,28 +82,51 @@ enum CalendarMeetingMatcher {
     ]
 
     /// Conference domains a native meeting app implies. A browser implies
-    /// nothing in particular, so any conference link counts for it.
-    static func conferenceDomains(forApp appName: String) -> [String] {
+    /// nothing in particular, so any conference link counts for it, the
+    /// user's own domains included; a native client still implies only its
+    /// own service.
+    static func conferenceDomains(forApp appName: String, extraDomains: [String] = []) -> [String] {
         let name = appName.lowercased()
         if name.contains("zoom") { return ["zoom.us"] }
         if name.contains("teams") { return ["teams.microsoft.com", "teams.live.com"] }
         if name.contains("webex") { return ["webex.com"] }
         if name.contains("facetime") { return ["facetime.apple.com"] }
-        return anyConferenceDomains
+        return anyConferenceDomains + extraDomains
     }
 
-    static func hasConferenceLink(_ event: CalendarEventCandidate, forApp appName: String) -> Bool {
+    static func hasConferenceLink(_ event: CalendarEventCandidate, forApp appName: String, extraDomains: [String] = []) -> Bool {
         let text = event.conferenceText.lowercased()
-        return conferenceDomains(forApp: appName).contains { text.contains($0) }
+        return conferenceDomains(forApp: appName, extraDomains: extraDomains).contains { text.contains($0) }
     }
 
-    static func bestMatch(recordingStart: Date, appName: String, among events: [CalendarEventCandidate]) -> Match? {
+    /// The user's conference domains from the comma-separated setting, in the
+    /// form the substring match above needs: lowercased, without a scheme or
+    /// a trailing slash, since what gets pasted is usually a whole address. A
+    /// path is kept (the built-in list has `vk.com/call`).
+    static func customDomains(from raw: String) -> [String] {
+        raw.split { $0 == "," || $0.isWhitespace }
+            .map { entry -> String in
+                var domain = entry.lowercased()
+                for scheme in ["https://", "http://"] where domain.hasPrefix(scheme) {
+                    domain.removeFirst(scheme.count)
+                }
+                while domain.hasSuffix("/") {
+                    domain.removeLast()
+                }
+                return domain
+            }
+            .filter { !$0.isEmpty }
+    }
+
+    static func bestMatch(
+        recordingStart: Date, appName: String, among events: [CalendarEventCandidate], extraDomains: [String] = [],
+    ) -> Match? {
         let scored: [(CalendarEventCandidate, Int)] = events.compactMap { event in
             let title = event.title.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !event.isAllDay, !title.isEmpty else { return nil }
             guard event.start <= recordingStart.addingTimeInterval(earlyJoin),
                   event.end >= recordingStart else { return nil }
-            let linked = hasConferenceLink(event, forApp: appName)
+            let linked = hasConferenceLink(event, forApp: appName, extraDomains: extraDomains)
             var score = 0
             if !event.attendees.isEmpty || linked { score += 2000 }
             if event.start <= recordingStart { score += 1000 }
@@ -113,7 +139,7 @@ enum CalendarMeetingMatcher {
         let meeting = CalendarMeeting(
             title: top.0.title.trimmingCharacters(in: .whitespacesAndNewlines),
             attendees: top.0.attendees,
-            hasConferenceLink: hasConferenceLink(top.0, forApp: appName),
+            hasConferenceLink: hasConferenceLink(top.0, forApp: appName, extraDomains: extraDomains),
             attendeeEmails: top.0.attendeeEmails,
         )
         return Match(meeting: meeting, isAmbiguous: scored.filter { $0.1 == top.1 }.count > 1)

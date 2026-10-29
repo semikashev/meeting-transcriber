@@ -7,8 +7,10 @@ import XCTest
 final class InRoomMeetingPrompterTests: XCTestCase {
     private final class StubLookup: CalendarMeetingLookup {
         var events: [CalendarEventCandidate]
-        init(events: [CalendarEventCandidate]) {
+        var extraConferenceDomains: [String]
+        init(events: [CalendarEventCandidate], extraConferenceDomains: [String] = []) {
             self.events = events
+            self.extraConferenceDomains = extraConferenceDomains
         }
 
         func meeting(startingAt _: Date, appName _: String) -> CalendarMeeting? {
@@ -80,6 +82,30 @@ final class InRoomMeetingPrompterTests: XCTestCase {
             hooks: harness.hooks,
             nowProvider: clock,
         )
+    }
+
+    /// The prompter hands the lookup's conference domains to the policy, so an
+    /// event linking to a service only the user's list knows is left alone.
+    func testAnEventLinkingToACustomDomainIsNotAskedAbout() async {
+        let spy = PromptSpy(answer: .granted)
+        let harness = Harness()
+        let call = CalendarEventCandidate(
+            title: "Design review", start: start, end: start.addingTimeInterval(3600), isAllDay: false,
+            attendees: ["Anna"], conferenceText: "https://meet.example.com/design-review",
+        )
+        let clock: () -> Date = { [now] in now }
+        let prompter = InRoomMeetingPrompter(
+            lookup: StubLookup(events: [call], extraConferenceDomains: ["meet.example.com"]),
+            isEnabled: { true },
+            notifier: spy,
+            hooks: harness.hooks,
+            nowProvider: clock,
+        )
+
+        await prompter.tick()
+
+        XCTAssertEqual(spy.titles, [], "a call to join is not an in-room meeting")
+        XCTAssertEqual(harness.starts, 0)
     }
 
     func testAsksAboutTheMeetingAndStartsRecordingOnRecord() async {

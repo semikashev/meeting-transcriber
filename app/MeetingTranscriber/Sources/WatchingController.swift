@@ -262,7 +262,7 @@ final class WatchingController {
                     browserTitleKeywords: { [settings] in BrowserTitleVouch.keywords(from: settings.browserAutoRecordTitleKeywords) },
                     denyListStore: ConsentDenyListStore(settings: settings),
                     autoRecordCalendarMeetings: { [settings] in settings.autoRecordCalendarMeetings },
-                    calendarLookup: EventKitMeetingLookup { [settings] in settings.calendarTitlesEnabled },
+                    calendarLookup: EventKitMeetingLookup(settings: settings),
                 )
 
                 attachStateChangeHandler(to: loop, notifyOnRecording: true)
@@ -478,7 +478,7 @@ final class WatchingController {
                 .production(parent: pipeline.outputDirectory.resolve())
             },
             notifier: notifier,
-            calendarLookup: EventKitMeetingLookup { [settings] in settings.calendarTitlesEnabled },
+            calendarLookup: EventKitMeetingLookup(settings: settings),
         )
         watchLoop = loop
 

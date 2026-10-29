@@ -56,6 +56,15 @@ final class InRoomMeetingPolicyTests: XCTestCase {
         }
     }
 
+    /// A link to a service only the user's own list knows is a call too, so
+    /// the event is not offered as an in-room meeting.
+    func testACustomConferenceDomainDisqualifies() {
+        let call = event("Sync", from: 0, to: 60, text: "https://meet.example.com/x")
+        XCTAssertTrue(InRoomMeetingPolicy.isInRoomMeeting(call, now: at(1)), "precondition: unknown to the built-in list")
+        XCTAssertFalse(InRoomMeetingPolicy.isInRoomMeeting(call, now: at(1), extraDomains: ["meet.example.com"]))
+        XCTAssertNil(InRoomMeetingPolicy.candidate(now: at(1), among: [call], history: [:], extraDomains: ["meet.example.com"]))
+    }
+
     func testAnInvitationTheUserDeclinedDoesNotQualify() {
         XCTAssertFalse(InRoomMeetingPolicy.isInRoomMeeting(event("Sync", from: 0, to: 60, declined: true), now: at(1)))
     }

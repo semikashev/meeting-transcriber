@@ -196,6 +196,38 @@ final class CalendarMeetingMatcherTests: XCTestCase {
         XCTAssertTrue(match.meeting.involvesOthers, "but the invitees still make it a meeting")
     }
 
+    // MARK: - The user's own conference domains
+
+    /// A self-hosted service the built-in list cannot know: with its domain
+    /// listed, an event linking to it is a call to join like any other.
+    func testACustomDomainCountsAsAConferenceLinkForABrowser() throws {
+        let call = event("Sync", from: 0, to: 60, attendees: [], text: "https://meet.example.com/design-review")
+        let unlisted = try XCTUnwrap(CalendarMeetingMatcher.bestMatch(recordingStart: at(5), appName: "Arc", among: [call]))
+        XCTAssertFalse(unlisted.meeting.hasConferenceLink, "precondition: the built-in list does not know it")
+
+        let listed = try XCTUnwrap(CalendarMeetingMatcher.bestMatch(
+            recordingStart: at(5), appName: "Arc", among: [call], extraDomains: ["meet.example.com"],
+        ))
+        XCTAssertTrue(listed.meeting.hasConferenceLink)
+        XCTAssertTrue(listed.meeting.involvesOthers)
+    }
+
+    /// A native client still implies its own service only.
+    func testACustomDomainDoesNotSpeakForANativeApp() {
+        let call = event("Sync", from: 0, to: 60, text: "https://meet.example.com/design-review")
+        XCTAssertFalse(CalendarMeetingMatcher.hasConferenceLink(call, forApp: "Microsoft Teams", extraDomains: ["meet.example.com"]))
+    }
+
+    /// The setting is free text, so what a user pastes (a whole address, any
+    /// case, a trailing slash) still has to match the event text.
+    func testCustomDomainsAreNormalised() {
+        XCTAssertEqual(
+            CalendarMeetingMatcher.customDomains(from: " HTTPS://Meet.Example.com/ , calls.example.org\nhttp://x.example.net/room/,, "),
+            ["meet.example.com", "calls.example.org", "x.example.net/room"],
+        )
+        XCTAssertEqual(CalendarMeetingMatcher.customDomains(from: " , \n"), [])
+    }
+
     func testMatchCarriesTheAttendeeAddresses() throws {
         var candidate = event("Sync", from: -5, to: 25, attendees: ["Anna"])
         candidate.attendeeEmails = ["anna@example.com"]

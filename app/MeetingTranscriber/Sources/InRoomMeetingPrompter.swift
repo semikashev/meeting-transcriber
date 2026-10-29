@@ -83,7 +83,9 @@ final class InRoomMeetingPrompter {
     func tick() async {
         guard isEnabled(), hooks.mayPrompt() else { return }
         let now = nowProvider()
-        guard let event = InRoomMeetingPolicy.candidate(now: now, among: lookup.events(around: now), history: history) else {
+        guard let event = InRoomMeetingPolicy.candidate(
+            now: now, among: lookup.events(around: now), history: history, extraDomains: lookup.extraConferenceDomains,
+        ) else {
             return
         }
         await ask(about: event)
