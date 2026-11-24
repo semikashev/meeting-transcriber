@@ -539,7 +539,9 @@ class PipelineQueue {
             return (job.hasSavedProtocol ? "Meeting Notes Ready" : "Transcript Saved", job.meetingTitle)
         }
         let savedATranscript = job.generatesNotesOnly != true
+        let triesAgain = job.hasRetryableMeetingNotes && MeetingNotesAutoRetryPolicy.canPass(failure)
         let body = "\"\(job.meetingTitle)\": \(failure.summary)." + (savedATranscript ? " The transcript is saved." : "")
+            + (triesAgain ? " The app tries again on its own." : "")
         return ("Meeting Notes Failed", failure.hint.map { "\(body) \($0)" } ?? body)
     }
 
@@ -1023,9 +1025,12 @@ class PipelineQueue {
 
     /// Record why this job's meeting notes could not be generated
     /// (`PipelineJob.notesFailure`).
-    func recordNotesFailure(id: UUID, _ failure: MeetingNotesFailure) {
+    func recordNotesFailure(id: UUID, _ failure: MeetingNotesFailure, now: Date = Date()) {
         guard let index = jobs.firstIndex(where: { $0.id == id }) else { return }
         jobs[index].notesFailure = failure
+        jobs[index].notesFailedAt = jobs[index].notesFailedAt ?? now
+        let delay = MeetingNotesAutoRetryPolicy.delay(after: failure)
+        jobs[index].notesRetryNotBefore = delay > 0 ? now.addingTimeInterval(delay) : nil
     }
 
     /// Record which tracks of this job's recording had audio. Read back through

@@ -109,6 +109,9 @@ struct MeetingTranscriberApp: App {
     // `init` and observes menu tracking on its own, so nothing reads it back and
     // the analyzer cannot see that use.
     @State private var menuProgressUpdater: MenuStageProgressUpdater // swiftlint:disable:this unused_declaration
+
+    // Held for the life of the app; nothing reads it.
+    @State private var notesAutoRetry: MeetingNotesAutoRetry // swiftlint:disable:this unused_declaration
     @Environment(\.openWindow)
     private var openWindow
 
@@ -153,6 +156,12 @@ struct MeetingTranscriberApp: App {
         // and then periodically. Here rather than in `AppState`, which unit
         // tests construct.
         ProtocolWebhookOutbox.startRetrying(notify: ProtocolWebhook.notifyUser)
+        // So do meeting notes that could not be generated, for the same reason
+        // started here.
+        let reachability = NetworkReachability()
+        let notesRetry = MeetingNotesAutoRetry(pipeline: state.pipeline) { reachability.isOnline }
+        notesRetry.start(networkReturned: reachability.returned)
+        _notesAutoRetry = State(initialValue: notesRetry)
         let suppressAutoWatch = ProcessInfo.processInfo.environment["MEETINGTRANSCRIBER_DEBUG_SUPPRESS_AUTOWATCH"] == "1"
         // Auto-watch: schedule on main run loop after app finishes launching.
         // E2E drivers that force channel-health flags via env var also set

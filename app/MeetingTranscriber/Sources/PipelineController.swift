@@ -129,6 +129,10 @@ final class PipelineController {
     /// and keeps the originals, which is the safe way to lose it.
     var mergeCleanups: [UUID: MergeCleanup] = [:]
 
+    /// Told when notes the app made again on its own were saved, so the next
+    /// meeting's can follow (`MeetingNotesAutoRetry`).
+    @ObservationIgnored var onAutomaticNotesRetrySucceeded: (() -> Void)?
+
     /// How originals leave the folder after a merge. Injectable so tests
     /// record instead of trashing.
     var originalsRemover: any FileRemoving = TrashFileRemover()
@@ -422,8 +426,13 @@ final class PipelineController {
         queue.onJobStateChange = { [notifier, settings, weak self] job, _, newState in
             switch newState {
             case .done:
-                let note = PipelineQueue.doneNotification(for: job, announceNotesFailure: settings.notifyOnMeetingNotesFailure)
-                notifier.notify(title: note.title, body: note.body)
+                if !job.failedAgainUnasked {
+                    let note = PipelineQueue.doneNotification(
+                        for: job, announceNotesFailure: settings.notifyOnMeetingNotesFailure,
+                    )
+                    notifier.notify(title: note.title, body: note.body)
+                }
+                if job.notesRetryIsAutomatic == true, job.hasSavedProtocol { self?.onAutomaticNotesRetrySucceeded?() }
                 self?.finishMerge(job: job, succeeded: true)
 
             case .error:
