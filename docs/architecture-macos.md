@@ -147,8 +147,8 @@ State writes to `AppPaths.dataDir`; IPC + queue snapshots to `ipcDir`.
 | `MeetingNotesAutoRetryPolicy.swift` | Pure choice of which failed notes are retried on their own, and when |
 | `ClaudeCLIProtocolGenerator+Refusals.swift` | Runs the Claude API turned away (429, 403) told apart, and the cap on the CLI's own wait |
 | `ProtocolLibrary.swift` | Scans the output folder into one `ProtocolEntry` per recording (protocol + transcript + `recordings/` audio by stem) and removes an entry's files through an injected `FileRemoving` (Trash in production) |
-| `ProtocolsWindowView.swift` | The Protocols window: rows with open / reveal / delete-audio / delete, busy rows locked; callbacks only, no file access |
-| `ProtocolsWindow.swift` | Content of the Protocols window over `AppState`: owns the rows, rescans them, deletes and merges |
+| `ProtocolsWindowView.swift` | The Protocols window: rows with open / reveal / delete-audio / delete, "Generate notes" on a row that has only its transcript, busy rows locked; callbacks only, no file access |
+| `ProtocolsWindow.swift` | Content of the Protocols window over `AppState`: owns the rows, rescans them (also when a job starts or finishes), deletes, merges and has notes generated |
 | `LiveCaptionsState.swift` | `@Observable` live-captions state (per-channel hypotheses + finalised utterances) + RPC-wire types |
 | `LiveCaptionsOverlay.swift` | SwiftUI caption-bar content (recent finals + per-channel hypotheses) hosted in `LiveCaptionsWindow` |
 | `LiveCaptionsWindowController.swift` | Borderless click-through NSPanel hosting the caption overlay; Option-drag moves it by screen-coordinate deltas, clamped to the screen visible frame (see `architecture/transcription.md`) |

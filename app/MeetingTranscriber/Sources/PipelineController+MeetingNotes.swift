@@ -25,4 +25,17 @@ extension PipelineController {
         }
         return outcome
     }
+
+    /// Meeting notes for a recording in the Protocols window that has only its
+    /// transcript: the retry of the job that still holds it, which knows the
+    /// meeting and its participants, else a notes-only job as for a picked one.
+    func makeNotes(forTranscript url: URL) {
+        ensureQueue()
+        let path = url.standardizedFileURL.path
+        if let held = queue.jobsWithRetryableMeetingNotes.first(where: { $0.transcriptPath?.standardizedFileURL.path == path }) {
+            queue.retryMeetingNotes(id: held.id)
+        } else {
+            generateNotes(fromTranscripts: [url])
+        }
+    }
 }

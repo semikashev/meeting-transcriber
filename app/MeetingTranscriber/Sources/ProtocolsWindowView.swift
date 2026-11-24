@@ -7,30 +7,39 @@ import SwiftUI
 /// so it can be tested without a folder and the app decides how files leave.
 struct ProtocolsWindowView: View {
     let entries: [ProtocolEntry]
+    /// Recordings a job is working on. The list is read again when they
+    /// change, so finished notes show up and their row unlocks.
+    let busyStems: Set<String>
     let onOpen: (ProtocolEntry) -> Void
     let onReveal: (ProtocolEntry) -> Void
     let onDelete: (ProtocolEntry, ProtocolRemovalScope) -> Void
     let onRefresh: () -> Void
     let onMerge: (SessionMergeRequest) -> Void
+    /// Makes the notes of a recording that has only its transcript.
+    let onGenerateNotes: (ProtocolEntry) -> Void
     @State private var merge: ProtocolsMergeState
 
     /// `merge` is only for tests that need to see the selection; the window
     /// keeps its own so a refresh (a new `entries` array) does not clear it.
     init(
         entries: [ProtocolEntry],
+        busyStems: Set<String> = [],
         onOpen: @escaping (ProtocolEntry) -> Void,
         onReveal: @escaping (ProtocolEntry) -> Void,
         onDelete: @escaping (ProtocolEntry, ProtocolRemovalScope) -> Void,
         onRefresh: @escaping () -> Void,
         onMerge: @escaping (SessionMergeRequest) -> Void = { _ in },
+        onGenerateNotes: @escaping (ProtocolEntry) -> Void = { _ in },
         merge: ProtocolsMergeState = ProtocolsMergeState(),
     ) {
         self.entries = entries
+        self.busyStems = busyStems
         self.onOpen = onOpen
         self.onReveal = onReveal
         self.onDelete = onDelete
         self.onRefresh = onRefresh
         self.onMerge = onMerge
+        self.onGenerateNotes = onGenerateNotes
         _merge = State(initialValue: merge)
     }
 
@@ -57,6 +66,7 @@ struct ProtocolsWindowView: View {
         }
         .frame(minWidth: 640, minHeight: 360)
         .onAppear(perform: onRefresh)
+        .onChange(of: busyStems) { onRefresh() }
         .sheet(isPresented: Binding(get: { merge.draft != nil }, set: { if !$0 { merge.draft = nil } })) {
             if let draft = merge.draft {
                 MergeSessionsSheet(
@@ -116,6 +126,16 @@ struct ProtocolsWindowView: View {
             if entry.protocolURL != nil || entry.transcriptURL != nil {
                 Button("Open") { onOpen(entry) }
             }
+            // Not in the App Store build, like the menu's Generate Meeting Notes
+            // from Transcript: the sandbox holds no grant for the folder when
+            // the job saves them.
+            #if !APPSTORE
+                if entry.protocolURL == nil, entry.transcriptURL != nil {
+                    Button("Generate notes") { onGenerateNotes(entry) }
+                        .help("Make the meeting notes from the saved transcript")
+                        .accessibilityIdentifier(A11yID.protocolsGenerateNotes(entry.stem))
+                }
+            #endif
             Button {
                 onReveal(entry)
             } label: {

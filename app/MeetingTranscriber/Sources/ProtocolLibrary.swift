@@ -97,6 +97,15 @@ enum ProtocolLibrary {
         .sorted { $0.recordedAt > $1.recordedAt }
     }
 
+    /// Stems a pipeline job still refers to: anything not finished, the jobs
+    /// parked on speaker naming, whose 16 kHz sidecar the naming session reads
+    /// back, and recordings being merged. Deleting under those would break the
+    /// job. A job for a picked transcript has no naming slug; its notes' name
+    /// is the stem.
+    static func busyStems(of jobs: [PipelineJob], merging: Set<String>) -> Set<String> {
+        Set(jobs.filter { !$0.state.isTerminal }.compactMap { $0.namingSlug ?? $0.notesBasename }).union(merging)
+    }
+
     static func remove(_ entry: ProtocolEntry, scope: ProtocolRemovalScope, using remover: any FileRemoving) throws {
         var doomed = entry.audioURLs
         if scope == .everything {

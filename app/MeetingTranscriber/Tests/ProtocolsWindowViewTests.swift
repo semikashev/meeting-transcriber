@@ -74,4 +74,52 @@ final class ProtocolsWindowViewTests: XCTestCase {
         XCTAssertThrowsError(try view.inspect().find(button: "Delete audio"))
         XCTAssertNoThrow(try view.inspect().find(button: "Delete"))
     }
+
+    // MARK: - Generate notes
+
+    private func transcriptEntry(protocolURL: URL? = nil, busy: Bool = false) -> ProtocolEntry {
+        ProtocolEntry(
+            stem: "a", recordedAt: Date(timeIntervalSince1970: 1_800_000_000), title: "A",
+            protocolURL: protocolURL, transcriptURL: URL(fileURLWithPath: "/tmp/a.txt"),
+            audioURLs: [], audioBytes: 0, isBusy: busy,
+        )
+    }
+
+    private func notesView(_ entry: ProtocolEntry, onGenerateNotes: @escaping (ProtocolEntry) -> Void = { _ in }) -> ProtocolsWindowView {
+        ProtocolsWindowView(
+            entries: [entry], onOpen: { _ in }, onReveal: { _ in }, onDelete: { _, _ in }, onRefresh: {},
+            onGenerateNotes: onGenerateNotes,
+        )
+    }
+
+    #if !APPSTORE
+        func testARowWithOnlyATranscriptOffersToGenerateItsNotes() throws {
+            var asked: [String] = []
+            let view = notesView(transcriptEntry()) { asked.append($0.stem) }
+            try view.inspect().find(viewWithAccessibilityIdentifier: A11yID.protocolsGenerateNotes("a")).button().tap()
+            XCTAssertEqual(asked, ["a"])
+        }
+    #endif
+
+    func testARowWithNotesOrWithoutATranscriptDoesNot() throws {
+        let withNotes = notesView(transcriptEntry(protocolURL: URL(fileURLWithPath: "/tmp/a.md")))
+        XCTAssertThrowsError(try withNotes.inspect().find(button: "Generate notes"))
+        XCTAssertThrowsError(try notesView(entry("a", title: "A", bytes: 10)).inspect().find(button: "Generate notes"))
+    }
+
+    /// The notes of a row being made appear, and the row unlocks, without the
+    /// user pressing Refresh.
+    func testTheListIsReadAgainWhenAJobStartsOrFinishes() throws {
+        var refreshes = 0
+        let view = ProtocolsWindowView(
+            entries: [transcriptEntry(busy: true)], busyStems: ["a"],
+            onOpen: { _ in }, onReveal: { _ in }, onDelete: { _, _ in }, onRefresh: { refreshes += 1 },
+        )
+        try view.inspect().vStack().callOnChange(oldValue: Set(["a"]), newValue: Set<String>())
+        XCTAssertEqual(refreshes, 1)
+    }
+
+    func testABusyRowDoesNotOfferToGenerateNotes() throws {
+        XCTAssertThrowsError(try notesView(transcriptEntry(busy: true)).inspect().find(button: "Generate notes"))
+    }
 }

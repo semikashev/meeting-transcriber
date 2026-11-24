@@ -239,8 +239,12 @@ enum A11yID {
     static let protocolsMergeDeleteOriginals = "protocolsMergeDeleteOriginals"
     static let protocolsMergeConfirm = "protocolsMergeConfirm"
 
-    /// Per-row delete buttons, addressed by the recording's stem (app-set,
-    /// never user input, so safe to publish unredacted like the row index above).
+    /// Per-row buttons, addressed by the recording's stem (app-set, never
+    /// user input, so safe to publish unredacted like the row index above).
+    static func protocolsGenerateNotes(_ stem: String) -> String {
+        "protocolsGenerateNotes.\(stem)"
+    }
+
     static func protocolsDelete(_ stem: String) -> String {
         "protocolsDelete.\(stem)"
     }
