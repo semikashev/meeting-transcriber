@@ -143,6 +143,9 @@ State writes to `AppPaths.dataDir`; IPC + queue snapshots to `ipcDir`.
 | `UpdateChecker.swift` | Checks GitHub releases for newer versions, drives the menu bar update badge |
 | `UpdateInstallRoute.swift` | Routes an available update to the right install path: a Homebrew-managed cask vs. a manually dragged `.app` |
 | `Settings/PickerLanguages.swift` | Language picker entries for WhisperKit and Parakeet language selectors |
+| `MeetingNotesAutoRetry.swift` | Makes failed meeting notes again on its own: at launch, every 15 minutes, when the network returns |
+| `MeetingNotesAutoRetryPolicy.swift` | Pure choice of which failed notes are retried on their own, and when |
+| `ClaudeCLIProtocolGenerator+Refusals.swift` | Runs the Claude API turned away (429, 403) told apart, and the cap on the CLI's own wait |
 | `ProtocolLibrary.swift` | Scans the output folder into one `ProtocolEntry` per recording (protocol + transcript + `recordings/` audio by stem) and removes an entry's files through an injected `FileRemoving` (Trash in production) |
 | `ProtocolsWindowView.swift` | The Protocols window: rows with open / reveal / delete-audio / delete, busy rows locked; callbacks only, no file access |
 | `ProtocolsWindow.swift` | Content of the Protocols window over `AppState`: owns the rows, rescans them, deletes and merges |

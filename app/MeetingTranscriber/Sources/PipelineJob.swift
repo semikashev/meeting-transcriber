@@ -186,6 +186,12 @@ struct PipelineJob: Identifiable, Codable {
         state == .done && notesFailure != nil && transcriptPath != nil
     }
 
+    /// The app tried the notes again on its own and they failed again: nothing
+    /// new to tell, the first failure was announced.
+    var failedAgainUnasked: Bool {
+        notesRetryIsAutomatic == true && notesFailure != nil && !hasSavedProtocol
+    }
+
     /// A finished job that stays listed, and in the snapshot, until the user
     /// acts on it: an export to retry or discard, or notes to retry or dismiss.
     var isHeldAfterCompletion: Bool {
@@ -228,6 +234,17 @@ struct PipelineJob: Identifiable, Codable {
     // become a full run after the relaunch. Optional like `autoSkipNaming`.
     // swiftlint:disable:next discouraged_optional_boolean
     var generatesNotesOnly: Bool?
+    /// When the notes first failed, nil once they are saved. Bounds how long
+    /// the app tries again on its own (`MeetingNotesAutoRetryPolicy`).
+    var notesFailedAt: Date?
+    /// Not tried again by the app itself before this.
+    var notesRetryNotBefore: Date?
+    /// How often the app has tried again on its own.
+    var notesAutoRetries: Int?
+    // Whether the current or last notes run was the app's own idea: one that
+    // fails again is not announced. Optional like `autoSkipNaming`.
+    // swiftlint:disable:next discouraged_optional_boolean
+    var notesRetryIsAutomatic: Bool?
     /// The speaker names the failed notes were to be tagged with, for the
     /// retry's Notion export. Nil when the notes did not fail.
     var notesSpeakerNames: [String]? // swiftlint:disable:this discouraged_optional_collection

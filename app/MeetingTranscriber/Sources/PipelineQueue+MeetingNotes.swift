@@ -40,8 +40,11 @@ extension PipelineQueue {
     /// while the provider is None, where it would end without notes. Never
     /// overwrites notes: a `.md` of the job's stem or the transcript's name
     /// ends the offer with a warning, here and again after the model call.
+    ///
+    /// `automatic` for a retry the app starts by itself: it is counted, and
+    /// one that fails again is not announced.
     @discardableResult
-    func retryMeetingNotes(id: UUID) -> Bool {
+    func retryMeetingNotes(id: UUID, automatic: Bool = false) -> Bool {
         guard canRetryMeetingNotes(id: id),
               let index = jobs.firstIndex(where: { $0.id == id }),
               let transcriptPath = jobs[index].transcriptPath else { return false }
@@ -62,7 +65,11 @@ extension PipelineQueue {
             return false
         }
         jobs[index].generatesNotesOnly = true
-        eventLog.append(jobID: id, event: "meeting_notes_retry", from: .done, to: .waiting)
+        jobs[index].notesRetryIsAutomatic = automatic ? true : nil
+        if automatic { jobs[index].notesAutoRetries = (jobs[index].notesAutoRetries ?? 0) + 1 }
+        eventLog.append(
+            jobID: id, event: automatic ? "meeting_notes_auto_retry" : "meeting_notes_retry", from: .done, to: .waiting,
+        )
         updateJobState(id: id, to: .waiting)
         triggerProcessing()
         return true
@@ -140,6 +147,9 @@ extension PipelineQueue {
         jobs[index].notesFailure = nil
         jobs[index].generatesNotesOnly = nil
         jobs[index].notesSpeakerNames = nil
+        jobs[index].notesFailedAt = nil
+        jobs[index].notesRetryNotBefore = nil
+        jobs[index].notesAutoRetries = nil
         let stale = [
             Self.protocolGenerationFailedWarning, Self.notesRetryTranscriptMissingWarning,
             Self.notesRetryNoProviderWarning, Self.rawTranscriptRetainedWithoutNotesWarning,
