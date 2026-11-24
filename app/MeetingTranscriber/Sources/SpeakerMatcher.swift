@@ -9,7 +9,7 @@ private let logger = Logger(subsystem: AppPaths.logSubsystem, category: "Speaker
 
 class SpeakerMatcher {
     private let dbPath: URL
-    private let threshold: Float
+    let threshold: Float
     private let confidenceMargin: Float
     /// Recent-samples FIFO size (was 5 before centroid landed; 3 is enough as
     /// fallback because the centroid is the primary anchor now).
@@ -36,11 +36,34 @@ class SpeakerMatcher {
     /// mutation anyway, and `replaceItemAt` already gives atomic file
     /// replacement at the FS level.
     private static let dbLock = NSLock()
+    /// Last problem reported per DB path (see `shouldReport`). Process-wide
+    /// because matchers are created per call; guarded by `dbLock`.
+    nonisolated(unsafe) private static var problemReports: [URL: ProblemReport] = [:]
 
-    init(dbPath: URL? = nil, threshold: Float = 0.40, confidenceMargin: Float = 0.10) {
+    /// Told when `mutateDB` could not use or write the DB, so the user learns
+    /// their enrolled voices are not being kept. Deduplicated, and called
+    /// after `dbLock` is released. Silent by default, like `WatchLoop`'s
+    /// notifier: production builds matchers through `factory(dbPath:notifier:)`,
+    /// which routes it to the app's one `AppNotifying`.
+    private let onDBProblem: (DBProblem) -> Void
+    /// Runs between the two reads of an undecodable DB, without `dbLock`
+    /// held (see `rereadDelay`). Injected so tests neither wait nor race a
+    /// timer.
+    private let settleBeforeReread: () -> Void
+
+    init(
+        dbPath: URL? = nil,
+        threshold: Float = 0.40,
+        confidenceMargin: Float = 0.10,
+        // First of the two closures, so a trailing closure binds to it.
+        onDBProblem: @escaping (DBProblem) -> Void = { _ in },
+        settleBeforeReread: @escaping () -> Void = { Thread.sleep(forTimeInterval: SpeakerMatcher.rereadDelay) },
+    ) {
         self.dbPath = dbPath ?? AppPaths.speakersDB
         self.threshold = threshold
         self.confidenceMargin = confidenceMargin
+        self.settleBeforeReread = settleBeforeReread
+        self.onDBProblem = onDBProblem
         Self.migrateIfNeeded(dbPath: self.dbPath)
     }
 
@@ -48,14 +71,98 @@ class SpeakerMatcher {
     /// process-wide DB lock for the duration of the closure so concurrent
     /// callers can't lose updates. Use this for every mutating operation;
     /// raw `loadDB` + `saveDB` paired by hand reintroduces the race.
+    ///
+    /// A DB that exists but cannot be used is never overwritten blind.
+    /// Treating it as empty and saving would replace every enrolled voice
+    /// with just this one change. A damaged DB is first copied aside
+    /// unchanged (`quarantineDamagedDB`), and the block runs against the
+    /// entries that could be salvaged (`.salvaged`; none if the file is not a
+    /// JSON array). Only then is the new array swapped in by an atomic
+    /// replace, so the original stays in place until the new file takes its
+    /// path: a failed write leaves it untouched, and a reader never finds the
+    /// path empty. A DB that failed to *read* may be intact, so it stays in
+    /// place and nothing is written; so does a damaged one that cannot be
+    /// copied. The block still runs in that case, because callers need its
+    /// result; `persistence` says whether the change reached the disk.
     @discardableResult
-    func mutateDB<R>(_ block: (inout [StoredSpeaker]) -> R) -> R {
-        Self.dbLock.lock()
-        defer { Self.dbLock.unlock() }
-        var stored = loadDB()
-        let result = block(&stored)
-        saveDB(stored)
-        return result
+    func mutateDB<R>(_ block: (inout [StoredSpeaker]) -> R) -> Mutation<R> {
+        var mayQuarantine = false
+        while true {
+            let attempt = Self.dbLock.withLock { lockedMutate(block, mayQuarantine: mayQuarantine) }
+            guard let (mutation, problem) = attempt else {
+                // Undecodable on the first read. Wait outside the lock, so
+                // other writers are not held up, then read it once more.
+                settleBeforeReread()
+                mayQuarantine = true
+                continue
+            }
+            // Outside the lock: the callback posts a notification and may call
+            // back into a matcher, and `dbLock` is not recursive.
+            if let problem { onDBProblem(problem) }
+            return mutation
+        }
+    }
+
+    /// The body of `mutateDB`, run with `dbLock` held. Returns the problem to
+    /// report, already deduplicated, for the caller to report after unlocking;
+    /// or nil, without running `block`, when the DB is undecodable and
+    /// `mayQuarantine` is false (see `rereadDelay`).
+    private func lockedMutate<R>(
+        _ block: (inout [StoredSpeaker]) -> R, mayQuarantine: Bool,
+    ) -> (Mutation<R>, DBProblem?)? {
+        let outcome = Self.readDB(at: dbPath)
+        // The problem already reported for this very file, if it has not
+        // changed since: it was left in place, or its write failed after the
+        // copy. Such a file has stopped changing.
+        let known = Self.problemReports[dbPath].flatMap { $0.file == FileState(of: dbPath) ? $0.problem : nil }
+        // Only a file that is not even a JSON array can be a sync tool caught
+        // mid-write, and one already reported need not be waited on again by
+        // the (mostly main-actor) callers.
+        if case .undecodable = outcome, !mayQuarantine, known == nil {
+            return nil
+        }
+        var plan = Self.writePlan(for: outcome)
+        // The copy must exist before anything is written: the entries a
+        // salvage drops survive only in it. An unchanged file whose write
+        // failed already has one, so a write that keeps failing makes no more.
+        var copiedTo: URL?
+        if let damage = plan.damage {
+            copiedTo = Self.existingCopy(after: known, of: dbPath)
+                ?? Self.quarantineDamagedDB(at: dbPath, damage: damage)
+            if copiedTo == nil { plan.writable = false }
+        }
+        var stored = plan.stored
+        let value = block(&stored)
+
+        let persistence: Persistence
+        let problem: DBProblem?
+        if plan.writable {
+            do {
+                try Self.writeDB(stored, to: dbPath)
+                persistence = .saved
+                problem = copiedTo.flatMap { plan.damage?.problem(copiedTo: $0) }
+                Self.problemReports[dbPath] = nil
+            } catch {
+                // The atomic replace never happened, so the original is still
+                // in place, untouched; the copy stays too, is named, and is
+                // reused by the next attempt while the file is unchanged.
+                logger.error("Failed to save speaker DB: \(error.localizedDescription, privacy: .public)")
+                persistence = .writeFailed
+                problem = .saveFailed(copiedTo: copiedTo)
+            }
+        } else {
+            persistence = .dbUnavailable
+            problem = .leftInPlace
+        }
+        let toReport = problem.flatMap { Self.shouldReport($0, at: dbPath, reports: &Self.problemReports) ? $0 : nil }
+        let replaced = persistence == .saved ? copiedTo : nil
+        return (Mutation(value: value, persistence: persistence, replacedCorruptDB: replaced), toReport)
+    }
+
+    /// Classify the DB on disk without the re-read `mutateDB` does. See
+    /// `ReadOutcome`.
+    func readDB() -> ReadOutcome {
+        Self.readDB(at: dbPath)
     }
 
     /// Reset old pyannote-format speakers.json (incompatible embeddings).
@@ -115,17 +222,15 @@ class SpeakerMatcher {
     }
 
     /// Match each label against the stored DB, returning the top candidates
-    /// with their per-anchor distances.
+    /// with their per-anchor distances; `against` is a kept `matchableSpeakers()`.
     /// Labels are matched longest speaker first (`speakingTimes`; key order
     /// breaks ties and stands in when no times are given), so a contested name
     /// goes to the label with the most evidence behind it.
     func matchVerbose(
         embeddings: [String: [Float]], speakingTimes: [String: TimeInterval] = [:], topK: Int = 3,
+        against: [StoredSpeaker]? = nil,
     ) -> [String: VerboseMatch] {
-        // Synthetic entries (RPC `seedSpeaker`) carry random embeddings —
-        // letting them participate in matching would let any caller with
-        // RPC access poison auto-naming. Drop them before scoring.
-        let stored = loadDB().filter { !$0.isSynthetic }
+        let stored = against ?? matchableSpeakers()
         var result: [String: VerboseMatch] = [:]
         var usedOnTracks: [String: Set<SpeakerKey.Track>] = [:]
 
@@ -242,246 +347,12 @@ class SpeakerMatcher {
         return (updated, count + 1)
     }
 
-    /// Update speaker DB with confirmed names and their embeddings.
-    /// - Each embedding first passes `sampleAdmission`: too little speech, or
-    ///   a vector that already stands for someone else, is not learned. The
-    ///   confirmation still counts as a use of an existing speaker, but never
-    ///   creates one without a voice.
-    /// - Labels are written longest speaker first, so when two labels of one
-    ///   recording carry near-identical embeddings the better-evidenced one
-    ///   becomes the anchor the other is judged against, independent of
-    ///   dictionary order.
-    /// - Admitted embeddings with at least `minSpeakingTimeForCentroid` seconds
-    ///   are folded into the running-mean `centroid`; every admitted one joins
-    ///   the recent-samples FIFO (max `maxRecentSamples`). An embedding without
-    ///   a known duration keeps the older behaviour: FIFO only.
-    @discardableResult
-    func updateDB(
-        mapping: [String: String],
-        embeddings: [String: [Float]],
-        speakingTimes: [String: TimeInterval] = [:],
-        provenance: SampleProvenance? = nil,
-        now: Date = Date(),
-    ) -> [String: SampleAdmission] {
-        let confirmed = mapping
-            // An empty name is a suggestion the user cleared (see `NamingConfirmation`).
-            .filter { label, name in !name.isEmpty && name != label && embeddings[label] != nil }
-            .sorted { lhs, rhs in
-                let l = speakingTimes[lhs.key] ?? 0
-                let r = speakingTimes[rhs.key] ?? 0
-                return l != r ? l > r : lhs.key < rhs.key
-            }
-        return mutateDB { stored in
-            var outcome: [String: SampleAdmission] = [:]
-            for (label, name) in confirmed {
-                guard let embedding = embeddings[label] else { continue }
-                let duration = speakingTimes[label]
-                let admission = Self.sampleAdmission(
-                    embedding, named: name, duration: duration, against: stored,
-                )
-                outcome[label] = admission
-                let idx = stored.firstIndex { $0.name == name }
-                var labelProvenance = provenance ?? SampleProvenance()
-                labelProvenance.track = SpeakerKey(encoded: label).track
-                switch (admission, idx) {
-                case let (.admitted, idx?):
-                    stored[idx] = Self.applyConfirmation(
-                        to: stored[idx], embedding: embedding, duration: duration ?? 0, now: now,
-                        provenance: labelProvenance,
-                    )
-
-                case (.admitted, nil):
-                    stored.append(Self.newSpeaker(
-                        name: name, embedding: embedding, duration: duration ?? 0, now: now,
-                        provenance: labelProvenance,
-                    ))
-
-                case let (_, idx?):
-                    stored[idx] = stored[idx].recordingUse(at: now)
-
-                case (_, nil):
-                    break
-                }
-            }
-            Self.logAdmissions(outcome)
-            return outcome
-        }
-    }
-
-    /// Pure helper: fold a confirmed embedding into an existing `StoredSpeaker`.
-    /// The embedding joins the history; it counts toward the centroid only
-    /// with `duration >= minSpeakingTimeForCentroid` and a dimension the
-    /// centroid can take, and is a recent-sample anchor either way.
-    static func applyConfirmation(
-        to speaker: StoredSpeaker, embedding: [Float], duration: TimeInterval, now: Date,
-        provenance: SampleProvenance? = nil,
-    ) -> StoredSpeaker {
-        let dimensionFits = speaker.centroid.map { $0.count == embedding.count } ?? true
-        let sample = makeSample(
-            embedding: embedding, duration: duration, qualifies: dimensionFits,
-            now: now, provenance: provenance,
-        )
-        return StoredSpeaker(
-            name: speaker.name,
-            samples: speaker.appending(sample),
-            lastUsed: now,
-            useCount: speaker.useCount + 1,
-        )
-    }
-
-    /// Pure helper: build a fresh `StoredSpeaker` from a single confirmation.
-    static func newSpeaker(
-        name: String, embedding: [Float], duration: TimeInterval, now: Date,
-        provenance: SampleProvenance? = nil,
-    ) -> StoredSpeaker {
-        let sample = makeSample(
-            embedding: embedding, duration: duration, qualifies: true,
-            now: now, provenance: provenance,
-        )
-        return StoredSpeaker(name: name, samples: [sample], lastUsed: now, useCount: 1)
-    }
-
-    private static func makeSample(
-        embedding: [Float], duration: TimeInterval, qualifies: Bool, now: Date,
-        provenance: SampleProvenance?,
-    ) -> VoiceSample {
-        let counts = qualifies && !embedding.isEmpty && duration >= minSpeakingTimeForCentroid
-        return VoiceSample(
-            embedding: embedding,
-            origin: provenance?.origin ?? .meeting,
-            centroidWeight: counts ? 1 : 0,
-            addedAt: now,
-            duration: duration > 0 ? duration : nil,
-            track: provenance?.track,
-            jobID: provenance?.jobID,
-            meetingTitle: provenance?.meetingTitle,
-            pinned: provenance?.pinned ?? false,
-        )
-    }
-
-    enum RenameResult: Equatable {
-        case renamed
-        case merged
-        case notFound
-        case noop
-    }
-
-    /// Rename a speaker. If a speaker with `to` already exists, merges `from`
-    /// into it. Persists immediately. `noop` covers same-source-and-target;
-    /// `notFound` covers a missing source.
-    @discardableResult
-    func renameSpeaker(from: String, to: String) -> RenameResult {
-        guard from != to else { return .noop }
-        return mutateDB { stored in
-            guard let srcIdx = stored.firstIndex(where: { $0.name == from }) else {
-                return .notFound
-            }
-            if let dstIdx = stored.firstIndex(where: { $0.name == to }) {
-                stored[dstIdx] = Self.merged(into: stored[dstIdx], from: stored[srcIdx])
-                stored.remove(at: srcIdx)
-                return .merged
-            }
-            stored[srcIdx] = stored[srcIdx].renamed(to: to)
-            return .renamed
-        }
-    }
-
-    /// Remove a speaker. Returns `false` if no speaker with that name was found.
-    @discardableResult
-    func deleteSpeaker(name: String) -> Bool {
-        mutateDB { stored in
-            guard let idx = stored.firstIndex(where: { $0.name == name }) else { return false }
-            stored.remove(at: idx)
-            return true
-        }
-    }
-
-    /// Merge `from` into `into`. Embeddings concatenated and FIFO-trimmed,
-    /// centroid weighted-averaged, lastUsed/useCount combined. Returns false
-    /// if either name is missing or if `from == into`.
-    @discardableResult
-    func mergeSpeakers(from: String, into: String) -> Bool {
-        guard from != into else { return false }
-        return mutateDB { stored in
-            guard let srcIdx = stored.firstIndex(where: { $0.name == from }),
-                  let dstIdx = stored.firstIndex(where: { $0.name == into }) else {
-                return false
-            }
-            stored[dstIdx] = Self.merged(into: stored[dstIdx], from: stored[srcIdx])
-            stored.removeAll { $0.name == from }
-            return true
-        }
-    }
-
-    /// Pure helper: combine `src` into `dst`. Used by both rename-collision
-    /// and explicit merge.
-    static func merged(into dst: StoredSpeaker, from src: StoredSpeaker) -> StoredSpeaker {
-        // Both histories, destination first; the derived centroid is then the
-        // weighted average of both, exactly as `mergeCentroids` computes it.
-        var samples = dst.samples + src.samples
-        // Migrated recent samples were only ever FIFO anchors: keep as many as
-        // the old append-and-trim kept, the most recent ones.
-        let migratedRecent = samples.indices.filter { samples[$0].origin == .migratedSample }
-        let excess = migratedRecent.count - maxRecentSamples
-        if excess > 0 {
-            let drop = Set(migratedRecent.prefix(excess))
-            samples = samples.enumerated().filter { !drop.contains($0.offset) }.map(\.element)
-        }
-        while samples.count(where: { !$0.pinned }) > StoredSpeaker.maxHistory,
-              let oldest = samples.firstIndex(where: { !$0.pinned }) {
-            samples.remove(at: oldest)
-        }
-        let lastUsed: Date? = switch (dst.lastUsed, src.lastUsed) {
-        case let (a?, b?): max(a, b)
-        case let (a?, nil): a
-        case let (nil, b?): b
-        case (nil, nil): nil
-        }
-        return StoredSpeaker(
-            name: dst.name,
-            samples: samples,
-            lastUsed: lastUsed,
-            useCount: dst.useCount + src.useCount,
-            // Stay synthetic only when both sides are synthetic. Merging a
-            // real entry in promotes the result back to real.
-            isSynthetic: dst.isSynthetic && src.isSynthetic,
-        )
-    }
-
-    /// Pure helper: weighted-average two centroids. Returns nil centroid if
-    /// both inputs are nil. Dimension mismatches yield the larger-count side
-    /// (we never let a dim-mismatched merge corrupt the centroid).
-    static func mergeCentroids(
-        a: [Float]?, aCount: Int, b: [Float]?, bCount: Int,
-    ) -> (centroid: [Float]?, count: Int) {
-        switch (a, b) {
-        case (nil, nil):
-            return (nil, aCount + bCount)
-
-        case let (a?, nil):
-            return (a, aCount + bCount)
-
-        case let (nil, b?):
-            return (b, aCount + bCount)
-
-        case let (a?, b?):
-            guard a.count == b.count, !a.isEmpty else {
-                return aCount >= bCount ? (a, aCount + bCount) : (b, aCount + bCount)
-            }
-            let total = Float(max(aCount + bCount, 1))
-            let aw = Float(aCount) / total
-            let bw = Float(bCount) / total
-            var merged = [Float](repeating: 0, count: a.count)
-            for i in 0 ..< a.count {
-                merged[i] = a[i] * aw + b[i] * bw
-            }
-            return (merged, aCount + bCount)
-        }
-    }
-
+    /// Stored speakers for read-only use. An unreadable DB reads as empty
+    /// here, a partly undecodable one as the entries that can be salvaged,
+    /// and either is left in place; only `mutateDB` copies it aside, under
+    /// the lock, before it would write.
     func loadDB() -> [StoredSpeaker] {
-        guard let data = try? Data(contentsOf: dbPath) else { return [] }
-        return (try? JSONDecoder().decode([StoredSpeaker].self, from: data)) ?? []
+        readDB().usableSpeakers
     }
 
     /// Names of all stored speakers, ordered for picker display: most recently
@@ -513,17 +384,11 @@ class SpeakerMatcher {
         return sortedUsed + sortedUnused
     }
 
+    /// Write the DB unconditionally, logging a failure. Skips the lock and
+    /// every safeguard in `mutateDB`, so production writes go through that.
     func saveDB(_ speakers: [StoredSpeaker]) {
         do {
-            let data = try JSONEncoder().encode(speakers)
-            let tmp = dbPath.deletingLastPathComponent()
-                .appendingPathComponent("speakers.json.tmp")
-            try data.write(to: tmp)
-            _ = try FileManager.default.replaceItemAt(dbPath, withItemAt: tmp)
-            // Voice embeddings/centroids are biometric-adjacent — restrict the
-            // persisted DB to owner-only. The temp-file rename does not carry a
-            // chmod applied pre-rename, so set it on the final path.
-            try FileManager.default.restrictToOwner(dbPath)
+            try Self.writeDB(speakers, to: dbPath)
         } catch {
             logger.error("Failed to save speaker DB: \(error.localizedDescription, privacy: .public)")
         }

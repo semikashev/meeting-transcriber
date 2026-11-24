@@ -9,7 +9,9 @@
 If you run `./scripts/lint.sh`, you also need SwiftLint and SwiftFormat 0.62.0 or
 newer; the format config disables rules older versions do not recognise and will
 reject outright. CI pins exact versions, listed in `scripts/tool-versions.sh`, and
-`lint.sh` warns when your local ones differ.
+`lint.sh` warns when your local ones differ. CI also runs SwiftLint's analyzer
+rules, which plain `lint.sh` does not; `./scripts/lint.sh --analyze` runs them
+the same way (a clean build first, so it takes a few minutes).
 
 ## Setup
 
@@ -84,7 +86,7 @@ origin/<your-branch>` instead of pushing again.
 
 ### AI-assisted development
 
-The project includes a [`CLAUDE.md`](CLAUDE.md) with full architecture context. If you use [Claude Code](https://docs.anthropic.com/en/docs/claude-code), we recommend the [`/git-workflow` skill](https://github.com/pasrom/dotclaude/blob/main/skills/git-workflow/SKILL.md) for commit creation — install it via the [dotclaude](https://github.com/pasrom/dotclaude) collection.
+The project includes a [`CLAUDE.md`](CLAUDE.md) with project rules and a router to the architecture docs. If you use [Claude Code](https://docs.anthropic.com/en/docs/claude-code), we recommend the [`/git-workflow` skill](https://github.com/pasrom/dotclaude/blob/main/skills/git-workflow/SKILL.md) for commit creation — install it via the [dotclaude](https://github.com/pasrom/dotclaude) collection.
 
 ### Tests
 
@@ -94,9 +96,55 @@ All new features and bug fixes must include tests. Run the full test suite befor
 cd app/MeetingTranscriber && swift test
 ```
 
+A test counts when it fails without your change. For a fix to existing code,
+revert the fix and confirm a test goes red. When the change adds something new
+(a type, a setting, a code path), a full revert is not that check: it also
+removes the new type, so its own tests fail even when nothing calls it. Find the
+one line that carries the change into the running app (the argument that passes
+a new setting on, the allowlist entry, the condition that gates the new path),
+replace it with a constant that still compiles, and confirm a test goes red; a
+build error does not count. Running only the tests that cover it is enough
+(`swift test --filter <TestClass>`); run the full suite once, with the line
+restored. Name that line and the test in the PR template. A change with no
+behaviour to test (docs, CI, a pure refactor or move) writes "n/a" there.
+
+- A test that proves a setting is honoured uses a value other than the default:
+  with the default it passes even when the setting is ignored.
+- New UI controls: see `docs/architecture/gui-testing.md`.
+- Fill in the template's "Not checked" line, for example "not tried on a
+  multi-channel mic".
+- In code comments and the PR text, state a mechanism or a number only when you
+  measured it; otherwise say that you did not.
+
+### Hygiene
+
+- No trailers written by AI tools in commit messages: no session links (for
+  example `Claude-Session:`) and no `Co-Authored-By:` lines for an assistant.
+  Older commits on `main` still carry some; new ones should not. A human
+  co-author is fine.
+- If you used AI tools, say so in the PR description instead: which model
+  wrote the change, and which ones you used to review or simplify it. That
+  tells a reviewer what was already checked, and by what.
+- No paths from your machine in code, tests or the PR text.
+- No real names in fixtures, tests, commits or the PR text; use Speaker A, B, C.
+- Never log transcript, protocol or speaker text with `privacy: .public`.
+
+### Build variants
+
+Only if you touch package dependencies, `app/MeetingTranscriber/Entitlements/`
+or code under `#if APPSTORE` or `#if !APPSTORE`:
+
+- CI builds both variants; `./scripts/pre-push.sh --with-appstore` finds an App
+  Store build failure sooner.
+- An entitlement goes into both `Homebrew.entitlements` and
+  `AppStore.entitlements` unless only one variant needs it, and the PR says why.
+- When you rely on new behaviour of a dependency, raise its minimum version in
+  `Package.swift` to the release that has that behaviour, not only
+  `Package.resolved`.
+
 ## Submitting a PR
 
-1. One PR per feature, bug fix, or refactor — keep it focused
+1. One PR per feature, bug fix, or refactor, kept focused: no hunks the change does not need, and a move or rename goes in its own commit
 2. Rebase your branch onto `main` before opening the PR
 3. Ensure all tests pass
 4. Write a clear PR description: what changed and why
@@ -111,7 +159,7 @@ Use [GitHub Issues](https://github.com/pasrom/meeting-transcriber/issues) to rep
 
 - All code and UI text in English
 - Keep it simple — avoid over-engineering and premature abstractions
-- See [`CLAUDE.md`](CLAUDE.md) for architecture conventions
+- See [`CLAUDE.md`](CLAUDE.md) and its router for architecture conventions
 
 ## License
 

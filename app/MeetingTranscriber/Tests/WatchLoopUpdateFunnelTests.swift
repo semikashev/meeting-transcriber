@@ -2,9 +2,9 @@
 import XCTest
 
 /// Indirect coverage for the `WatchLoop.update(_:)` mutation funnel.
-/// `update` is private, so the assertions exercise it through the
-/// public entry-points (`start`, `stop`, manual recording) and inspect
-/// the resulting `snapshot` + `onStateChange` callback log.
+/// Mostly exercised through the entry points (`start`, `stop`, manual
+/// recording), inspecting the resulting `snapshot` + `onStateChange`
+/// callback log; the detail-only case calls the funnel directly.
 @MainActor
 final class WatchLoopUpdateFunnelTests: XCTestCase {
     /// A single funnel call carries co-located mutations atomically:
@@ -14,7 +14,7 @@ final class WatchLoopUpdateFunnelTests: XCTestCase {
     func testStartEmitsCoherentSnapshotTransition() {
         let (loop, _) = makeTestWatchLoop()
         var observed: [WatchLoopState] = []
-        loop.onStateChange = { [weak loop] _, _ in
+        loop.onStateChange = { [weak loop] _, _, _ in
             if let loop { observed.append(loop.snapshot) }
         }
 
@@ -32,14 +32,14 @@ final class WatchLoopUpdateFunnelTests: XCTestCase {
     func testDetailOnlyUpdateDoesNotFireOnStateChange() {
         let (loop, _) = makeTestWatchLoop()
         loop.start()
+        defer { loop.stop() }
         var phaseTransitions = 0
-        loop.onStateChange = { _, _ in phaseTransitions += 1 }
+        loop.onStateChange = { _, _, _ in phaseTransitions += 1 }
 
-        // `stopManualRecording` is a no-op when no manual recording is in
-        // flight — exercise a deeper code path instead by re-stopping
-        // the loop, which goes through the funnel with phase change.
-        loop.stop()
-        XCTAssertEqual(phaseTransitions, 1, "Phase moved watching→idle exactly once")
+        loop.update { $0.detail = "Still polling" }
+
+        XCTAssertEqual(loop.snapshot.detail, "Still polling", "the funnel must commit the detail")
+        XCTAssertEqual(phaseTransitions, 0, "a detail-only update must not report a phase change")
     }
 
     /// The phase-transition callback receives the old phase observed
@@ -49,7 +49,7 @@ final class WatchLoopUpdateFunnelTests: XCTestCase {
         let (loop, _) = makeTestWatchLoop()
         loop.start()
         var lastPair: (WatchLoop.State, WatchLoop.State)?
-        loop.onStateChange = { old, new in lastPair = (old, new) }
+        loop.onStateChange = { old, new, _ in lastPair = (old, new) }
 
         loop.stop()
 
@@ -83,7 +83,7 @@ final class WatchLoopUpdateFunnelTests: XCTestCase {
         try await loop.startManualRecording(pid: 7, appName: "Webex", title: "Sync")
         XCTAssertEqual(loop.snapshot.phase, .recording)
 
-        loop.stopManualRecording()
+        await loop.stopManualRecording()
 
         let snap = loop.snapshot
         XCTAssertEqual(snap.phase, .idle, "Phase still transitions to idle on stop failure")

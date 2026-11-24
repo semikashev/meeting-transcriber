@@ -54,6 +54,7 @@ extension PipelineQueue {
         let staged = micURL.deletingLastPathComponent()
             .appendingPathComponent("mic_16k_cancelled.wav")
         let report: EchoCancellationReport
+        let started = ContinuousClock.now
         do {
             report = try await canceller.cancelEcho(
                 micURL: micURL, referenceURL: appURL, outputURL: staged,
@@ -81,6 +82,11 @@ extension PipelineQueue {
             )
             return false
         }
+        // Timed here, between the run's return and the self-check, so the
+        // event is the canceller's cost alone and is logged for a declined run
+        // too: it took just as long. The one place the run is timed: the stage
+        // log and the job's `echo.cancellationSeconds` both get this number.
+        recordEchoCancellationTiming(jobID: jobID, startedAt: started, micURL: micURL)
 
         // Judged before it is adopted, which is the whole reason the seam hands
         // the report back before the swap. Adopting first and asking after left

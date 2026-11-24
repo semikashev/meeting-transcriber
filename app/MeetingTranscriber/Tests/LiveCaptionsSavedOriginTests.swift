@@ -40,7 +40,7 @@ final class LiveCaptionsSavedOriginTests: XCTestCase {
     /// as the saved origin when given.
     private func makeController(saved: CGPoint? = nil) throws -> (LiveCaptionsWindowController, UserDefaults) {
         let name = "captions-origin-\(getpid())-\(UUID().uuidString)"
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: name))
+        let defaults = try XCTUnwrap(DefaultsSuite.open(name))
         addTeardownBlock { DefaultsSuite.remove(name) }
         if let saved {
             defaults.set(["x": saved.x, "y": saved.y], forKey: LiveCaptionsWindowController.originDefaultsKey)
@@ -354,5 +354,34 @@ final class LiveCaptionsSavedOriginTests: XCTestCase {
                 }
             }
         }
+    }
+
+    /// Production places against the real displays through this mapping, so
+    /// the placement cases above, which build their screens by hand, rest on
+    /// it taking the full frame as the frame and the visible frame as the
+    /// visible one. Only a screen whose two frames differ can tell them
+    /// apart, so one with a menu bar or Dock showing is required.
+    func testARealScreenMapsItsFullAndVisibleFrame() throws {
+        guard let real = NSScreen.screens.first(where: { $0.frame != $0.visibleFrame }) else {
+            throw XCTSkip("no screen whose visible frame differs from its frame (no screen, or menu bar and Dock hidden)")
+        }
+        let mapped = CaptionScreen(real)
+        XCTAssertEqual(mapped.frame, real.frame)
+        XCTAssertEqual(mapped.visibleFrame, real.visibleFrame)
+    }
+
+    /// A controller built without screens places against the real displays:
+    /// every attached screen, and the main one for the default position.
+    /// Spelled out from `NSScreen` rather than through `CaptionScreen(_:)`,
+    /// so a changed default goes red even if the mapping changed with it.
+    func testTheDefaultScreensAreTheAttachedDisplays() throws {
+        try XCTSkipIf(NSScreen.screens.isEmpty, "no screen attached")
+        let (controller, _) = try makeController()
+        func plainMapped(_ screen: NSScreen) -> CaptionScreen {
+            CaptionScreen(frame: screen.frame, visibleFrame: screen.visibleFrame)
+        }
+
+        XCTAssertEqual(controller.screens(), NSScreen.screens.map(plainMapped))
+        XCTAssertEqual(controller.mainScreen(), NSScreen.main.map(plainMapped))
     }
 }

@@ -175,12 +175,33 @@ final class MicInputDetectorTests: XCTestCase {
     }
 
     func testPatternsWatchingFiltersBySelection() {
-        let all = MicInputDetector.patterns(watching: ["WeChat", "Tencent Meeting", "FaceTime", "WhatsApp"])
+        let all = MicInputDetector.patterns(watching: ["WeChat", "Tencent Meeting", "FaceTime", "WhatsApp", "Slack"])
         XCTAssertEqual(all.count, MicInputDetector.defaultPatterns.count)
         let none = MicInputDetector.patterns(watching: [])
         XCTAssertTrue(none.isEmpty)
         let one = MicInputDetector.patterns(watching: ["WeChat"])
         XCTAssertEqual(one.map(\.appName), ["WeChat"])
+    }
+
+    /// Every ID of a selected built-in counts for the dedup, not just its
+    /// first (for Tencent Meeting the second is the VooV build).
+    func testCustomEntryMatchingASecondaryBuiltInBundleIDIsDropped() throws {
+        let tencent = try XCTUnwrap(MicInputDetector.defaultPatterns.first { $0.appName == "Tencent Meeting" })
+        let secondary = try XCTUnwrap(tencent.bundleIDs.dropFirst().first)
+        let patterns = MicInputDetector.patterns(watching: ["Tencent Meeting"], customBundleIDs: [secondary])
+        XCTAssertEqual(patterns.map(\.bundleIDs), [tencent.bundleIDs])
+    }
+
+    /// The other boundary of the rule: a built-in that does not match helpers
+    /// (WeChat excludes its mini-program helpers on purpose) does not swallow
+    /// a custom entry for one.
+    func testCustomHelperEntryIsKeptWhenTheBuiltInDoesNotMatchHelpers() throws {
+        let weChat = try XCTUnwrap(MicInputDetector.defaultPatterns.first { $0.appName == "WeChat" })
+        XCTAssertFalse(weChat.matchesHelpers, "precondition: WeChat's built-in pattern does not match helpers")
+        let helper = "com.tencent.xinWeChat.IPCHelper"
+        let patterns = MicInputDetector.patterns(watching: ["WeChat"], customBundleIDs: [helper])
+        XCTAssertEqual(patterns.map(\.bundleIDs), [weChat.bundleIDs, [helper]])
+        XCTAssertEqual(patterns.map(\.usesBuiltInMeetingPattern), [true, false])
     }
 
     func testCustomAppDetectsViaHelperAndTapsMainApp() throws {
@@ -255,7 +276,7 @@ final class MicInputDetectorTests: XCTestCase {
         func detector(customApps: [String]) throws -> MicInputDetector {
             let suite = "CustomWatchWiring-\(getpid())-\(UUID().uuidString)"
             addTeardownBlock { DefaultsSuite.remove(suite) }
-            let settings = try AppSettings(defaults: XCTUnwrap(UserDefaults(suiteName: suite)))
+            let settings = try AppSettings(defaults: XCTUnwrap(DefaultsSuite.open(suite)))
             settings.watchCustomApps = customApps
             let mic = try XCTUnwrap(
                 WatchingController.defaultDetectors(settings: settings)

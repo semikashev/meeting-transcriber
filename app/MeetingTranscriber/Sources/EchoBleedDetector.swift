@@ -56,10 +56,22 @@ enum EchoBleedDetector {
     /// frequency response, which they always do.
     static let frameSeconds = 0.010
     static let windowSeconds = 10.0
-    /// The measured inter-track offset is 10 to 20 ms. A wider search adds no
-    /// reach and inflates every value, since taking a maximum over more
-    /// candidates is a multiple-comparisons bias.
-    static let maxLagSeconds = 0.2
+    /// The lag search around the recorder's own alignment, in seconds, and
+    /// asymmetric on purpose. Positive means the microphone copy arrives later.
+    ///
+    /// Bleed arrives late by the room path plus whatever the output device
+    /// adds: built-in speakers keep that small, but an external or Bluetooth
+    /// output puts the copy well past 200 ms, where a symmetric search found
+    /// nothing and the recording read as clean. Hence the longer upper edge.
+    /// The lower edge stays at 200 ms because the recorder's alignment itself
+    /// can overshoot, and narrowing it lost real detections in a replay over
+    /// the recorded calls the thresholds were calibrated on.
+    ///
+    /// Not wider than this, because taking a maximum over more candidates is a
+    /// multiple-comparisons bias that inflates every value; the same replay
+    /// found the extra 100 ms added almost no hot windows on clean calls.
+    static let earliestLagSeconds = -0.2
+    static let latestLagSeconds = 0.3
     static let correlationThreshold = 0.7
     static let affectedShareThreshold = 0.15
     /// A share is only evidence once there is something to take a share of.
@@ -73,6 +85,41 @@ enum EchoBleedDetector {
     /// anywhere. That is a different defect, handled by the channel-health path.
     static let silenceFloorDBFS = -70.0
 
+    /// When the far end is talking, judged from the app track alone. A frame
+    /// is active when its level is within `farEndActiveRangeDB` of the track's
+    /// own speech level (its `farEndLevelPercentile` frame level over the
+    /// analysed span) and above `farEndActiveFloorDBFS`; a window is far-end
+    /// active when at least `farEndActiveFrameShare` of its frames are. Relative
+    /// to the track rather than absolute, because call levels differ by tens of
+    /// dB between apps and devices, while an idle line sits far below whatever
+    /// level that call's speech has.
+    static let farEndLevelPercentile = 0.95
+    static let farEndActiveRangeDB = 25.0
+    static let farEndActiveFloorDBFS = -60.0
+    static let farEndActiveFrameShare = 0.05
+
+    /// Bleed travels one fixed path, so its windows peak at one lag even where
+    /// a louder local talker keeps them under `correlationThreshold`. The lock
+    /// is the share of scored windows peaking within `lagLockToleranceSeconds`
+    /// of the lag most hot windows peaked at. That lag has to sit at least
+    /// `lagLockEdgeMarginSeconds` inside both search edges: a clean call piles
+    /// its peaks up at an edge, wherever the correlation is still rising when
+    /// the search stops, and a pile-up there is not a path.
+    static let lagLockToleranceSeconds = 0.01
+    static let lockedShareThreshold = 0.3
+    static let lagLockEdgeMarginSeconds = 0.03
+
+    /// Which rule called a recording affected, for the log line that makes a
+    /// field report diagnosable.
+    enum Route: String {
+        /// Hot windows over every scored window: the original rule.
+        case share
+        /// Hot windows over the windows the far end talked in.
+        case farEndShare
+        /// Scored windows locked to one bleed path.
+        case lockedLag
+    }
+
     /// One window's measurement, kept so a field report is diagnosable without
     /// the audio. The lag is what separates real bleed from a coincidence: bleed
     /// peaks at a stable lag near the recorder's own track offset, whereas two
@@ -80,12 +127,38 @@ enum EchoBleedDetector {
     struct WindowScore: Equatable {
         let correlation: Double
         let lagSeconds: Double
+        /// Share of this window's frames in which the far end was talking.
+        let farEndActivity: Double
+
+        init(correlation: Double, lagSeconds: Double, farEndActivity: Double) {
+            self.correlation = correlation
+            self.lagSeconds = lagSeconds
+            self.farEndActivity = farEndActivity
+        }
+
+        var isHot: Bool {
+            correlation > EchoBleedDetector.correlationThreshold
+        }
+
+        var farEndActive: Bool {
+            farEndActivity >= EchoBleedDetector.farEndActiveFrameShare
+        }
     }
 
     struct Result: Equatable {
-        /// Per-window measurements, in order, and the only stored state.
+        /// Every analysed window in order, `nil` where an envelope was flat and
+        /// the window could not be scored. Kept with its gaps so the n-th entry
+        /// is the n-th ten seconds of the recording.
+        let windows: [WindowScore?]
+        /// The microphone delay the search was centred on, so a lag can be
+        /// read relative to the centre.
+        let micDelay: TimeInterval
+
+        /// The scored windows only, in order, which is what every rule counts.
         /// Never empty: a `Result` is only produced once a window scored.
-        let windowScores: [WindowScore]
+        var windowScores: [WindowScore] {
+            windows.compactMap(\.self)
+        }
 
         var windowsScored: Int {
             windowScores.count
@@ -95,7 +168,7 @@ enum EchoBleedDetector {
         /// the evidence it summarises cannot disagree — and so the threshold
         /// lives next to the field it defines instead of in the scoring loop.
         var windowsAffected: Int {
-            windowScores.count { $0.correlation > EchoBleedDetector.correlationThreshold }
+            windowScores.count(where: \.isHot)
         }
 
         /// Share of 10 s windows whose two tracks carry the same audio.
@@ -103,11 +176,85 @@ enum EchoBleedDetector {
             windowsScored > 0 ? Double(windowsAffected) / Double(windowsScored) : 0
         }
 
-        var isAffected: Bool {
-            windowsScored >= EchoBleedDetector.minScoredWindows
-                && windowsAffected >= EchoBleedDetector.minAffectedWindows
-                && affectedWindowShare > EchoBleedDetector.affectedShareThreshold
+        /// The lag most hot windows peaked at, in frames from the search
+        /// centre, and how many scored windows peaked within the tolerance of
+        /// it. `nil` when no window is hot, since the mode is taken over the
+        /// hot windows only: a cold window's peak lag is wherever a coincidence
+        /// put it. Ties go to the lag that locks the most windows, then to the
+        /// one the earliest hot window peaked at (`max(by:)` keeps the first of
+        /// equal elements).
+        private func lagLock(_ scores: [WindowScore]) -> (offset: Int, locked: Int)? {
+            let centre = EchoBleedDetector.frames(-micDelay)
+            let offsets = scores.map { EchoBleedDetector.frames($0.lagSeconds) - centre }
+            var counts: [Int: Int] = [:]
+            var firstSeen: [Int] = []
+            for (score, offset) in zip(scores, offsets) where score.isHot {
+                if counts[offset] == nil { firstSeen.append(offset) }
+                counts[offset, default: 0] += 1
+            }
+            guard let top = counts.values.max() else { return nil }
+            let tolerance = EchoBleedDetector.frames(EchoBleedDetector.lagLockToleranceSeconds)
+            return firstSeen
+                .filter { counts[$0] == top }
+                .map { mode in (offset: mode, locked: offsets.count { abs($0 - mode) <= tolerance }) }
+                .max { $0.locked < $1.locked }
         }
+
+        /// Every rule that calls this recording affected, in the order above.
+        /// The share over every scored window is the original rule. The share
+        /// over the far-end windows catches a call where the far end talks in
+        /// few windows and bleeds in all of them, which the first rule dilutes
+        /// with windows nothing came out of the loudspeaker in. The lag lock
+        /// catches bleed masked by a louder local talker, which keeps all but a
+        /// few windows under the per-window threshold but not off the path.
+        var routes: [Route] {
+            let scores = windowScores
+            let hot = scores.count(where: \.isHot)
+            var fired: [Route] = []
+            if EchoBleedDetector.sharePasses(scored: scores.count, hot: hot) {
+                fired.append(.share)
+            }
+            let farEnd = scores.filter(\.farEndActive)
+            if EchoBleedDetector.sharePasses(scored: farEnd.count, hot: farEnd.count(where: \.isHot)) {
+                fired.append(.farEndShare)
+            }
+            if lagLockPasses(scores, hot: hot) {
+                fired.append(.lockedLag)
+            }
+            return fired
+        }
+
+        var isAffected: Bool {
+            !routes.isEmpty
+        }
+
+        /// The same two floors as the share rules, then a lock on a lag that
+        /// is not an edge of the search.
+        private func lagLockPasses(_ scores: [WindowScore], hot: Int) -> Bool {
+            guard EchoBleedDetector.floorsPass(scored: scores.count, hot: hot),
+                  let lock = lagLock(scores),
+                  Double(lock.locked) / Double(scores.count) > EchoBleedDetector.lockedShareThreshold
+            else { return false }
+            let margin = EchoBleedDetector.frames(EchoBleedDetector.lagLockEdgeMarginSeconds)
+            return EchoBleedDetector.frames(EchoBleedDetector.earliestLagSeconds) + margin <= lock.offset
+                && lock.offset <= EchoBleedDetector.frames(EchoBleedDetector.latestLagSeconds) - margin
+        }
+    }
+
+    /// Seconds as a whole number of envelope frames, rounded the way the
+    /// search centre is.
+    private static func frames(_ seconds: Double) -> Int {
+        Int((seconds / frameSeconds).rounded())
+    }
+
+    /// The two floors every route has to clear, in one place so they cannot
+    /// drift apart between routes.
+    private static func floorsPass(scored: Int, hot: Int) -> Bool {
+        scored >= minScoredWindows && hot >= minAffectedWindows
+    }
+
+    private static func sharePasses(scored: Int, hot: Int) -> Bool {
+        floorsPass(scored: scored, hot: hot) && Double(hot) / Double(scored) > affectedShareThreshold
     }
 
     /// Returns `nil` when no honest verdict is possible: either track silent, or
@@ -144,7 +291,7 @@ enum EchoBleedDetector {
         // one whole window.
         let windows = appEnvelope.count / framesPerWindow
 
-        let maxLag = Int(maxLagSeconds / frameSeconds)
+        let offsets = frames(earliestLagSeconds) ... frames(latestLagSeconds)
         // Negative, and the sign is the whole point. `micDelay > 0` means the
         // mic started LATE, so its file is missing that opening stretch and its
         // copy of the app audio sits *earlier* in file-index terms — the same
@@ -153,23 +300,25 @@ enum EchoBleedDetector {
         // `peakCorrelation` pairs `app[k]` with `mic[k + lag]`, so the match is
         // at `lag = -micDelay`. Getting this backwards is worse than passing no
         // delay at all: it searches twice the offset away from the peak.
-        let centreLag = -Int((micDelay / frameSeconds).rounded())
-        let scores = (0 ..< windows).compactMap { w -> WindowScore? in
+        let centreLag = frames(-micDelay)
+        let activity = farEndActivity(appEnvelope[0 ..< (windows * framesPerWindow)], framesPerWindow: framesPerWindow)
+        let scores = (0 ..< windows).map { w -> WindowScore? in
             let range = (w * framesPerWindow) ..< ((w + 1) * framesPerWindow)
             guard let peak = peakCorrelation(
                 appEnvelope[range],
                 micEnvelope[range],
-                maxLag: maxLag,
+                offsets: offsets,
                 centre: centreLag,
             )
             else { return nil }
             return WindowScore(
                 correlation: peak.correlation,
                 lagSeconds: Double(peak.lag) * frameSeconds,
+                farEndActivity: activity[w],
             )
         }
-        guard !scores.isEmpty else { return nil }
-        return Result(windowScores: scores)
+        guard scores.contains(where: { $0 != nil }) else { return nil }
+        return Result(windows: scores, micDelay: micDelay)
     }
 
     // MARK: - Pieces
@@ -197,17 +346,48 @@ enum EchoBleedDetector {
         return out
     }
 
+    /// Per window, the share of frames in which the far end was talking (see
+    /// `farEndLevelPercentile`). The percentile is taken over the whole span
+    /// passed in, which is every frame that belongs to a window: a non-empty
+    /// whole number of windows, so neither helper needs an empty or ragged case.
+    private static func farEndActivity(_ envelope: ArraySlice<Double>, framesPerWindow: Int) -> [Double] {
+        // A digital-zero frame gets a finite, very low level rather than -inf,
+        // so it sorts below everything and is never active.
+        let levels = envelope.map { 20 * log10(max($0, 1e-10)) }
+        let threshold = max(
+            percentile(levels.sorted(), farEndLevelPercentile) - farEndActiveRangeDB,
+            farEndActiveFloorDBFS,
+        )
+        return stride(from: 0, to: levels.count, by: framesPerWindow).map { start in
+            let window = levels[start ..< (start + framesPerWindow)]
+            return Double(window.count { $0 > threshold }) / Double(window.count)
+        }
+    }
+
+    /// Linear interpolation between the closest ranks, so `p` of 0.95 over a
+    /// short span does not jump from one frame's level to the next.
+    private static func percentile(_ sorted: [Double], _ p: Double) -> Double {
+        let position = p * Double(sorted.count - 1)
+        let lower = Int(position.rounded(.down))
+        let upper = min(lower + 1, sorted.count - 1)
+        return sorted[lower] + (sorted[upper] - sorted[lower]) * (position - Double(lower))
+    }
+
     /// Highest normalised correlation of `b` against `a` over the lag range, and
     /// the lag it peaked at. `nil` when either side is flat in this window,
-    /// which carries no evidence either way.
+    /// which carries no evidence either way. `offsets` is in frames around
+    /// `centre`; a candidate that leaves too little overlap is skipped, which
+    /// keeps a large `micDelay` from reading out of bounds. A delay longer than
+    /// a window skips every candidate, so no window scores and there is no
+    /// verdict.
     private static func peakCorrelation(
         _ a: ArraySlice<Double>,
         _ b: ArraySlice<Double>,
-        maxLag: Int,
+        offsets: ClosedRange<Int>,
         centre: Int,
     ) -> (correlation: Double, lag: Int)? {
         var best: (correlation: Double, lag: Int)?
-        for offset in -maxLag ... maxLag {
+        for offset in offsets {
             let lag = centre + offset
             // Shifting `b` right by `lag` and clipping both to the part that
             // still overlaps. Written once rather than as a mirrored pair of

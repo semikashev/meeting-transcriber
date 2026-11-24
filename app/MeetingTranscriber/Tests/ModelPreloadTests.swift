@@ -57,4 +57,15 @@ final class ModelPreloadTests: XCTestCase {
         let manager = StreamingEouAsrManager(chunkSize: .ms320, eouDebounceMs: 1280)
         try await manager.loadModels()
     }
+
+    /// The pyannote segmentation + WeSpeaker embedding models, from their own
+    /// HuggingFace repo. Several `LiveSpeakerMatcherTests` load them, and
+    /// `--parallel` can run those in separate worker processes, so a cold cache
+    /// (a fresh per-runner test home on the self-hosted Mini) would otherwise
+    /// race on the download.
+    /// Mirrors `LiveSpeakerMatcher`'s own load, with the compute units every
+    /// production path uses, so the warm-up compiles the routing that ships.
+    func testPreloadDiarizerModels() async throws {
+        _ = try await FluidOfflineProcessor.loadDiarizerModels(computeUnits: FluidOfflineProcessor.computeUnits)
+    }
 }

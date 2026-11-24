@@ -76,7 +76,8 @@ final class WhisperKitLocalSnapshotTests: XCTestCase {
     /// suffix one. For the six variants this app offers, the library's own
     /// `*<variant>/*` glob resolves to exactly one folder of the same name, so no
     /// fixture built from those names can tell an exact match from a suffix match.
-    /// Only a prefixed neighbour could, and the repository publishes none.
+    /// Only a prefixed neighbour could; the stock repository publishes none, and the
+    /// test below builds one the way a custom repository can.
     func testLocateIgnoresACompleteSiblingVariant() throws {
         let root = try makeTempDirectory(prefix: "wk-snapshot")
         try writeSnapshot(variant: "openai_whisper-large-v3-v20240930_turbo", in: root)
@@ -84,6 +85,59 @@ final class WhisperKitLocalSnapshotTests: XCTestCase {
         XCTAssertNil(
             WhisperKitLocalSnapshot.locate(variant: "openai_whisper-large-v3", in: root),
             "Only the requested variant counts, a different complete one must not be served",
+        )
+    }
+
+    /// The suffix case the sibling test cannot reach. WhisperKit's downloader matches
+    /// `*<variant>/*`, so a variant typed as the tail of the real folder name fetches
+    /// that folder into the cache under its real name. The locator must not serve it
+    /// for the typed name: the download step refuses the mismatch and names the real
+    /// folder, and a locator that matched by suffix would quietly load what the
+    /// download step just refused.
+    func testLocateDoesNotServeAFolderThatMerelyEndsInTheVariant() throws {
+        let root = try makeTempDirectory(prefix: "wk-snapshot")
+        try writeSnapshot(variant: "flix-swissgerman-large-v3_8bit", in: root)
+
+        XCTAssertNil(
+            WhisperKitLocalSnapshot.locate(variant: "large-v3_8bit", in: root),
+            "A folder that merely ends in the variant is another model and must not be loaded for it",
+        )
+    }
+
+    /// A picked folder is never downloaded, so it has to carry the tokenizer that a
+    /// Hub variant gets through the download cache.
+    func testAModelFolderNeedsItsTokenizer() throws {
+        let root = try makeTempDirectory(prefix: "wk-snapshot")
+        try writeSnapshot(variant: "finetune", in: root)
+        let folder = root.appendingPathComponent("finetune", isDirectory: true)
+
+        XCTAssertNil(WhisperKitLocalSnapshot.firstMissingFile(in: folder), "A Hub variant is complete without it")
+        XCTAssertEqual(WhisperKitLocalSnapshot.checkModelFolder(folder), .folderIncomplete(missing: "tokenizer.json"))
+
+        for file in WhisperKitLocalSnapshot.requiredTokenizerFiles {
+            try Data("{}".utf8).write(to: folder.appendingPathComponent(file))
+        }
+        XCTAssertNil(WhisperKitLocalSnapshot.checkModelFolder(folder))
+    }
+
+    func testAFileIsNotAModelFolder() throws {
+        let file = try makeTempDirectory(prefix: "wk-snapshot").appendingPathComponent("model.bin")
+        try Data("x".utf8).write(to: file)
+
+        XCTAssertEqual(WhisperKitLocalSnapshot.checkModelFolder(file), .folderUnavailable)
+    }
+
+    /// A custom repository is looked up where the downloader writes it: next to the
+    /// stock one, under its own `<owner>/<name>`.
+    func testEachRepositoryHasItsOwnRootUnderTheSameBase() {
+        let stock = WhisperKitLocalSnapshot.defaultRepoRoot
+        let custom = WhisperKitLocalSnapshot.repoRoot(for: "spert/flix-swissgerman-whisperkit")
+
+        XCTAssertEqual(stock, WhisperKitLocalSnapshot.repoRoot(for: WhisperKitLocalSnapshot.repoID))
+        XCTAssertEqual(
+            custom.standardizedFileURL.path,
+            stock.deletingLastPathComponent().deletingLastPathComponent()
+                .appendingPathComponent("spert/flix-swissgerman-whisperkit").standardizedFileURL.path,
         )
     }
 
@@ -95,7 +149,7 @@ final class WhisperKitLocalSnapshotTests: XCTestCase {
     /// `locate` returned nil for every variant forever: each load would go back through
     /// the download and reintroduce issue #736 offline, with nothing but an os_log line
     /// to show for it. This one goes through
-    /// `WhisperKitModelSource.production.locateLocal`, so it covers the composition as
+    /// `WhisperKitModelSource.production(for:)`, so it covers the composition as
     /// well: the repository id, the root, the bundle names and the per-bundle file
     /// names, all against a model the downloader actually wrote.
     ///
@@ -113,12 +167,17 @@ final class WhisperKitLocalSnapshotTests: XCTestCase {
     /// Skips only where nothing has been fetched at all, so it guards a developer
     /// machine and the self-hosted runner rather than gating a clean CI box.
     ///
+    /// A custom model fetched from another repository sits under the same base, so
+    /// each candidate is checked against the repository it was found in, and a stock
+    /// one is preferred: that is the only case that exercises `repoID` itself, which
+    /// is why the stock id is spelled out here instead of read from the constant.
+    ///
     /// One drift it still cannot see, stated rather than papered over: the search root
     /// is derived from `defaultRepoRoot`, so a change in the *depth* of
     /// `HubApiWrapper.localRepoLocation` moves both and the test skips again (measured
-    /// by mutation). Deriving the root independently would mean rebuilding
-    /// `Documents/huggingface` by hand, which is exactly the duplication the locator
-    /// avoids. That drift is a library contract rather than a name this repo borrowed,
+    /// by mutation). Deriving the root independently would mean rebuilding the
+    /// `<download base>/models/<repo>` layout by hand, which is exactly the
+    /// duplication the locator avoids. That drift is a library contract rather than a name this repo borrowed,
     /// and it would also break the online download path, which the real-model tests
     /// cover.
     @MainActor
@@ -138,24 +197,28 @@ final class WhisperKitLocalSnapshotTests: XCTestCase {
         }
 
         // models/<org>/<repo>/<variant>, the layout the Hub downloader writes.
-        var fetched: [String] = []
+        let stockRepoID = "argmaxinc/whisperkit-coreml"
+        var fetched: [(rank: Int, repoID: String, variant: String)] = []
         for org in entries(modelsRoot) {
             let orgURL = modelsRoot.appendingPathComponent(org, isDirectory: true)
             for repo in entries(orgURL) {
                 let repoURL = orgURL.appendingPathComponent(repo, isDirectory: true)
+                let repoID = "\(org)/\(repo)"
                 for variant in entries(repoURL)
                     where bundleCount(repoURL.appendingPathComponent(variant, isDirectory: true)) >= required {
-                    fetched.append(variant)
+                    fetched.append((rank: repoID == stockRepoID ? 0 : 1, repoID: repoID, variant: variant))
                 }
             }
         }
-        guard let variant = fetched.min() else {
+        guard let model = fetched.min(by: { ($0.rank, $0.variant) < ($1.rank, $1.variant) }) else {
             throw XCTSkip("no fully fetched CoreML model anywhere under the download base, nothing to check the borrowed names against")
         }
+        let origin: WhisperKitModelOrigin = model.repoID == stockRepoID ? .stock : .hub(repoID: model.repoID)
+        let variant = model.variant
 
         XCTAssertNotNil(
-            WhisperKitModelSource.production.locateLocal(variant),
-            "The production wiring must find the fetched model \(variant). A nil here means the "
+            WhisperKitModelSource.production(for: origin).locateLocal(variant),
+            "The production wiring must find the fetched model \(model.repoID)/\(variant). A nil here means the "
                 + "repository id, the root, or the borrowed bundle or file names no longer match what "
                 + "the downloader writes, so every load silently falls back to the Hub and issue #736 "
                 + "is back offline",

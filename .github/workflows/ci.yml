@@ -65,9 +65,9 @@ jobs:
       # workspace; the action otherwise hits the GitHub API for the file
       # list but still needs the filter definition locally.
       - if: github.event_name == 'pull_request'
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - if: github.event_name == 'pull_request'
-        uses: dorny/paths-filter@v4
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d  # v4.0.3
         id: filter
         with:
           # `every` is required for the exclusion-style filter in
@@ -79,24 +79,26 @@ jobs:
           filters: .github/filters.yml
 
   # Advisory by design: this job is NOT among the required checks and must never
-  # be the thing that stops a merge. `main` is not at stake either way, and
-  # scripts/ci/check-merge-commits.sh carries the reason. What it protects is the
-  # review of the open PR, which a merge commit makes unreadable commit by commit.
+  # be the thing that stops a merge. It runs two checks on the PR's own commits:
+  # merge commits (scripts/ci/check-merge-commits.sh carries the reason; a merge
+  # commit makes the open PR unreadable commit by commit) and trailers written by
+  # AI tools (scripts/ci/check-tool-trailers.sh). `main` is not at stake either way.
   #
-  # Two deliberate deviations from the house pattern in the jobs below:
-  #   - No `Cancel run on failure` step. A check that blocks nothing must not take
-  #     the macOS jobs down with it: the contributor still needs to see whether
-  #     their actual change builds and passes.
+  # Two deliberate choices, compared with the build and test jobs below:
+  #   - No `Cancel run on failure` step (`lint` and `analyze` have none either).
+  #     A check that blocks nothing must not take the macOS jobs down with it:
+  #     the contributor still needs to see whether their actual change builds
+  #     and passes.
   #   - Not gated on `changes`. A merge commit is worth reporting whichever files
   #     the PR touches, and this costs seconds on a free runner.
-  merge-commit-check:
+  branch-hygiene:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           # Three non-default inputs, each load-bearing. `ref`: the default
           # checkout for a pull_request event is refs/pull/N/merge, a merge commit
@@ -117,6 +119,12 @@ jobs:
         env:
           BASE_REF: ${{ github.event.pull_request.base.ref }}
         run: bash scripts/ci/check-merge-commits.sh "origin/$BASE_REF"
+      # Runs even when the merge-commit step failed, so one finding never hides the other.
+      - name: Check for AI tool trailers
+        if: ${{ !cancelled() }}
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: bash scripts/ci/check-tool-trailers.sh "origin/$BASE_REF"
 
   lint:
     needs: changes
@@ -124,15 +132,18 @@ jobs:
     if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true') }}
     runs-on: xcode-27
     env:
-      # Xcode 27.0 by its own path rather than /Applications/Xcode.app: the image also
-      # ships 27.1 and a 27.2 beta, and a moved default must never reach a build here.
-      DEVELOPER_DIR: /Applications/Xcode_27.0.app/Contents/Developer
+      # Xcode 27.2 by its own path rather than /Applications/Xcode.app: the image also
+      # ships 27.0 and 27.1, and a moved default must never reach a build here.
+      DEVELOPER_DIR: /Applications/Xcode_27.2.app/Contents/Developer
     timeout-minutes: 10
+    # No `Cancel run on failure` step, and so no `actions: write`: a required
+    # check that blocks the merge on its own, and a red lint says nothing about
+    # the build or tests the cancel would throw away (see that action's
+    # description).
     permissions:
       contents: read
-      actions: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       # Both linters are pinned to an exact release *and* an exact checksum,
       # rather than installed with `brew install`. Why: scripts/tool-versions.sh.
       # How: scripts/ci/install-lint-tool.sh. Verification is a separate step
@@ -164,9 +175,6 @@ jobs:
             echo "==> $t"
             bash "$t"
           done
-      - name: Cancel run on failure
-        if: failure()
-        uses: ./.github/actions/cancel-on-failure
 
   analyze:
     needs: changes
@@ -174,19 +182,28 @@ jobs:
     if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true') }}
     runs-on: xcode-27
     env:
-      # Xcode 27.0 by its own path rather than /Applications/Xcode.app: the image also
-      # ships 27.1 and a 27.2 beta, and a moved default must never reach a build here.
-      DEVELOPER_DIR: /Applications/Xcode_27.0.app/Contents/Developer
+      # Xcode 27.2 by its own path rather than /Applications/Xcode.app: the image also
+      # ships 27.0 and 27.1, and a moved default must never reach a build here.
+      DEVELOPER_DIR: /Applications/Xcode_27.2.app/Contents/Developer
     timeout-minutes: 30
+    # No `Cancel run on failure` step, and so no `actions: write`, as in `lint`.
+    # A compile error, the one failure this shares with `test`, fails the `test`
+    # legs by itself.
     permissions:
       contents: read
-      actions: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: Install pinned SwiftLint
         run: bash scripts/ci/install-lint-tool.sh swiftlint
       - name: Verify pinned SwiftLint
         run: bash scripts/ci/install-lint-tool.sh swiftlint --verify
+      # Retried, so a 504 on a binary-target download does not fail the build.
+      # The build below must keep using the default package location (no
+      # -derivedDataPath / -clonedSourcePackagesDirPath) to reuse this result.
+      - name: Resolve packages
+        timeout-minutes: 20
+        run: cd app/MeetingTranscriber && bash "$GITHUB_WORKSPACE/scripts/ci/resolve-packages.sh" -scheme MeetingTranscriber
+      # `scripts/lint.sh --analyze` mirrors this step locally; keep the two in step.
       - name: Build & Analyze
         run: |
           # pipefail: without it `xcodebuild ... | tee` masks an xcodebuild
@@ -217,10 +234,11 @@ jobs:
           # change: output identical after the strip, +14 s on a 212 s run.
           swiftlint analyze --strict --compiler-log-path /tmp/xcodebuild.log --reporter github-actions-logging 2>&1 \
             | bash scripts/ci/type-check-timings.sh strip
-      # Non-gating by construction: the 300 ms limit in Package.swift stays the
-      # only enforcement. `continue-on-error` keeps any report problem from
-      # failing the job, including the script's own exit 1 when it found no
-      # timings, which then shows as a tolerated step failure plus a warning
+      # Non-gating by construction: the limits in the Package.swift manifests
+      # (app 1000 ms, AudioTapLib 300 ms) stay the only enforcement.
+      # `continue-on-error` keeps any report problem from failing the job,
+      # including the script's own exit 1 when it found no timings, which then
+      # shows as a tolerated step failure plus a warning
       # annotation rather than as an empty table. Runs after a failed build
       # too: when the gate fires, the bodies measured before the error are
       # exactly the ones to read.
@@ -228,9 +246,6 @@ jobs:
         if: success() || failure()
         continue-on-error: true
         run: bash scripts/ci/type-check-timings.sh report /tmp/xcodebuild.log --root "$GITHUB_WORKSPACE"
-      - name: Cancel run on failure
-        if: failure()
-        uses: ./.github/actions/cancel-on-failure
 
   test:
     needs: changes
@@ -238,24 +253,26 @@ jobs:
     if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true') }}
     runs-on: xcode-27
     env:
-      # Xcode 27.0 by its own path rather than /Applications/Xcode.app: the image also
-      # ships 27.1 and a 27.2 beta, and a moved default must never reach a build here.
-      DEVELOPER_DIR: /Applications/Xcode_27.0.app/Contents/Developer
+      # Xcode 27.2 by its own path rather than /Applications/Xcode.app: the image also
+      # ships 27.0 and 27.1, and a moved default must never reach a build here.
+      DEVELOPER_DIR: /Applications/Xcode_27.2.app/Contents/Developer
     # 25 min job-timeout = 20 min setup (cold cache) + ~5 min margin. The
-    # `Swift tests` step below has its own 18 min step-timeout so a hang
-    # surfaces as `timed_out` (clearly distinguishable from cancellation),
-    # not the opaque `cancelled` a bare job-timeout produces. See
-    # docs/plans/.local/open/2026-05-11-job-timeout-visibility.md.
+    # `Build tests` and `Swift tests` steps below have step-timeouts of
+    # their own so a hang there surfaces as `timed_out` (clearly
+    # distinguishable from cancellation), not the opaque `cancelled` a bare
+    # job-timeout produces; on a cold cache the job budget, not a step's,
+    # is still what runs out first.
     timeout-minutes: 25
     permissions:
       contents: read
       actions: write
     strategy:
       # Both Homebrew and AppStore variants must pass. fail-fast: false NOT to
-      # keep the sibling running on failure — the `Cancel run on failure` step
-      # below cancels the whole run on any failure — but so the failing leg runs
-      # that step and names itself the culprit in the run summary, instead of
-      # being silently auto-cancelled by the matrix before it can.
+      # keep the sibling running when a leg's build or tests fail — the
+      # `Cancel run on failure` step below cancels the whole run then — but so
+      # the failing leg runs that step and names itself the culprit in the run
+      # summary, instead of being silently auto-cancelled by the matrix before
+      # it can.
       fail-fast: false
       matrix:
         variant: [homebrew, appstore]
@@ -266,15 +283,18 @@ jobs:
             swift-flags: "-Xswiftc -DAPPSTORE"
     name: test (${{ matrix.variant }})
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       # 20 min covers SPM + ML cache restore plus the cold-cache pre-warm
       # download; well below the 25 min job timeout so a hung download
       # surfaces as a step failure, not a job-timeout.
       - uses: ./.github/actions/setup-swift-test
+        id: setup
         timeout-minutes: 20
         with:
           cache-key-suffix: ${{ matrix.variant }}
           swift-flags: ${{ matrix.swift-flags }}
+      # The ffmpeg-tier tests fail on a runner without ffmpeg (see the action).
+      - uses: ./.github/actions/setup-ffmpeg
       # Without this the echo-cancellation tests skip, which is how this
       # feature reached a review with single-digit patch coverage on the two
       # files that do the work. The gap is worse than the number: the library
@@ -285,14 +305,42 @@ jobs:
       # adds no network dependency that CI did not have.
       - name: Fetch the echo-cancellation model
         run: echo "MEETINGTRANSCRIBER_LOCALVQE_MODEL=$(./scripts/fetch-localvqe-model.sh)" >> "$GITHUB_ENV"
-      # 18 min step-timeout on the actual tests: typical hot-cache run is
-      # 5–7 min, so this is ~3× margin while still failing fast as
-      # `timed_out` (not `cancelled`) when a single test hangs.
-      # `--enable-code-coverage` adds ~10–15 % runtime and writes a
-      # `default.profdata` next to the xctest bundle.
+      # Build and run are separate steps so each has a timeout of its own and
+      # the run summary shows where the time went. Step timeouts fail as
+      # `timed_out`, which a bare job timeout would report as `cancelled`.
+      - name: Build tests
+        id: build-tests
+        timeout-minutes: 15
+        run: cd app/MeetingTranscriber && swift build --build-tests --enable-code-coverage ${{ matrix.swift-flags }}
+      # Three shards for the runner's three vCPUs, not `swift test --parallel`,
+      # which starts one process per test method; the header of
+      # scripts/ci/test-shards.sh has the measurements and what the script
+      # guarantees. `--coverage` leaves the `default.profdata` that export-lcov
+      # reads. ModelPreloadTests is a cache pre-warm, not a test, and runs in
+      # setup-swift-test on a cache miss. 15 min step-timeout: the first hosted
+      # runs took 2 min (homebrew) and 4.5 min (appstore) on a hot cache, and
+      # the two legs' runners differed by 2x on a similar test count, so this
+      # is ~3x margin over the slow leg while still failing as `timed_out`.
+      # `--out` keeps the logs and raw profiles outside `.build`, which the
+      # SPM cache would otherwise save and restore.
       - name: Swift tests
-        timeout-minutes: 18
-        run: cd app/MeetingTranscriber && swift test --parallel --enable-code-coverage --skip ModelPreloadTests ${{ matrix.swift-flags }}
+        id: swift-tests
+        timeout-minutes: 15
+        run: cd app/MeetingTranscriber && ../../scripts/ci/test-shards.sh run --shards 3 --skip ModelPreloadTests --coverage --out "$RUNNER_TEMP/test-shards"
+      # The shard logs are what `test-shards.sh weights` regenerates the weights
+      # file from, and a plan is only balanced for the machine the weights were
+      # measured on, so the logs of this runner are kept. On a red run they also
+      # hold more of a dead shard than the 300 lines the step prints.
+      - name: Keep the shard logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: test-shard-logs-${{ matrix.variant }}
+          path: |
+            ${{ runner.temp }}/test-shards/shard-*.log
+            ${{ runner.temp }}/test-shards/plan.tsv
+          if-no-files-found: ignore
+          retention-days: 14
       # `tools/mt-cli` has its own test target, and until now nothing built it:
       # `swift build` skips test targets, and the only gate that touched the
       # test FILES was scripts/lint.sh, which formats and lints them without
@@ -307,7 +355,30 @@ jobs:
       # green and the pull request mergeable. Homebrew leg only: mt-cli is a
       # development client with no App Store variant, so the appstore leg would
       # repeat the identical run. About 13 s cold, 31 tests.
+      #
+      # The compiler part of the key comes from the setup step above, which
+      # leaves `cache-spm` at its default; with it off that output is empty and
+      # the key would carry no compiler.
+      #
+      # Its build tree is cached under a key that covers everything that goes
+      # into it (compiler, manifest, dependencies, sources, tests), with no
+      # fallback to an older tree: a hit is a tree built from identical inputs,
+      # any change is a cold build. A hit does not skip the compile, though:
+      # the checkout stamps the sources with new modification times, so mt-cli
+      # itself is rebuilt either way. What a hit saves is the dependency
+      # checkout and its build. Uncached, this step took 31 to 58 s.
+      #
+      # Only restored here; the `Save mt-cli build` step at the end of the job
+      # saves it, on `main` only (see there).
+      - name: Restore mt-cli build
+        id: mt-cli-cache
+        if: matrix.variant == 'homebrew'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: tools/mt-cli/.build
+          key: mt-cli-spm-${{ runner.os }}-${{ steps.setup.outputs.toolchain }}-${{ hashFiles('tools/mt-cli/Package.swift', 'tools/mt-cli/Package.resolved') }}-${{ hashFiles('tools/mt-cli/Sources/**', 'tools/mt-cli/Tests/**') }}
       - name: mt-cli tests
+        id: mt-cli-tests
         if: matrix.variant == 'homebrew'
         timeout-minutes: 5
         run: cd tools/mt-cli && swift test --parallel
@@ -319,8 +390,41 @@ jobs:
           package-dir: app/MeetingTranscriber
           flag: ${{ matrix.variant }}
           codecov-token: ${{ secrets.CODECOV_TOKEN }}
+      # The mt-cli tree is saved here, at the end of the job, so that only a
+      # green job saves it, and only for a run on `main` (push or
+      # workflow_dispatch; `github.ref` of a pull request is
+      # `refs/pull/<n>/merge`). A pull request would otherwise add an entry to
+      # its own scope on every push that changes mt-cli, which no other ref
+      # can read and which counts against the repository's cache budget. A
+      # run on `main` that restored the exact key has nothing new to save.
+      - name: Save mt-cli build
+        if: >-
+          success() && matrix.variant == 'homebrew' &&
+          github.ref == 'refs/heads/main' &&
+          steps.mt-cli-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: tools/mt-cli/.build
+          key: ${{ steps.mt-cli-cache.outputs.cache-primary-key }}
+      # Cancels the run only when this leg's own build or tests failed, since
+      # that is when the run is known red for a reason that needs a new push,
+      # and the remaining legs are spent effort. A failure in setup (cache,
+      # downloads) or in the shard-log upload is usually no verdict on the
+      # code and a rerun of just that leg fixes it, so it does not take the
+      # sibling leg and the other jobs down with it. One accepted limit: on a model-cache
+      # miss the pre-warm in setup-swift-test compiles the test target, so a
+      # compile error can fail there and then cancels nothing; the leg still
+      # fails. A timed-out step shows as `timed_out` in the run summary, but
+      # its `steps.<id>.outcome` is `failure`, so a hang that hits its step
+      # timeout still cancels. One that runs into the 25 min job timeout first,
+      # possible on a cold cache, ends the job `cancelled` and cancels nothing.
       - name: Cancel run on failure
-        if: failure()
+        if: >-
+          failure() && (
+            steps.build-tests.outcome == 'failure' ||
+            steps.swift-tests.outcome == 'failure' ||
+            steps.mt-cli-tests.outcome == 'failure'
+          )
         uses: ./.github/actions/cancel-on-failure
         with:
           job-name: test (${{ matrix.variant }})
@@ -336,24 +440,29 @@ jobs:
     if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true') }}
     runs-on: xcode-27
     env:
-      # Xcode 27.0 by its own path rather than /Applications/Xcode.app: the image also
-      # ships 27.1 and a 27.2 beta, and a moved default must never reach a build here.
-      DEVELOPER_DIR: /Applications/Xcode_27.0.app/Contents/Developer
+      # Xcode 27.2 by its own path rather than /Applications/Xcode.app: the image also
+      # ships 27.0 and 27.1, and a moved default must never reach a build here.
+      DEVELOPER_DIR: /Applications/Xcode_27.2.app/Contents/Developer
     timeout-minutes: 10
     permissions:
       contents: read
       actions: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       # No ML model dependencies — a plain SPM cache keyed off the
-      # manifest is enough to drop cold-compile cost on repeat runs.
-      - uses: actions/cache@v6
+      # manifest is enough to drop cold-compile cost on repeat runs. Only
+      # restored here; `Save audiotap build` at the end of the job saves it, on
+      # `main` only.
+      - name: Restore audiotap build
+        id: audiotap-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: tools/audiotap/.build
           key: audiotap-spm-${{ runner.os }}-${{ hashFiles('tools/audiotap/Package.swift') }}
           restore-keys: |
             audiotap-spm-${{ runner.os }}-
       - name: Swift tests
+        id: swift-tests
         timeout-minutes: 5
         run: cd tools/audiotap && swift test --parallel --enable-code-coverage
       - uses: ./.github/actions/export-lcov
@@ -362,6 +471,27 @@ jobs:
           package-dir: tools/audiotap
           flag: audiotap
           codecov-token: ${{ secrets.CODECOV_TOKEN }}
+      # Saved at the end of the job so that only a green job saves, and only
+      # for a run on `main` (see `Save mt-cli build` in `test` for why). A hit
+      # on a restore-keys fallback is not an exact hit, so the entry for the
+      # new manifest is still saved then.
+      - name: Save audiotap build
+        if: >-
+          success() && github.ref == 'refs/heads/main' &&
+          steps.audiotap-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: tools/audiotap/.build
+          key: ${{ steps.audiotap-cache.outputs.cache-primary-key }}
+      # Load-bearing, unlike in `lint` and `analyze`: this job is NOT a required
+      # check, so cancelling the still-running required `test` legs is the only
+      # way a failing AudioTapLib test blocks the merge (see the mt-cli step in
+      # `test` for the limit of that). Scoped to the test step, so that a
+      # failure elsewhere, such as the coverage export, does not take the
+      # required legs down with it. The test step is not a pure library verdict
+      # either: a stale or incompatible `.build` from the cache (restored through
+      # restore-keys, or after an Xcode change, which the key does not carry)
+      # also fails inside it, and then still cancels.
       - name: Cancel run on failure
-        if: failure()
+        if: failure() && steps.swift-tests.outcome == 'failure'
         uses: ./.github/actions/cancel-on-failure

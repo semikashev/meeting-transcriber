@@ -25,7 +25,7 @@ extension MicCaptureHandler {
     /// restart.
     func handleDeviceChange(fromConfigurationChange: Bool = false) {
         let isDeviceAvailable = selectedDeviceUID
-            .map { MicEngineSession.deviceIDForUID($0) != kAudioObjectUnknown } ?? false
+            .map { deviceIDForUID($0) != kAudioObjectUnknown } ?? false
         // A capture that stalled for lack of audio released its engine and is
         // waiting for exactly this: a new device is the one thing that may
         // bring it back (see `+Progress`).
@@ -121,7 +121,7 @@ extension MicCaptureHandler {
         var rate: Double?
         var thrown: (any Error)?
         do {
-            rate = try startEngine(deviceUID: deviceUID, on: candidate)
+            rate = try startEngine(deviceUID: deviceUID, on: candidate, generation: generation)
         } catch {
             thrown = error
         }
@@ -204,6 +204,60 @@ extension MicCaptureHandler {
         onGiveUp?()
     }
 
+    /// Throws `MicAttemptSuperseded` once the attempt for `generation` is no
+    /// longer the one in flight: it was given up at its deadline, with or
+    /// without a stop, or the capture was stopped. Called before the first
+    /// engine call, before `installTap`, which only attaches a tap to a node
+    /// and is checked as an early exit, and before `start`, the one step that
+    /// opens the input; the file and the converter between them are not
+    /// checked.
+    ///
+    /// What it cannot prevent: a step that passed this check and then takes
+    /// longer than the deadline itself, a slow Bluetooth profile switch say,
+    /// still opens the input after the deadline, under whatever records then,
+    /// until the stale attempt is torn down when the step returns. Closing
+    /// that would mean holding the arbiter's lock across a call that may never
+    /// return.
+    func ensureAttemptIsCurrent(_ generation: Int) throws {
+        guard arbiter.withLock({ $0.phase == .attemptInFlight(generation: generation) }) else {
+            logger.info("Mic: attempt \(generation) is no longer current, not going on with its engine")
+            throw MicAttemptSuperseded()
+        }
+    }
+
+    /// An engine configuration change restarts the engine unless it left a
+    /// pinned engine as it started; see `MicConfigurationChangePolicy` for
+    /// why that case exists. Main queue.
+    func handleEngineConfigChange() {
+        if MicConfigurationChangePolicy.decide(session.configurationChangeReading()) == .ignore {
+            logger.info("Mic: engine configuration change left the pinned engine unchanged; keeping it")
+            return
+        }
+        logger.info("Mic: engine configuration changed (format/route change)")
+        handleDeviceChange(fromConfigurationChange: true)
+    }
+
+    /// The system's default input changed. Main queue, where the listener is
+    /// delivered.
+    ///
+    /// A running engine on a pinned microphone is not on the default input,
+    /// so a headset connecting or going away elsewhere does not concern it:
+    /// restarting it anyway cut a gap into the track for nothing, and every
+    /// needless bring-up is one more chance at the wedge of issue #588. It is
+    /// kept when the same reading a configuration change takes still shows it
+    /// as it started, which also covers the pinned device itself vanishing.
+    /// Only while capturing: a stalled capture or a pending attempt has no
+    /// engine left to judge, and a change of the input is what they wait for.
+    func handleDefaultInputDeviceChanged() {
+        if isRecording,
+           MicConfigurationChangePolicy.decide(session.configurationChangeReading()) == .ignore {
+            logger.info("Mic: default input device changed; the pinned engine is not on it, keeping it")
+            return
+        }
+        logger.info("Mic: default input device changed")
+        handleDeviceChange()
+    }
+
     func removeConfigChangeObserver() {
         guard let observer = configChangeObserver else { return }
         NotificationCenter.default.removeObserver(observer)
@@ -268,6 +322,11 @@ extension MicCaptureHandler {
     /// The device a restart should aim at right now, or nil to take the default.
     func currentRestartTarget() -> String? {
         guard let uid = selectedDeviceUID else { return nil }
-        return MicEngineSession.deviceIDForUID(uid) != kAudioObjectUnknown ? uid : nil
+        return deviceIDForUID(uid) != kAudioObjectUnknown ? uid : nil
     }
 }
+
+/// An attempt found it was no longer the current one part-way through
+/// bringing its engine up. Internal: it only ever reaches the arbiter, which
+/// rejects the attempt as stale.
+struct MicAttemptSuperseded: Error {}

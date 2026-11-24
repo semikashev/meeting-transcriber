@@ -1,3 +1,4 @@
+import AudioTapLib
 import Foundation
 import os.log
 
@@ -8,23 +9,11 @@ private let logger = Logger(subsystem: AppPaths.logSubsystem, category: "WatchLo
 /// type inherits that isolation, so the moved methods need no annotation.
 /// Failures are reported by `reportRecordOnlyFailure`.
 extension WatchLoop {
-    func writeRecordOnlySidecar(
-        title: String,
-        appName: String,
-        recording: RecordingResult,
-        trigger: RecordingSidecar.Trigger,
-        participants: [String],
-    ) throws {
-        let kept = try makeRecordOnlyWrite(
-            title: title, appName: appName, recording: recording, trigger: trigger, participants: participants,
-        ).perform()
-        reportStagingFilesKept(kept)
-    }
-
-    /// `writeRecordOnlySidecar` with the file work on a detached task, for a
-    /// quit: its budget is a timer on the main actor, and moving the tracks
-    /// into an output folder on another volume is a copy that takes as long
-    /// as the mix did. Failures are reported as on the synchronous path.
+    /// Move the recording into the record-only folder and write its sidecar,
+    /// with the file work on a detached task (called by `stopAndEnqueue`):
+    /// moving the tracks into an output folder on another volume is a copy
+    /// that takes as long as the mix did, and a quit's budget is a timer on
+    /// the main actor. A failure is reported, not thrown.
     func writeRecordOnlyOffMain(
         title: String,
         appName: String,
@@ -168,21 +157,34 @@ struct RecordOnlyWrite: Sendable {
         let stem = try Self.freeStem(basename, for: suffixes, in: destDir)
         let finalNames = suffixes.map { stem + $0 }
         let sidecarURL = destDir.appendingPathComponent(stem + RecordingSidecar.filenameSuffix)
-        try Self.placeCopies(of: Array(zip(sources, finalNames)), in: destDir, using: transfer)
+        // Until the sidecar commits, a failure takes back the files this call
+        // moved into place: no sidecar will describe them, and the sources
+        // stay for the next launch, which would write the recording again
+        // beside them. Only names this call placed, never another writer's.
+        var placed: [URL] = []
+        do {
+            try Self.placeCopies(of: Array(zip(sources, finalNames)), in: destDir, using: transfer, placed: &placed)
 
-        let sidecar = RecordingSidecar(
-            title: title,
-            appName: appName,
-            startedAt: recording.recordingStartDate,
-            stoppedAt: stoppedAt,
-            participants: participants,
-            micDelaySeconds: recording.micDelay,
-            trigger: trigger,
-            mixFilename: finalNames[0],
-            appFilename: recording.appPath.map { stem + Self.suffix(of: $0.lastPathComponent, after: basename) },
-            micFilename: recording.micPath.map { stem + Self.suffix(of: $0.lastPathComponent, after: basename) },
-        )
-        try commitSidecar(sidecar, at: sidecarURL)
+            let sidecar = RecordingSidecar(
+                title: title,
+                appName: appName,
+                startedAt: recording.recordingStartDate,
+                stoppedAt: stoppedAt,
+                participants: participants,
+                micDelaySeconds: recording.micDelay,
+                trigger: trigger,
+                mixFilename: finalNames[0],
+                appFilename: recording.appPath.map { stem + Self.suffix(of: $0.lastPathComponent, after: basename) },
+                micFilename: recording.micPath.map { stem + Self.suffix(of: $0.lastPathComponent, after: basename) },
+                micMuteIntervals: recording.micMuteIntervals,
+            )
+            try commitSidecar(sidecar, at: sidecarURL)
+        } catch {
+            for url in placed {
+                try? fm.removeItem(at: url)
+            }
+            throw error
+        }
         let notRemoved = Self.removeSources(sources)
         logger.info("Record-only: wrote sidecar + WAVs to \(destDir.path) for \(title, privacy: .private)")
         return notRemoved
@@ -213,8 +215,11 @@ struct RecordOnlyWrite: Sendable {
     /// Steps 1 and 2: a complete copy of each source under the temporary name
     /// of its final name, then each moved into place. Nothing is replaced: a
     /// move onto a name that exists fails. On a failure the temporary copies
-    /// go.
-    private static func placeCopies(of files: [(source: URL, finalName: String)], in destDir: URL, using transfer: Transfer) throws {
+    /// go; `placed` gets each file moved into place, for the caller to take
+    /// back.
+    private static func placeCopies(
+        of files: [(source: URL, finalName: String)], in destDir: URL, using transfer: Transfer, placed: inout [URL],
+    ) throws {
         let fm = FileManager.default
         var staged: [(temp: URL, final: URL)] = []
         do {
@@ -225,6 +230,7 @@ struct RecordOnlyWrite: Sendable {
             }
             for file in staged {
                 try fm.moveItem(at: file.temp, to: file.final)
+                placed.append(file.final)
             }
         } catch {
             for file in staged {

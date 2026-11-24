@@ -19,7 +19,7 @@ final class AboutSettingsViewTests: XCTestCase {
     override func setUp() async throws {
         try await super.setUp()
         testSuiteName = "AboutSettingsViewTests-\(getpid())-\(UUID().uuidString)"
-        guard let suite = UserDefaults(suiteName: testSuiteName) else {
+        guard let suite = DefaultsSuite.open(testSuiteName) else {
             XCTFail("Could not create test UserDefaults suite")
             return
         }
@@ -87,6 +87,45 @@ final class AboutSettingsViewTests: XCTestCase {
         try view.inspect().find(button: "Check Now").tap()
 
         XCTAssertTrue(checker.isChecking)
+    }
+
+    private func checkerWithUpdate(installedCask: String?) throws -> UpdateChecker {
+        let checker = UpdateChecker(provider: MockUpdateProvider(), installedCask: installedCask)
+        checker.availableUpdate = try ReleaseInfo(
+            tagName: "v1.0.0",
+            name: "Release v1.0.0",
+            prerelease: false,
+            htmlURL: XCTUnwrap(URL(string: "https://github.com/pasrom/meeting-transcriber/releases/tag/v1.0.0")),
+            dmgURL: URL(string: "https://example.com/app.dmg"),
+        )
+        return checker
+    }
+
+    func testHomebrewInstallShowsBrewCommandInsteadOfDownload() throws {
+        let body = try makeAbout(updateChecker: checkerWithUpdate(installedCask: "meeting-transcriber")).inspect()
+        XCTAssertNoThrow(try body.find(text: "brew update && brew upgrade --cask pasrom/meeting-transcriber/meeting-transcriber"))
+        XCTAssertNoThrow(try body.find(viewWithAccessibilityIdentifier: A11yID.updateCopyBrewCommand))
+        XCTAssertThrowsError(try body.find(viewWithAccessibilityIdentifier: A11yID.updateDownload))
+    }
+
+    func testCopyCommandButtonCopiesTheBrewCommand() throws {
+        let pasteboard = NSPasteboard(name: NSPasteboard.Name("AboutSettingsViewTests-\(UUID().uuidString)"))
+        defer { pasteboard.releaseGlobally() }
+        var view = try makeAbout(updateChecker: checkerWithUpdate(installedCask: "meeting-transcriber"))
+        view.pasteboard = pasteboard
+
+        try view.inspect().find(viewWithAccessibilityIdentifier: A11yID.updateCopyBrewCommand).button().tap()
+
+        XCTAssertEqual(
+            pasteboard.string(forType: .string),
+            "brew update && brew upgrade --cask pasrom/meeting-transcriber/meeting-transcriber",
+        )
+    }
+
+    func testDMGInstallShowsDownload() throws {
+        let body = try makeAbout(updateChecker: checkerWithUpdate(installedCask: nil)).inspect()
+        XCTAssertNoThrow(try body.find(viewWithAccessibilityIdentifier: A11yID.updateDownload))
+        XCTAssertThrowsError(try body.find(viewWithAccessibilityIdentifier: A11yID.updateCopyBrewCommand))
     }
 
     func testUpdatesSectionHiddenWhenNoChecker() throws {

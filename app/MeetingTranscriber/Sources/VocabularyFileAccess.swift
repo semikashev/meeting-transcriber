@@ -1,15 +1,34 @@
 import Foundation
+import os.log
+
+private let logger = Logger(subsystem: AppPaths.logSubsystem, category: "VocabularyFileAccess")
 
 /// Resolves persisted sandbox access for terminology files and brackets each
 /// read with the matching security scope. Plain paths remain supported for
 /// existing non-sandbox installations that predate bookmarks.
 enum VocabularyFileAccess {
-    static func resolve(path: String, bookmark: Data?) -> URL? {
+    /// Resolution that does not wait for a volume, with the security scope a
+    /// sandboxed read needs. `.withoutUI` and
+    /// `.withoutMounting` make a bookmark on a detached network share fail at once
+    /// instead of blocking the caller while the share is contacted, which is the
+    /// only acceptable form for a read on the main actor. Used by the custom
+    /// model folder's validation in `AppSettings`, which runs in `init` and on the
+    /// view path, and by the terminology rules file, read at every job start; the
+    /// RPC settings snapshot passes its own fail-fast options. A
+    /// load itself resolves with the default and may wait; it runs off the view
+    /// path and needs the folder, not an answer.
+    static let failFastScopedResolution: URL.BookmarkResolutionOptions = [.withSecurityScope, .withoutUI, .withoutMounting]
+
+    static func resolve(
+        path: String,
+        bookmark: Data?,
+        options: URL.BookmarkResolutionOptions = .withSecurityScope,
+    ) -> URL? {
         if let bookmark {
             var stale = false
             guard let url = try? URL(
                 resolvingBookmarkData: bookmark,
-                options: .withSecurityScope,
+                options: options,
                 relativeTo: nil,
                 bookmarkDataIsStale: &stale,
             ) else { return nil }
@@ -20,6 +39,47 @@ enum VocabularyFileAccess {
         }
         guard !path.isEmpty else { return nil }
         return URL(fileURLWithPath: path)
+    }
+
+    /// Nil when macOS refuses the bookmark. Callers then store the selection
+    /// without one, which in the sandbox loses access after a restart, so the
+    /// refusal is logged rather than swallowed.
+    static func makeBookmark(for url: URL) -> Data? {
+        do {
+            return try url.bookmarkData(
+                options: .withSecurityScope,
+                includingResourceValuesForKeys: nil,
+                relativeTo: nil,
+            )
+        } catch {
+            // Domain and code only: a localized description can name the file,
+            // and os_log output can leave the machine.
+            let nsError = error as NSError
+            logger.error(
+                "Could not create a security-scoped bookmark: \(nsError.domain, privacy: .public) \(nsError.code, privacy: .public)",
+            )
+            return nil
+        }
+    }
+
+    /// For a bookmark macOS reports stale (its target moved or was renamed): the
+    /// target's current location and a new bookmark for it. Nil while the
+    /// bookmark is current, or when it cannot be resolved or re-created.
+    static func refreshedStaleBookmark(
+        _ bookmark: Data,
+        options: URL.BookmarkResolutionOptions = .withSecurityScope,
+    ) -> (url: URL, bookmark: Data)? {
+        var isStale = false
+        let resolved = try? URL(
+            resolvingBookmarkData: bookmark,
+            options: options,
+            relativeTo: nil,
+            bookmarkDataIsStale: &isStale,
+        )
+        guard let url = resolved, isStale,
+              let refreshed = withAccess(to: url, makeBookmark)
+        else { return nil }
+        return (url, refreshed)
     }
 
     static func withAccess<Result>(to url: URL, _ body: (URL) -> Result) -> Result {

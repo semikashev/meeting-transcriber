@@ -1,5 +1,4 @@
 #if !APPSTORE
-    // swiftlint:disable file_length
     @testable import MeetingTranscriber
     import XCTest
 
@@ -163,85 +162,32 @@
         }
 
         @MainActor
-        func testRouteAcceptsNullOrigin() async {
-            // Some user agents send literal "null" for sandboxed/file:// contexts —
-            // treat as absent so curl/native tools always work.
+        func testRouteRejectsNullOrigin() async {
+            // A page loaded from file://, a data: URL or a sandboxed iframe sends
+            // the literal "null". That is still a browser, so it must be refused
+            // like any other origin; curl and native tools send no Origin at all.
             let server = DebugRPCServer(port: 0, token: Self.testToken) { .empty }
             var headers = Self.authHeaders
             headers["origin"] = "null"
             let response = await server.route(HTTPRequest(method: "GET", path: "/healthz", headers: headers))
-            XCTAssertEqual(response.status, 200)
-        }
-
-        // MARK: - Enabled gate
-
-        func testEnabledFollowsEnvVar() {
-            // The runtime env value is whatever launched this test process —
-            // assert the API works rather than a specific value.
-            let value = ProcessInfo.processInfo.environment[DebugRPCServer.envVar]
-            XCTAssertEqual(DebugRPCServer.enabled, value == "1")
+            XCTAssertEqual(response.status, 403)
         }
 
         // MARK: - Lifecycle
 
         @MainActor
-        func testStopIsIdempotent() {
+        func testStopIsIdempotent() async {
             let server = DebugRPCServer(port: 0, token: Self.testToken) { .empty }
             // Safe to call before start.
             server.stop()
             server.stop()
-            // Safe to call after start.
+            // Safe to call after start, once the listener is up.
             server.start()
+            await waitFor(server.boundPort != nil, timeout: regressionCeiling)
+            XCTAssertNotNil(server.boundPort, "the listener never came up")
             server.stop()
             server.stop()
-        }
-
-        // MARK: - Token persistence
-
-        func testLoadOrCreateTokenIsStableAndChmod600() throws {
-            // We can't easily redirect AppPaths in a test, so just assert the
-            // function returns a 64-hex string and is idempotent.
-            let first = DebugRPCServer.loadOrCreateToken()
-            let second = DebugRPCServer.loadOrCreateToken()
-            XCTAssertEqual(first, second)
-            XCTAssertEqual(first.count, 64)
-            XCTAssertTrue(first.allSatisfy(\.isHexDigit))
-
-            let attrs = try FileManager.default.attributesOfItem(atPath: DebugRPCServer.tokenFileURL.path)
-            let perms = (attrs[.posixPermissions] as? Int) ?? -1
-            XCTAssertEqual(perms, 0o600)
-        }
-
-        func testRotateTokenGeneratesNewValueAndPersistsAtomically() throws {
-            let url = makeTempFile(suffix: "-rpc-token")
-            // Seed an existing token to ensure rotate doesn't reuse it.
-            let seed = "seed-token-1234"
-            FileManager.default.createFile(
-                atPath: url.path, contents: Data(seed.utf8),
-                attributes: [.posixPermissions: 0o600],
-            )
-
-            let rotated = DebugRPCServer.rotateToken(at: url)
-            XCTAssertNotEqual(rotated, seed)
-            XCTAssertEqual(rotated.count, 64)
-            XCTAssertTrue(rotated.allSatisfy(\.isHexDigit))
-
-            // File now contains the rotated value.
-            let onDisk = try String(contentsOf: url, encoding: .utf8)
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            XCTAssertEqual(onDisk, rotated)
-
-            // Mode preserved at 0600 across the rewrite.
-            let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
-            let perms = (attrs[.posixPermissions] as? Int) ?? -1
-            XCTAssertEqual(perms, 0o600)
-        }
-
-        func testRotateTokenProducesDistinctValuesAcrossCalls() {
-            let url = makeTempFile(suffix: "-rpc-token")
-            let a = DebugRPCServer.rotateToken(at: url)
-            let b = DebugRPCServer.rotateToken(at: url)
-            XCTAssertNotEqual(a, b, "Two consecutive rotations must yield different tokens")
+            XCTAssertNil(server.boundPort, "a stopped server must not report a port")
         }
 
         // MARK: - Speaker DB action routes
@@ -275,6 +221,36 @@
             let body = Data(#"{"from":"Missing","to":"Whatever"}"#.utf8)
             let response = await server.route(authedJSONRequest(path: "/action/renameSpeaker", body: body))
             XCTAssertEqual(response.status, 404)
+        }
+
+        @MainActor
+        func testRouteSeedSpeakerNotSavedReturns503() async throws {
+            let stub = StubSpeakerActions()
+            stub.seedOutcome = .notSaved
+            let server = DebugRPCServer(
+                port: 0, token: Self.testToken,
+                snapshot: { .empty }, speakerActions: stub.actions(),
+            )
+            let body = Data(#"{"name":"Alice"}"#.utf8)
+            let response = await server.route(authedJSONRequest(path: "/action/seedSpeaker", body: body))
+            XCTAssertEqual(response.status, 503)
+            let message = try XCTUnwrap(String(data: response.body, encoding: .utf8))
+            XCTAssertTrue(message.contains("speaker database"), message)
+        }
+
+        @MainActor
+        func testRouteRenameSpeakerOnResetDBReturns409() async throws {
+            let stub = StubSpeakerActions()
+            stub.renameOutcome = .dbReset
+            let server = DebugRPCServer(
+                port: 0, token: Self.testToken,
+                snapshot: { .empty }, speakerActions: stub.actions(),
+            )
+            let body = Data(#"{"from":"A","to":"B"}"#.utf8)
+            let response = await server.route(authedJSONRequest(path: "/action/renameSpeaker", body: body))
+            XCTAssertEqual(response.status, 409)
+            let message = try XCTUnwrap(String(data: response.body, encoding: .utf8))
+            XCTAssertTrue(message.contains("set aside"), message)
         }
 
         @MainActor

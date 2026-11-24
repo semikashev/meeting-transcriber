@@ -1,7 +1,45 @@
+import ApplicationServices
 @testable import MeetingTranscriber
 import XCTest
 
 final class ParticipantReaderTests: XCTestCase {
+    // MARK: - Accessibility trust
+
+    /// How many times `readParticipants` built the AX root to walk from.
+    private func rootsMade(trusted: Bool, accessibilityApplies: Bool = true) -> Int {
+        var made = 0
+        _ = ParticipantReader.readParticipants(
+            pid: getpid(),
+            accessibilityApplies: accessibilityApplies,
+            isTrusted: { trusted },
+            makeRoot: { pid in
+                made += 1
+                return AXUIElementCreateApplication(pid)
+            },
+        )
+        return made
+    }
+
+    /// Without the Accessibility grant every AX call fails and logs a
+    /// warning, so the roster walk must not start at all. The trusted case is
+    /// the control: the test process has no roster, so nothing is found
+    /// either way, but the walk does start.
+    func testUntrustedProcessWalksNoTree() {
+        XCTAssertEqual(rootsMade(trusted: false), 0, "the AX tree was walked without the grant")
+        XCTAssertEqual(rootsMade(trusted: true), 1)
+    }
+
+    /// A build that does not use the grant reports Accessibility as not
+    /// applicable and shows no Settings row, so the reader must stay off there
+    /// even when the process happens to be trusted. Otherwise the feature would
+    /// run with no way to diagnose it.
+    func testBuildWithoutTheGrantWalksNoTreeEvenWhenTrusted() {
+        XCTAssertEqual(
+            rootsMade(trusted: true, accessibilityApplies: false), 0,
+            "the AX tree was walked in a build that does not use the grant",
+        )
+    }
+
     // MARK: - Basic Filtering
 
     func testFilterValidNames() {
@@ -34,6 +72,19 @@ final class ParticipantReaderTests: XCTestCase {
         let input = ["Mute", "participants", "Alice", "Share"]
         let result = ParticipantReader.filterParticipantNames(input)
         XCTAssertEqual(result, ["Alice"])
+    }
+
+    /// A skip word only matches as a whole word: a name that merely begins
+    /// with one ("Share", "More", "Guest", "Chat") is a name.
+    func testFilterKeepsNamesThatOnlyBeginWithASkipWord() {
+        let input = ["Sharelle", "Moreno", "Guestavo", "Chatura"]
+        XCTAssertEqual(ParticipantReader.filterParticipantNames(input), input)
+    }
+
+    /// A skip word followed by more text, or in its plural, is still a label.
+    func testFilterRemovesLabelsThatBeginWithASkipWord() {
+        let input = ["Share screen", "More options", "Presenters", "Attendees (5)", "Guest user", "Alice"]
+        XCTAssertEqual(ParticipantReader.filterParticipantNames(input), ["Alice"])
     }
 
     func testFilterRemovesTimestamps() {

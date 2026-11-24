@@ -15,15 +15,15 @@
     final class RPCChannelFaultStateTests: XCTestCase {
         private let t0 = Date(timeIntervalSince1970: 1_700_000_000)
 
-        func testAHealthyRecordingReportsNoFault() {
-            let state = makeRPCTestState()
+        func testAHealthyRecordingReportsNoFault() throws {
+            let state = try makeRPCTestState()
             let health = state.rpcStateSnapshot().channelHealth
             XCTAssertNil(health.micFault)
             XCTAssertNil(health.appFault)
         }
 
         func testTheSnapshotFollowsTheReportedFault() throws {
-            let state = makeRPCTestState()
+            let state = try makeRPCTestState()
             let recorder = MockRecorder()
             recorder.appLevelDBFS = -20
             recorder.micLevelDBFS = -120
@@ -40,9 +40,9 @@
             XCTAssertEqual(try XCTUnwrap(health.micSecondsSinceLastBuffer), 600, accuracy: 0.001)
         }
 
-        func testTheSnapshotDistinguishesTheTwoFaults() {
+        func testTheSnapshotDistinguishesTheTwoFaults() throws {
             // The two call for different fixes, so one bit would not do.
-            let state = makeRPCTestState()
+            let state = try makeRPCTestState()
             let recorder = MockRecorder()
             recorder.appLevelDBFS = -20
             recorder.micLevelDBFS = -120
@@ -59,8 +59,8 @@
         /// cannot say whether a revival the user tried stalled again. The
         /// count is what a driver or a field diagnosis reads that from (issues
         /// #724, #706).
-        func testTheSnapshotCarriesTheMicrophoneStallAndItsCount() {
-            let state = makeRPCTestState()
+        func testTheSnapshotCarriesTheMicrophoneStallAndItsCount() throws {
+            let state = try makeRPCTestState()
             let recorder = MockRecorder()
             recorder.appLevelDBFS = -20
             recorder.micLevelDBFS = -120
@@ -76,8 +76,8 @@
 
         /// Zero once the recording is being watched, absent before: "never
         /// stalled" and "not looked at" are different answers.
-        func testTheStallCountIsZeroWhileWatchedAndAbsentBefore() {
-            let state = makeRPCTestState()
+        func testTheStallCountIsZeroWhileWatchedAndAbsentBefore() throws {
+            let state = try makeRPCTestState()
             XCTAssertNil(state.rpcStateSnapshot().channelHealth.micStallCount)
 
             state.channelHealth.simulateStartForTests()
@@ -93,7 +93,7 @@
             // is backwards and took three runs to settle on real hardware.
             // Distinct values per channel, so a snapshot wired to the wrong one
             // fails instead of coinciding.
-            let state = makeRPCTestState()
+            let state = try makeRPCTestState()
             let recorder = MockRecorder()
             recorder.micLevelDBFS = -72
             recorder.appLevelDBFS = -18
@@ -106,11 +106,28 @@
             XCTAssertEqual(try XCTUnwrap(health.appLevelDBFS), -18, accuracy: 0.001)
         }
 
-        func testTheLevelsAreAbsentBeforeAnyTick() {
-            let state = makeRPCTestState()
+        func testTheLevelsAreAbsentBeforeAnyTick() throws {
+            let state = try makeRPCTestState()
             let health = state.rpcStateSnapshot().channelHealth
             XCTAssertNil(health.micLevelDBFS)
             XCTAssertNil(health.appLevelDBFS)
+        }
+
+        /// The sensor's live reading (issue #699), beside the latched fault:
+        /// the fault waits for the microphone to corroborate, the reading
+        /// does not, so a driver can see the sensor without a live call.
+        func testTheSnapshotCarriesTheLiveNoiseFloorReading() throws {
+            let state = try makeRPCTestState()
+            XCTAssertFalse(state.rpcStateSnapshot().channelHealth.appNoiseFloorOnly)
+            let recorder = MockRecorder()
+            recorder.appCarriesOnlyNoiseFloor = true
+            state.channelHealth.simulateStartForTests()
+
+            state.channelHealth.applyTick(recorder: recorder, now: t0)
+
+            let health = state.rpcStateSnapshot().channelHealth
+            XCTAssertTrue(health.appNoiseFloorOnly)
+            XCTAssertNil(health.appFault, "uncorroborated, so not reported")
         }
 
         func testTheInactiveSnapshotCarriesNoFault() {
@@ -119,6 +136,7 @@
             XCTAssertNil(inactive.appFault)
             XCTAssertNil(inactive.micSecondsSinceLastBuffer)
             XCTAssertNil(inactive.micStallCount)
+            XCTAssertFalse(inactive.appNoiseFloorOnly)
         }
     }
 #endif

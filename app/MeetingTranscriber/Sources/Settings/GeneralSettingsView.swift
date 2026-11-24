@@ -12,6 +12,9 @@ struct GeneralSettingsView: View {
     /// without using the channel that is broken.
     var notificationVisibility: NotificationVisibility?
 
+    /// Backs the Launch at Login toggle. Nil hides the row.
+    var loginItem: LoginItemController?
+
     @State private var addAppRefusals: [String] = []
 
     /// Nil until the first permission check. The case, not just the message:
@@ -27,6 +30,14 @@ struct GeneralSettingsView: View {
     var body: some View {
         // swiftlint:disable:next closure_body_length
         Form {
+            Section("Startup") {
+                if let loginItem {
+                    launchAtLogin(loginItem)
+                }
+                Toggle("Start watching when the app opens", isOn: $settings.autoWatch)
+                    .accessibilityIdentifier(A11yID.autoWatchToggle)
+            }
+
             Section("Mode") {
                 Toggle("Record-only mode", isOn: $settings.recordOnly)
                     .accessibilityIdentifier(A11yID.recordOnlyToggle)
@@ -43,19 +54,14 @@ struct GeneralSettingsView: View {
                 Toggle("Tencent Meeting", isOn: $settings.watchTencentMeeting)
                 Toggle("FaceTime", isOn: $settings.watchFaceTime)
                 Toggle("WhatsApp", isOn: $settings.watchWhatsApp)
+                Toggle("Slack", isOn: $settings.watchSlack)
+                    .accessibilityIdentifier(A11yID.watchSlackToggle)
                 customApps
                 Toggle("Browser Web Meetings", isOn: $settings.watchBrowserMeetings)
                     .accessibilityIdentifier(A11yID.watchBrowserToggle)
-                Text(
-                    """
-                    Detects web meetings (Google Meet, Whereby, web Zoom/Teams) by the WebRTC \
-                    signal, so any browser works. Other apps that place calls can trigger it too; \
-                    it asks before recording (unless the title below or the calendar option \
-                    vouches for the call), and "Never for this app" stops one for good.
-                    """,
-                )
-                .font(.caption)
-                .foregroundStyle(.secondary)
+                Text(Self.browserMeetingsCaption)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 browserTitleRow
                 browserConsentWarning
                 consentDenyList
@@ -88,6 +94,30 @@ struct GeneralSettingsView: View {
             }
         }
         .formStyle(.grouped)
+        // macOS owns the login-item status and the user can change it in System
+        // Settings at any time, including while this window stays open (the
+        // approval hint sends them there), so re-read it on appear and whenever
+        // the app comes back to the front.
+        .onAppear { loginItem?.refresh() }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            loginItem?.refresh()
+        }
+    }
+
+    private func launchAtLogin(_ loginItem: LoginItemController) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Toggle("Launch at login", isOn: Binding(
+                get: { loginItem.isOn },
+                set: { loginItem.setEnabled($0) },
+            ))
+            .accessibilityIdentifier(A11yID.launchAtLoginToggle)
+            if let hint = loginItem.hint {
+                Text(hint)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .accessibilityIdentifier(A11yID.launchAtLoginHint)
+            }
+        }
     }
 
     /// Read on appear and after each request, not live: the only way it
@@ -243,6 +273,26 @@ struct GeneralSettingsView: View {
         return refusals
     }
 
+    /// The Browser Web Meetings caption. Safari is named only where it is
+    /// detected: the App Store build cannot attribute WebKit's GPU process to
+    /// Safari (`MicInputDetector.patterns(watching:)`).
+    #if APPSTORE
+        static let browserMeetingsCaption = """
+        Detects web meetings (Google Meet, Whereby, web Zoom/Teams) in Chromium browsers \
+        by the WebRTC signal. Other apps that place calls can trigger it too; it asks before \
+        recording (unless the title below or the calendar option vouches for the call), \
+        and "Never for this app" stops one for good.
+        """
+    #else
+        static let browserMeetingsCaption = """
+        Detects web meetings (Google Meet, Whereby, web Zoom/Teams) by the WebRTC signal \
+        in Chromium browsers and by microphone use in Safari. Other apps that place calls, \
+        or a page that only uses the microphone, can trigger it too; it asks before \
+        recording (unless the title below or the calendar option vouches for the call), \
+        and "Never for this app" stops one for good.
+        """
+    #endif
+
     static func watchRefusal(
         name: String,
         bundleID: String,
@@ -253,7 +303,7 @@ struct GeneralSettingsView: View {
             return "\(name) can't watch itself."
         }
         let executable = info["CFBundleExecutable"] as? String
-        let builtInName = MicInputDetector.defaultPatterns.first { $0.bundleIDs.contains(bundleID) }?.appName
+        let builtInName = MicInputDetector.defaultPatterns.first { $0.matches(bundleID: bundleID) }?.appName
             ?? PowerAssertionDetector.defaultPatterns.first { executable.map($0.processNames.contains) ?? false }?.appName
         if let builtInName {
             return "\(builtInName) has its own toggle above."
@@ -362,7 +412,7 @@ struct GeneralSettingsView: View {
                     .font(.callout.weight(.semibold))
                 Text(
                     "Files land in `\(display)`. Each recording gets a `<timestamp>_meta.json` " +
-                        "sidecar next to its WAVs. No transcription, diarization, or protocol " +
+                        "sidecar next to its WAVs. No transcription, diarization, or meeting notes " +
                         "generation runs on this device.",
                 )
                 .font(.caption)

@@ -5,7 +5,7 @@ import XCTest
 /// Interaction + write-back tests for non-button Settings controls (Picker,
 /// Stepper) and a first LiveCaptionsOverlay render test. The existing suite drove
 /// only Toggle `.tap()`; Picker `.select()` / Stepper `.increment()` / the
-/// captions TimelineView had zero coverage. Each control is driven and the
+/// captions overlay had zero coverage. Each control is driven and the
 /// resulting `AppSettings` write-back (or rendered identifier) is asserted, so a
 /// broken binding — not just a missing control — fails the test.
 @MainActor
@@ -20,7 +20,7 @@ final class SettingsInteractionTests: XCTestCase {
         // Isolated per-test suite (pid+uuid) so a killed test never leaks into the
         // dev app's `.standard` plist — mirrors SettingsViewTests.
         suiteName = "SettingsInteractionTests-\(getpid())-\(UUID().uuidString)"
-        guard let suite = UserDefaults(suiteName: suiteName) else {
+        guard let suite = DefaultsSuite.open(suiteName) else {
             XCTFail("could not create test UserDefaults suite")
             return
         }
@@ -63,7 +63,7 @@ final class SettingsInteractionTests: XCTestCase {
         let view = OutputSettingsView(settings: settings)
 
         let picker = try view.inspect().find(ViewType.Picker.self) { picker in
-            try picker.labelView().text().string() == "LLM Provider"
+            try picker.labelView().text().string() == "Provider"
         }
         try picker.select(value: ProtocolProvider.openAICompatible)
 
@@ -75,7 +75,7 @@ final class SettingsInteractionTests: XCTestCase {
         let view = OutputSettingsView(settings: settings)
 
         let picker = try view.inspect().find(ViewType.Picker.self) { picker in
-            try picker.labelView().text().string() == "Protocol Language"
+            try picker.labelView().text().string() == "Notes Language"
         }
         // `select(value:)` only writes the binding and never checks the tags, so
         // the option's presence has to be asserted separately.
@@ -92,10 +92,162 @@ final class SettingsInteractionTests: XCTestCase {
         let view = OutputSettingsView(settings: settings)
 
         let picker = try view.inspect().find(ViewType.Picker.self) { picker in
-            try picker.labelView().text().string() == "Protocol Language"
+            try picker.labelView().text().string() == "Notes Language"
         }
 
         XCTAssertNoThrow(try picker.find(text: "Thai"))
+    }
+
+    func testOpenAIAPIKeyPlacementPickerWritesBackToSettings() throws {
+        let settings = makeSettings()
+        settings.protocolProvider = .openAICompatible
+        let view = connectionSection(settings)
+
+        let picker = try view.inspect()
+            .find(viewWithAccessibilityIdentifier: A11yID.openAIAPIKeyPlacementPicker)
+            .find(ViewType.Picker.self)
+        try picker.select(value: OpenAIAPIKeyPlacement.customHeader)
+
+        XCTAssertEqual(settings.openAIAPIKeyPlacement, .customHeader)
+    }
+
+    func testOpenAIAPIKeyHeaderNameFieldWritesBackToSettings() throws {
+        let settings = makeSettings()
+        settings.protocolProvider = .openAICompatible
+        settings.openAIAPIKeyPlacement = .customHeader
+        let view = connectionSection(settings)
+
+        let field = try view.inspect()
+            .find(viewWithAccessibilityIdentifier: A11yID.openAIAPIKeyHeaderNameField)
+            .find(ViewType.TextField.self)
+        XCTAssertNotEqual(settings.openAIAPIKeyHeaderName, "x-api-key", "precondition: the input must differ from the stored value")
+        try field.setInput("x-api-key")
+
+        XCTAssertEqual(settings.openAIAPIKeyHeaderName, "x-api-key")
+    }
+
+    // MARK: - OpenAI sampling overrides
+
+    private func openAIView(temperature: Double? = nil, topP: Double? = nil) -> (OpenAIConnectionSection, AppSettings) {
+        let settings = makeSettings()
+        settings.protocolProvider = .openAICompatible
+        settings.openAITemperature = temperature
+        settings.openAITopP = topP
+        return (connectionSection(settings), settings)
+    }
+
+    func testOpenAITemperatureToggleSwitchesOverrideOn() throws {
+        let (view, settings) = openAIView()
+
+        try view.inspect()
+            .find(viewWithAccessibilityIdentifier: A11yID.openAITemperatureToggle)
+            .find(ViewType.Toggle.self)
+            .tap()
+
+        XCTAssertEqual(settings.openAITemperature, OpenAISamplingParameter.initialOverride)
+    }
+
+    func testOpenAITopPToggleSwitchesOverrideOff() throws {
+        let (view, settings) = openAIView(topP: 0.5)
+
+        try view.inspect()
+            .find(viewWithAccessibilityIdentifier: A11yID.openAITopPToggle)
+            .find(ViewType.Toggle.self)
+            .tap()
+
+        XCTAssertNil(settings.openAITopP, "switching the override off must clear it, not keep the last value")
+    }
+
+    func testOpenAITemperatureStepperWritesBack() throws {
+        let (view, settings) = openAIView(temperature: 0.5)
+
+        try view.inspect()
+            .find(viewWithAccessibilityIdentifier: A11yID.openAITemperatureValue)
+            .find(ViewType.Stepper.self)
+            .increment()
+
+        XCTAssertEqual(try XCTUnwrap(settings.openAITemperature), 0.55, accuracy: 0.0001)
+    }
+
+    func testOpenAITopPStepperWritesBack() throws {
+        let (view, settings) = openAIView(topP: 0.5)
+
+        try view.inspect()
+            .find(viewWithAccessibilityIdentifier: A11yID.openAITopPValue)
+            .find(ViewType.Stepper.self)
+            .decrement()
+
+        XCTAssertEqual(try XCTUnwrap(settings.openAITopP), 0.45, accuracy: 0.0001)
+    }
+
+    func testOpenAITemperatureFieldWritesBack() throws {
+        let (view, settings) = openAIView(temperature: 0.5)
+
+        try view.inspect()
+            .find(viewWithAccessibilityIdentifier: A11yID.openAITemperatureValue)
+            .find(ViewType.TextField.self)
+            // The field parses with the current locale, so type what it would show.
+            .setInput(0.2.formatted(.number))
+
+        XCTAssertEqual(settings.openAITemperature, 0.2)
+    }
+
+    func testOpenAITopPFieldWritesBack() throws {
+        let (view, settings) = openAIView(topP: 0.5)
+
+        try view.inspect()
+            .find(viewWithAccessibilityIdentifier: A11yID.openAITopPValue)
+            .find(ViewType.TextField.self)
+            .setInput(0.9.formatted(.number))
+
+        XCTAssertEqual(settings.openAITopP, 0.9)
+    }
+
+    func testOpenAISamplingValueRowsOnlyAppearWhenOverridden() throws {
+        let body = try openAIView(temperature: 0.7).0.inspect()
+
+        // The top_p toggle renders, so the missing value row is not a failed lookup.
+        XCTAssertNoThrow(try body.find(viewWithAccessibilityIdentifier: A11yID.openAITopPToggle))
+        XCTAssertNoThrow(try body.find(viewWithAccessibilityIdentifier: A11yID.openAITemperatureValue))
+        XCTAssertThrowsError(try body.find(viewWithAccessibilityIdentifier: A11yID.openAITopPValue))
+    }
+
+    func testOpenAIAPIKeyHeaderNameControlsOnlyAppearForCustomHeader() throws {
+        let settings = makeSettings()
+        settings.protocolProvider = .openAICompatible
+        settings.openAIAPIKeyPlacement = .bearerToken
+        settings.openAIAPIKeyHeaderName = "Content-Type"
+        let body = try connectionSection(settings).inspect()
+
+        // The placement picker renders, so the absences below are not a failed lookup.
+        XCTAssertNoThrow(try body.find(viewWithAccessibilityIdentifier: A11yID.openAIAPIKeyPlacementPicker))
+        XCTAssertThrowsError(try body.find(viewWithAccessibilityIdentifier: A11yID.openAIAPIKeyHeaderNameField))
+        XCTAssertThrowsError(try body.find(viewWithAccessibilityIdentifier: A11yID.openAIAPIKeyHeaderNameWarning))
+    }
+
+    func testOpenAIAPIKeyHeaderNameWarningShownOnlyForInvalidName() throws {
+        let settings = makeSettings()
+        settings.protocolProvider = .openAICompatible
+        settings.openAIAPIKeyPlacement = .customHeader
+
+        settings.openAIAPIKeyHeaderName = "Content-Type"
+        XCTAssertNoThrow(
+            try connectionSection(settings).inspect()
+                .find(viewWithAccessibilityIdentifier: A11yID.openAIAPIKeyHeaderNameWarning),
+        )
+
+        settings.openAIAPIKeyHeaderName = "x-api-key"
+        XCTAssertThrowsError(
+            try connectionSection(settings).inspect()
+                .find(viewWithAccessibilityIdentifier: A11yID.openAIAPIKeyHeaderNameWarning),
+        )
+
+        // The generator trims the name before it validates it, so the warning must too.
+        settings.openAIAPIKeyHeaderName = " x-api-key "
+        XCTAssertThrowsError(
+            try connectionSection(settings).inspect()
+                .find(viewWithAccessibilityIdentifier: A11yID.openAIAPIKeyHeaderNameWarning),
+        )
     }
 
     // MARK: - Transcript output toggles
@@ -139,7 +291,35 @@ final class SettingsInteractionTests: XCTestCase {
         XCTAssertTrue(settings.useAITitleForFilenames)
     }
 
+    func testRecordingRetentionToggleWritesBackToSettings() throws {
+        let settings = makeSettings()
+        settings.recordingRetentionEnabled = false
+        let view = OutputSettingsView(settings: settings)
+
+        let toggle = try view.inspect()
+            .find(viewWithAccessibilityIdentifier: A11yID.recordingRetentionToggle)
+            .find(ViewType.Toggle.self)
+        try toggle.tap()
+
+        XCTAssertTrue(settings.recordingRetentionEnabled)
+    }
+
     // MARK: - Stepper write-back
+
+    /// The retention days stepper is the only Stepper in the Output tab; it is
+    /// located by type because a Stepper exposes no findable identifier.
+    func testRecordingRetentionDaysStepperWritesBackToSettings() throws {
+        let settings = makeSettings()
+        settings.recordingRetentionEnabled = true
+        settings.recordingRetentionDays = 0
+        let view = OutputSettingsView(settings: settings)
+
+        let steppers = try view.inspect().findAll(ViewType.Stepper.self)
+        XCTAssertEqual(steppers.count, 1, "expected only the retention days stepper")
+        try steppers[0].increment()
+
+        XCTAssertEqual(settings.recordingRetentionDays, 1)
+    }
 
     func testPollIntervalStepperIncrementsSetting() throws {
         let settings = makeSettings()
@@ -202,6 +382,45 @@ final class SettingsInteractionTests: XCTestCase {
         XCTAssertTrue(toggle.isDisabled())
     }
 
+    // MARK: - Caption backend footnote and download consent
+
+    /// Indonesian is not a Nemotron-trained language: the view must describe
+    /// re-transcribe and must not ask for the Nemotron download.
+    func testUntrainedLanguageShowsReTranscribeFootnoteAndNeedsNoConsent() throws {
+        let settings = makeSettings()
+        settings.transcriptionEngine = .whisperKit
+        settings.whisperLanguage = "id"
+        let strategy = TranscriptionSettingsView.captionStrategy(for: settings)
+        XCTAssertEqual(strategy, .reTranscribe)
+        XCTAssertFalse(TranscriptionSettingsView.needsCaptionModelConsent(strategy: strategy, modelDownloaded: false))
+        let view = TranscriptionSettingsView(
+            settings: settings,
+            whisperKitEngine: WhisperKitEngine(),
+            parakeetEngine: ParakeetEngine(),
+        )
+        let footnote = TranscriptionSettingsView.captionBackendFootnote(strategy: .reTranscribe, languageIsSet: true, detectsLanguage: true)
+        XCTAssertFalse(footnote.contains("Nemotron"))
+        XCTAssertNoThrow(try view.inspect().find(text: footnote))
+    }
+
+    func testTrainedLanguageShowsNemotronFootnoteAndNeedsConsentUntilDownloaded() throws {
+        let settings = makeSettings()
+        settings.transcriptionEngine = .whisperKit
+        settings.whisperLanguage = "de"
+        let strategy = TranscriptionSettingsView.captionStrategy(for: settings)
+        XCTAssertEqual(strategy, .nemotronStreaming)
+        XCTAssertTrue(TranscriptionSettingsView.needsCaptionModelConsent(strategy: strategy, modelDownloaded: false))
+        XCTAssertFalse(TranscriptionSettingsView.needsCaptionModelConsent(strategy: strategy, modelDownloaded: true))
+        let view = TranscriptionSettingsView(
+            settings: settings,
+            whisperKitEngine: WhisperKitEngine(),
+            parakeetEngine: ParakeetEngine(),
+        )
+        let footnote = TranscriptionSettingsView.captionBackendFootnote(strategy: .nemotronStreaming, languageIsSet: true, detectsLanguage: true)
+        XCTAssertTrue(footnote.contains("Nemotron"))
+        XCTAssertNoThrow(try view.inspect().find(text: footnote))
+    }
+
     // MARK: - Caption size picker
 
     func testCaptionSizePickerSelectionWritesBackToSettings() throws {
@@ -238,19 +457,60 @@ final class SettingsInteractionTests: XCTestCase {
         XCTAssertTrue(picker.isDisabled())
     }
 
-    // MARK: - Calendar titles toggle
+    // MARK: - Caption warm-up status
 
-    func testCalendarTitlesToggleWritesBackToSettings() throws {
+    private func warmupStatusText(_ warmup: LiveCaptionsWarmup, enabled: Bool = true) throws -> String {
         let settings = makeSettings()
-        XCTAssertFalse(settings.calendarTitlesEnabled, "precondition: opt-in defaults off")
-        let view = GeneralSettingsView(settings: settings)
+        settings.liveTranscriptionEnabled = enabled
+        let view = TranscriptionSettingsView(
+            settings: settings,
+            whisperKitEngine: WhisperKitEngine(),
+            parakeetEngine: ParakeetEngine(),
+            captionWarmup: warmup,
+        )
+        return try view.inspect()
+            .find(viewWithAccessibilityIdentifier: A11yID.liveCaptionsWarmupStatus)
+            .find(ViewType.Text.self).string()
+    }
 
-        let toggle = try view.inspect()
-            .find(viewWithAccessibilityIdentifier: A11yID.calendarTitlesToggle)
-            .find(ViewType.Toggle.self)
-        try toggle.tap()
+    func testCaptionWarmupStatusShowsEachState() throws {
+        XCTAssertEqual(
+            try warmupStatusText(.preparing(since: Date())),
+            "Preparing live captions\u{2026} (loading the model can take a minute or more)",
+        )
+        XCTAssertEqual(try warmupStatusText(.ready), "Live captions ready")
+        XCTAssertEqual(
+            try warmupStatusText(.failed("offline")),
+            "Live captions unavailable: offline\nTurn live captions off and on to retry.",
+        )
+    }
 
-        XCTAssertTrue(settings.calendarTitlesEnabled, "tapping the toggle must turn the setting on")
+    func testCaptionWarmupSpinnerShowsOnlyWhilePreparing() {
+        XCTAssertNoThrow(try CaptionWarmupStatus(warmup: .preparing(since: Date())).inspect().find(ViewType.ProgressView.self))
+        XCTAssertThrowsError(try CaptionWarmupStatus(warmup: .ready).inspect().find(ViewType.ProgressView.self))
+        XCTAssertThrowsError(try CaptionWarmupStatus(warmup: .failed("offline")).inspect().find(ViewType.ProgressView.self))
+    }
+
+    func testCaptionWarmupElapsedTimeShowsOnlyWhilePreparing() {
+        let elapsed = A11yID.liveCaptionsWarmupElapsed
+        XCTAssertNoThrow(
+            try CaptionWarmupStatus(warmup: .preparing(since: Date())).inspect().find(viewWithAccessibilityIdentifier: elapsed),
+        )
+        XCTAssertThrowsError(try CaptionWarmupStatus(warmup: .ready).inspect().find(viewWithAccessibilityIdentifier: elapsed))
+        XCTAssertThrowsError(
+            try CaptionWarmupStatus(warmup: .failed("offline")).inspect().find(viewWithAccessibilityIdentifier: elapsed),
+        )
+    }
+
+    func testCaptionWarmupReadyShowsTheCheckmarkLabel() throws {
+        let label = try CaptionWarmupStatus(warmup: .ready).inspect().find(ViewType.Label.self)
+        XCTAssertEqual(try label.icon().image().actualImage().name(), "checkmark.circle.fill")
+        XCTAssertThrowsError(try CaptionWarmupStatus(warmup: .preparing(since: Date())).inspect().find(ViewType.Label.self))
+    }
+
+    func testCaptionWarmupStatusHiddenWithoutAWarmupOrWithCaptionsOff() {
+        XCTAssertThrowsError(try warmupStatusText(.idle))
+        XCTAssertThrowsError(try warmupStatusText(.ready, enabled: false))
     }
 
     // MARK: - LiveCaptionsOverlay render
@@ -259,14 +519,14 @@ final class SettingsInteractionTests: XCTestCase {
         let state = LiveCaptionsState()
         state.applyFinalized("hello", channel: .mic)
 
-        // No active backend → the backend label (inside the TimelineView) is absent.
+        // No active backend → the backend label is absent.
         XCTAssertThrowsError(
             try LiveCaptionsOverlay(state: state).inspect()
                 .find(viewWithAccessibilityIdentifier: A11yID.liveCaptionBackend),
             "with no active backend the label must not render",
         )
 
-        // Active backend → the label appears, reachable through the TimelineView.
+        // Active backend → the label appears.
         state.setActiveBackend("Parakeet EOU")
         XCTAssertNoThrow(
             try LiveCaptionsOverlay(state: state).inspect()

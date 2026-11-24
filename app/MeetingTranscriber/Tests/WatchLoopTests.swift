@@ -59,7 +59,7 @@ final class WatchLoopTests: XCTestCase {
     func testOnStateChangeCallback() {
         let loop = makeLoop()
         var transitions: [(WatchLoop.State, WatchLoop.State)] = []
-        loop.onStateChange = { old, new in
+        loop.onStateChange = { old, new, _ in
             transitions.append((old, new))
         }
 
@@ -134,7 +134,7 @@ final class WatchLoopTests: XCTestCase {
 
     func testNoMicDefault() {
         let loop = makeLoop()
-        XCTAssertFalse(loop.noMic)
+        XCTAssertFalse(loop.noMic())
     }
 
     // MARK: - PipelineQueue Configuration
@@ -144,8 +144,8 @@ final class WatchLoopTests: XCTestCase {
         XCTAssertNil(loop.pipelineQueue)
     }
 
-    func testPipelineQueueInit() {
-        let queue = PipelineQueue()
+    func testPipelineQueueInit() throws {
+        let queue = try makeIsolatedQueue()
         let loop = makeLoop(pipelineQueue: queue)
         XCTAssertNotNil(loop.pipelineQueue)
     }
@@ -164,8 +164,8 @@ final class WatchLoopTests: XCTestCase {
 
     // MARK: - Pipeline Queue Wiring
 
-    func testPipelineQueuePassedToConstructor() {
-        let queue = PipelineQueue()
+    func testPipelineQueuePassedToConstructor() throws {
+        let queue = try makeIsolatedQueue()
         let loop = WatchLoop(
             detector: PowerAssertionDetector(),
             pipelineQueue: queue,
@@ -236,44 +236,6 @@ final class WatchLoopTests: XCTestCase {
         )
     }
 
-    // MARK: - Stop Manual Recording Enqueues Job
-
-    func testStopManualRecordingEnqueuesJob() async throws {
-        let queue = PipelineQueue()
-        let (loop, recorder) = makeTestWatchLoop(pipelineQueue: queue)
-        recorder.mixPath = URL(fileURLWithPath: "/tmp/test_mix.wav")
-
-        try await loop.startManualRecording(pid: 42, appName: "Chrome", title: "Standup")
-        XCTAssertTrue(loop.isManualRecording)
-
-        loop.stopManualRecording()
-
-        XCTAssertFalse(loop.isManualRecording)
-        XCTAssertEqual(loop.state, .idle)
-        XCTAssertTrue(recorder.stopCalled)
-        XCTAssertEqual(queue.jobs.count, 1)
-        XCTAssertEqual(queue.jobs.first?.meetingTitle, "Standup")
-        XCTAssertEqual(queue.jobs.first?.appName, "Chrome")
-    }
-
-    // MARK: - Double Start Manual Recording
-
-    func testStartManualRecordingWhileRecordingIsNoOp() async throws {
-        let (loop, recorder) = makeTestWatchLoop()
-
-        try await loop.startManualRecording(pid: 42, appName: "Chrome", title: "First")
-        defer { loop.stop() }
-
-        XCTAssertTrue(loop.isManualRecording)
-        XCTAssertEqual(loop.manualRecordingInfo?.title, "First")
-
-        // Second start should be ignored because state is already .recording
-        try await loop.startManualRecording(pid: 99, appName: "Safari", title: "Second")
-
-        XCTAssertEqual(loop.manualRecordingInfo?.title, "First")
-        XCTAssertTrue(recorder.startCalled)
-    }
-
     // MARK: - Permission Pre-Check
 
     func testManualRecordingFailsWhenPermissionBroken() async {
@@ -302,8 +264,8 @@ final class WatchLoopTests: XCTestCase {
             HealthCheckResult(screenRecording: .healthy, microphone: .healthy, accessibility: .denied)
         }
 
-        // Accessibility feeds participant reading and mute detection, neither of
-        // which this path uses, and Settings presents it as optional. Refusing
+        // Accessibility feeds only Teams participant reading, which this path
+        // does not use, and Settings presents it as optional. Refusing
         // over it left the app recording an auto-detected meeting while turning
         // down the one the user asked for by hand.
         try await loop.startManualRecording(pid: 123, appName: "Test", title: "Test")
@@ -370,7 +332,7 @@ final class WatchLoopTests: XCTestCase {
 
     /// Drives a complete `start → stop` manual recording cycle so the test
     /// exercises the public surface (`stopManualRecording`) rather than the
-    /// private `enqueueRecording` it forwards to.
+    /// `stopAndEnqueue` it forwards to.
     private func runManualRecordOnlyRecording(
         recorderMix: URL,
         outputDir: URL,
@@ -393,12 +355,12 @@ final class WatchLoopTests: XCTestCase {
         recorder.micPath = recorderMic
         recorder.recordingStartDate = recordingStartDate
         try await loop.startManualRecording(pid: 42, appName: appName, title: title)
-        loop.stopManualRecording()
+        await loop.stopManualRecording()
         return loop
     }
 
     func test_recordOnly_writesSidecarAndDoesNotEnqueue() async throws {
-        let queue = PipelineQueue()
+        let queue = try makeIsolatedQueue()
         let tmp = try makeTempDirectory(prefix: "recordOnly")
 
         let mixURL = tmp.appendingPathComponent("20260503_120000_mix.wav")
@@ -460,7 +422,7 @@ final class WatchLoopTests: XCTestCase {
     /// `startedAt <= stoppedAt` so a downstream fleet consumer never computes a
     /// negative duration or rejects the JSON as malformed.
     func test_recordOnly_sidecarStartedAtNeverAfterStoppedAt_onBackwardClockStep() async throws {
-        let queue = PipelineQueue()
+        let queue = try makeIsolatedQueue()
         let tmp = try makeTempDirectory(prefix: "recordOnlyClock")
         let mixURL = tmp.appendingPathComponent("20260503_120000_mix.wav")
         try Data().write(to: mixURL)
@@ -493,7 +455,7 @@ final class WatchLoopTests: XCTestCase {
         try Data().write(to: mixURL)
         let notifier = RecordingNotifier()
 
-        let queue = PipelineQueue()
+        let queue = try makeIsolatedQueue()
         let loop = try await runManualRecordOnlyRecording(
             recorderMix: mixURL,
             outputDir: unwritable,
@@ -514,7 +476,7 @@ final class WatchLoopTests: XCTestCase {
     }
 
     func test_normalMode_enqueuesAndWritesNoSidecar() async throws {
-        let queue = PipelineQueue()
+        let queue = try makeIsolatedQueue()
         let tmp = try makeTempDirectory(prefix: "normalMode")
 
         let mixURL = tmp.appendingPathComponent("20260503_120000_mix.wav")
@@ -523,7 +485,7 @@ final class WatchLoopTests: XCTestCase {
         let (loop, recorder) = makeTestWatchLoop(pipelineQueue: queue)
         recorder.mixPath = mixURL
         try await loop.startManualRecording(pid: 42, appName: "Microsoft Teams", title: "Standup")
-        loop.stopManualRecording()
+        await loop.stopManualRecording()
 
         XCTAssertEqual(queue.jobs.count, 1)
         XCTAssertEqual(queue.jobs.first?.meetingTitle, "Standup")

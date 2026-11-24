@@ -41,8 +41,9 @@ final class WatchingControllerManualRecordingTests: XCTestCase {
     func testMicrophoneRecordingStartsWhenTheMicrophoneIsAllowed() async {
         // Control for the refusal above: without it a method that never starts
         // anything would pass just as well.
-        // Seeded health: without it the loop runs a live TCC probe whose answer
-        // depends on the runner, and this test asserts a start *succeeds*.
+        // Seeded explicitly rather than through the factory's default: this
+        // test asserts a start *succeeds*, which an unseeded loop's live TCC
+        // probe would make depend on the runner.
         let controller = makeWatchingController(
             logDir: tmpDir, noMic: false, permissionHealth: .allHealthy,
         )
@@ -70,7 +71,12 @@ final class WatchingControllerManualRecordingTests: XCTestCase {
         )
         addTeardownBlock { await controller.stopManualRecording() }
 
-        controller.startManualRecording(pid: 1234, appName: "Chrome", title: "Standup")
+        // This process's own pid, so the recorded app is alive for as long as
+        // the test runs. The loop's monitor stops a manual recording on its
+        // first poll once the pid is gone, and a made-up pid is gone on most
+        // machines, so with one the assertion on `isManualRecording` below
+        // held only while that poll had not run yet.
+        controller.startManualRecording(pid: getpid(), appName: "Chrome", title: "Standup")
         // Wait for the report, not for `isManualRecording`: the loop sets that
         // inside the start, one statement before the notification, so waiting
         // on it can win the race and read an empty list.
@@ -134,7 +140,7 @@ final class WatchingControllerManualRecordingTests: XCTestCase {
         let start = try XCTUnwrap(controller.beginManualRecording(.microphone))
         let started = await start.value
         XCTAssertEqual(started, .started, "precondition")
-        controller.stopManualRecording()
+        await controller.stopManualRecording()
 
         let titles = notifier.calls.map(\.title)
         XCTAssertTrue(titles.contains(OutputDirectoryResolver.unavailableTitle), "user was told: \(titles)")
@@ -242,7 +248,10 @@ final class WatchingControllerManualRecordingTests: XCTestCase {
         })
         let (loop, _) = makeTestWatchLoop()
         controller.watchLoop = loop
-        try await loop.startManualRecording(pid: 99, appName: "Chrome", title: "Meeting")
+        // Own pid, as above: a loop recording a pid that is gone stops itself
+        // on the monitor's first poll, and the refusal below keys on the loop
+        // still recording.
+        try await loop.startManualRecording(pid: getpid(), appName: "Chrome", title: "Meeting")
         addTeardownBlock {
             await micGate.open()
             await loop.stop()
@@ -266,7 +275,7 @@ final class WatchingControllerManualRecordingTests: XCTestCase {
         // exits, which clears `manualRecordingInfo` but leaves the controller's
         // reference in place, so this also pins that the refusal keys on
         // `isManualRecording` and not on `watchLoop != nil`.
-        loop.stopManualRecording()
+        await loop.stopManualRecording()
         XCTAssertFalse(loop.isManualRecording, "precondition for the control case")
 
         controller.startManualRecording(pid: 1234, appName: "Safari", title: "Third")

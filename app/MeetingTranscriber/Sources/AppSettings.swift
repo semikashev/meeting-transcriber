@@ -56,25 +56,41 @@ enum DiarizerMode: String, CaseIterable, Codable {
     // is the regression gate that surfaces the need.
     case offline
     case sortformer
+    case nemotron
 
     var label: String {
         switch self {
         case .offline: "Offline (Clustering)"
         case .sortformer: "Sortformer (Overlap-aware)"
+        case .nemotron: "Nemotron 3 (8 speakers)"
+        }
+    }
+
+    /// Name without the qualifier, for the places that are too narrow for
+    /// `label` (the naming dialog's re-run picker) or that already state the
+    /// qualifier themselves (the speaker-cap hints).
+    var shortLabel: String {
+        switch self {
+        case .offline: "Offline"
+        case .sortformer: "Sortformer"
+        case .nemotron: "Nemotron 3"
         }
     }
 
     /// Maximum selectable speaker count for this mode. Sortformer's cap
     /// is a hard architectural limit (`SortformerConfig.numSpeakers = 4`
-    /// in FluidAudio). Offline's cap is the upper bound of the Settings
-    /// Stepper — the diarizer has no hard limit, but anything above 10
-    /// is past the useful range for typical meetings. Surfaced as a
+    /// in FluidAudio), and so is Nemotron 3's (`Nemotron3Config.numSpeakers
+    /// = 8`, the checkpoint's eight output slots). Offline's cap is the
+    /// upper bound of the Settings Stepper — the diarizer has no hard
+    /// limit, but anything above 10 is past the useful range for typical
+    /// meetings. Surfaced as a
     /// single source of truth so the Stepper ranges in Settings + the
     /// SpeakerNamingView re-run UI + the cap-hint label all agree.
     var speakerCap: Int {
         switch self {
         case .offline: 10
         case .sortformer: 4
+        case .nemotron: 8
         }
     }
 }
@@ -99,10 +115,76 @@ enum ProtocolProvider: String, CaseIterable {
     }
 }
 
+// Codable for `OpenAIConnection`; the raw values are what UserDefaults already holds.
+// swiftlint:disable raw_value_for_camel_cased_codable_enum
+enum OpenAIAPIKeyPlacement: String, CaseIterable, Codable {
+    case bearerToken
+    case customHeader
+    // swiftlint:enable raw_value_for_camel_cased_codable_enum
+
+    /// The header name a fresh install starts with.
+    static let defaultHeaderName = "api-key"
+
+    var label: String {
+        switch self {
+        case .bearerToken: "Bearer token"
+        case .customHeader: "Custom header"
+        }
+    }
+}
+
+/// A sampling parameter the user may override for the OpenAI-compatible
+/// provider. The raw value is the field name in the chat-completions body. An
+/// override that is not set is left out of the request entirely, so the server
+/// applies its own default (LM Studio and Ollama keep a per-model one) rather
+/// than one invented here.
+enum OpenAISamplingParameter: String, CaseIterable {
+    case temperature
+    case topP = "top_p"
+
+    /// Value an override starts at when the user switches it on: the OpenAI
+    /// API's documented default for both. Local servers often default lower
+    /// (Ollama and LM Studio ship around 0.7 to 0.8 for temperature), so
+    /// switching an override on is itself a change for them.
+    static let initialOverride = 1.0
+
+    var label: String {
+        switch self {
+        case .temperature: "Temperature"
+        case .topP: "Top P"
+        }
+    }
+
+    /// UserDefaults key the override is stored under.
+    var defaultsKey: String {
+        switch self {
+        case .temperature: "openAITemperature"
+        case .topP: "openAITopP"
+        }
+    }
+
+    /// The range the OpenAI API accepts for this parameter.
+    var range: ClosedRange<Double> {
+        switch self {
+        case .temperature: 0 ... 2
+        case .topP: 0 ... 1
+        }
+    }
+
+    /// Clamp a value into `range`, rounded to two decimals so stepping by
+    /// hundredths never sends float residue like 0.7000000000000001.
+    /// Non-finite input yields nil (no override): JSON cannot carry it.
+    func normalized(_ value: Double) -> Double? {
+        guard value.isFinite else { return nil }
+        let clamped = min(max(value, range.lowerBound), range.upperBound)
+        return (clamped * 100).rounded() / 100
+    }
+}
+
 @Observable
-final class AppSettings {
+final class AppSettings { // swiftlint:disable:this type_body_length
     /// Backing store. Production callers pass nothing → `.standard`. Tests
-    /// inject their own `UserDefaults(suiteName:)` so parallel test
+    /// inject a scratch suite (`DefaultsSuite.open` in the tests) so parallel test
     /// processes don't race on the shared on-disk plist.
     @ObservationIgnored private let defaults: UserDefaults
 
@@ -121,6 +203,9 @@ final class AppSettings {
     /// specifically, rather than reusing a credential another tool manages.
     @ObservationIgnored private let claudeAPIKeyAccount: String
 
+    /// Keychain account backing `notionAPIKey`, same injection reasoning as above.
+    @ObservationIgnored private let notionAPIKeyAccount: String
+
     // MARK: - Apps to Watch
 
     var watchTeams: Bool {
@@ -135,7 +220,9 @@ final class AppSettings {
         didSet { defaults.set(watchWebex, forKey: "watchWebex") }
     }
 
-    /// Watch for browser-based meetings (Chromium browsers / WebRTC), issue #503.
+    /// Watch for browser-based meetings, issue #503: Chromium browsers by their
+    /// WebRTC power assertion, Safari by its WebKit GPU process holding the mic
+    /// (`MicInputDetector.safariPatterns`).
     /// Off by default — opt-in, and browser meetings prompt before recording
     /// (the WebRTC signal isn't meeting-exclusive), unlike native auto-start.
     var watchBrowserMeetings: Bool {
@@ -176,6 +263,10 @@ final class AppSettings {
 
     var watchWhatsApp: Bool {
         didSet { defaults.set(watchWhatsApp, forKey: "watchWhatsApp") }
+    }
+
+    var watchSlack: Bool {
+        didSet { defaults.set(watchSlack, forKey: "watchSlack") }
     }
 
     var watchCustomApps: [String] {
@@ -267,15 +358,24 @@ final class AppSettings {
     /// unmeasured, each rebuild costs a moment of audio and is exposed to the
     /// restart wedge of issue #588, and a far end that is genuinely silent can
     /// trip it. Read when a recording starts, like the other capture options.
+    /// Whether app recordings begin with the microphone muted in the recording.
+    var startRecordingsMicMuted: Bool {
+        didSet { defaults.set(startRecordingsMicMuted, forKey: "startRecordingsMicMuted") }
+    }
+
+    /// The shortcut that toggles the mute while a recording runs. Off when nil.
+    var micMuteHotkey: GlobalHotkey? {
+        didSet { defaults.set(micMuteHotkey.flatMap { try? JSONEncoder().encode($0) }, forKey: "micMuteHotkey") }
+    }
+
     var silentTrackWatchdogEnabled: Bool {
         didSet { defaults.set(silentTrackWatchdogEnabled, forKey: "silentTrackWatchdogEnabled") }
     }
 
-    /// PoC: when on, mic-channel audio is also fed to a live `StreamingTranscriber`
-    /// during recording. Partial / finalised captions are logged via os_log on
-    /// subsystem `com.meetingtranscriber`, category `LiveTranscription` — no
-    /// caption-bar UI yet. Only effective when the active engine is Parakeet;
-    /// other engines silently no-op. Default: off.
+    /// PoC: when on, recording audio is also fed to a live caption pipeline,
+    /// shown in the caption overlay. Which backend runs is `LiveCaptionsGate`'s
+    /// decision from the engine's configured language; both engines support it.
+    /// Default: off.
     var liveTranscriptionEnabled: Bool {
         didSet { defaults.set(liveTranscriptionEnabled, forKey: "liveTranscriptionEnabled") }
     }
@@ -283,7 +383,7 @@ final class AppSettings {
     /// Overlay-window visibility only. Live transcription still runs when the
     /// master toggle is on; this setting only hides `LiveCaptionsOverlay`.
     /// Default on, so existing users keep seeing the bar. Missing UserDefaults
-    /// key reads as true (`defaults.object(forKey:) as? Bool ?? true`).
+    /// key reads as true (`defaults.bool(forKey:default: true)`).
     var liveCaptionsOverlayEnabled: Bool {
         didSet { defaults.set(liveCaptionsOverlayEnabled, forKey: "liveCaptionsOverlayEnabled") }
     }
@@ -311,20 +411,62 @@ final class AppSettings {
     }
 
     /// Label for the local mic speaker in dual-source mode.
-    /// Default "Me". Empty string = diarize mic track (multi-person room).
+    /// Default "Me". Only a label; it does not decide whether the mic track
+    /// is diarized. Stored as typed; `PipelineQueue` resolves an empty or
+    /// whitespace-only name, and the reserved "Remote", to "Me".
     var micName: String {
         didSet { defaults.set(micName, forKey: "micName") }
     }
 
     // MARK: - Transcription
 
+    var unloadModelsWhenIdle: Bool {
+        didSet { defaults.set(unloadModelsWhenIdle, forKey: "unloadModelsWhenIdle") }
+    }
+
     var transcriptionEngine: TranscriptionEngineSetting {
         didSet { defaults.set(transcriptionEngine.rawValue, forKey: "transcriptionEngine") }
     }
 
+    /// The stock variant picked in Settings. Stays a stock variant while a custom
+    /// model is in use, and is what an unfinished custom model falls back to.
     var whisperKitModel: String {
         didSet { defaults.set(whisperKitModel, forKey: "whisperKitModel") }
     }
+
+    /// Load `whisperKitCustomRepo`/`whisperKitCustomVariant` or the custom model
+    /// folder instead of `whisperKitModel`. Resolved by `whisperKitModelSelection`.
+    var whisperKitCustomModelEnabled: Bool {
+        didSet { defaults.set(whisperKitCustomModelEnabled, forKey: "whisperKitCustomModelEnabled") }
+    }
+
+    /// Hugging Face repository of the custom model, `owner/name`.
+    var whisperKitCustomRepo: String {
+        didSet {
+            defaults.set(whisperKitCustomRepo, forKey: "whisperKitCustomRepo")
+            refreshWhisperKitRepositoryValidation()
+        }
+    }
+
+    /// Variant folder inside `whisperKitCustomRepo`.
+    var whisperKitCustomVariant: String {
+        didSet {
+            defaults.set(whisperKitCustomVariant, forKey: "whisperKitCustomVariant")
+            refreshWhisperKitRepositoryValidation()
+        }
+    }
+
+    /// A model folder on disk; when set, it is used instead of the repository.
+    private(set) var whisperKitCustomModelFolderPath: String {
+        didSet { defaults.set(whisperKitCustomModelFolderPath, forKey: "whisperKitCustomModelFolderPath") }
+    }
+
+    private(set) var whisperKitCustomModelFolderBookmark: Data? {
+        didSet { defaults.set(whisperKitCustomModelFolderBookmark, forKey: "whisperKitCustomModelFolderBookmark") }
+    }
+
+    /// Not persisted: derived from the fields above and the folder's contents.
+    var whisperKitCustomModelValidation: WhisperKitCustomModelValidation
 
     /// Whisper transcription language. Empty string = auto-detect (maps to nil on WhisperKitEngine).
     var whisperLanguage: String {
@@ -349,9 +491,26 @@ final class AppSettings {
         didSet { defaults.set(customVocabularyBookmark, forKey: "customVocabularyBookmark") }
     }
 
-    /// Experimental opt-in: WhisperKit's prompt can reduce transcript completeness.
-    var whisperKitVocabularyPromptEnabled: Bool {
-        didSet { defaults.set(whisperKitVocabularyPromptEnabled, forKey: "whisperKitVocabularyPromptEnabled") }
+    /// Whether any engine reads the vocabulary file: Parakeet's CTC boosting and
+    /// WhisperKit's experimental prompt, which can reduce transcript completeness.
+    var customVocabularyEnabled: Bool {
+        didSet { defaults.set(customVocabularyEnabled, forKey: "customVocabularyEnabled") }
+    }
+
+    /// Upgrade value for `customVocabularyEnabled`: what the engine in use did
+    /// before the one switch. Only WhisperKit was gated, by its own prompt flag.
+    static func initialCustomVocabularyEnabled(
+        whisperKitPromptEnabled: Bool,
+        hasVocabularyFile: Bool,
+        whisperKit: Bool,
+    ) -> Bool {
+        whisperKit ? whisperKitPromptEnabled : hasVocabularyFile
+    }
+
+    func updateWhisperKitCustomModelFolder(path: String, bookmark: Data?) {
+        whisperKitCustomModelFolderPath = path
+        whisperKitCustomModelFolderBookmark = bookmark
+        refreshWhisperKitCustomModelValidation()
     }
 
     func updateCustomVocabularySelection(path: String, bookmark: Data?) {
@@ -362,17 +521,55 @@ final class AppSettings {
     var terminologyRulesText: String {
         didSet {
             defaults.set(terminologyRulesText, forKey: "terminologyRulesText")
-            terminologyRulesValidation = TerminologyNormalizer(rulesText: terminologyRulesText).diagnostics
+            guard terminologyRulesFilePath.isEmpty else { return }
+            terminologyRulesValidation = .rules(TerminologyNormalizer(rulesText: terminologyRulesText).diagnostics)
         }
     }
 
-    var terminologyRulesValidation: TerminologyNormalizer.Diagnostics
+    /// Optional rules file that replaces the text area as the source of the
+    /// terminology rules. Like the vocabulary file, the plain path is for
+    /// display; reads go through the bookmark.
+    private(set) var terminologyRulesFilePath: String {
+        didSet { defaults.set(terminologyRulesFilePath, forKey: "terminologyRulesFilePath") }
+    }
+
+    private(set) var terminologyRulesFileBookmark: Data? {
+        didSet { defaults.set(terminologyRulesFileBookmark, forKey: "terminologyRulesFileBookmark") }
+    }
+
+    func updateTerminologyRulesFileSelection(path: String, bookmark: Data?) {
+        terminologyRulesFilePath = path
+        terminologyRulesFileBookmark = bookmark
+    }
+
+    /// Every persisted bookmark's stale repair, for the one launch-time call
+    /// in `AppState`. `customVocabularyFile` also repairs from its getter; the
+    /// others rely on this call, for the reason given there.
+    func repairStaleBookmarks() {
+        repairStaleCustomOutputDirBookmark()
+        repairStaleCustomVocabularyBookmark()
+        repairStaleTerminologyRulesFileBookmark()
+        repairStaleWhisperKitCustomModelFolderBookmark()
+    }
+
+    var terminologyRulesValidation: TerminologyRulesStatus
+
+    /// Ephemeral read-only preview of the selected rules file, refreshed with
+    /// its status. Empty while the text area is the source.
+    var terminologyRulesFileContents: String
 
     /// Ephemeral UI status; recalculated when the selected vocabulary changes.
     var customVocabularyValidation: CustomVocabularyValidation
 
     var diarize: Bool {
         didSet { defaults.set(diarize, forKey: "diarize") }
+    }
+
+    /// How long a meeting may wait for its speaker names before the next
+    /// launch accepts the automatic names for it. One day by default, which is
+    /// what the cleanup has always used, so an existing install keeps it.
+    var staleNamingTimeout: StaleNamingTimeout {
+        didSet { defaults.set(staleNamingTimeout.rawValue, forKey: "staleNamingTimeout") }
     }
 
     var vadEnabled: Bool {
@@ -415,6 +612,18 @@ final class AppSettings {
 
     var diarizerMode: DiarizerMode {
         didSet { defaults.set(diarizerMode.rawValue, forKey: "diarizerMode") }
+    }
+
+    /// Open the "Name Speakers" window by itself when a meeting is ready to be
+    /// named, after processing and again on launch for meetings still waiting.
+    /// On by default, which is how the app has always behaved. Off, the
+    /// meeting still waits for its names, a "Name Speakers" notification says
+    /// so (when it starts waiting, and on launch for meetings that already
+    /// were), and the user opens the window from the menu bar
+    /// ("Name Speakers...") when it suits them. The stale cleanup
+    /// (`staleNamingTimeout`) applies either way.
+    var autoOpenSpeakerNaming: Bool {
+        didSet { defaults.set(autoOpenSpeakerNaming, forKey: "autoOpenSpeakerNaming") }
     }
 
     /// Number of expected speakers. 0 = auto-detect.
@@ -491,6 +700,14 @@ final class AppSettings {
         didSet { defaults.set(protocolLanguage, forKey: "protocolLanguage") }
     }
 
+    /// Post a notification when the meeting notes for a meeting could not be
+    /// generated (the provider failed), instead of the plain "Transcript Saved".
+    /// On by default: a failure that only shows as a warning in the menu went
+    /// unnoticed for weeks when the Claude CLI was signed out.
+    var notifyOnMeetingNotesFailure: Bool {
+        didSet { defaults.set(notifyOnMeetingNotesFailure, forKey: "notifyOnMeetingNotesFailure") }
+    }
+
     /// Append the verbatim transcript to generated Markdown meeting minutes.
     /// Defaults to `true` to preserve the output format used before this option
     /// was introduced.
@@ -507,6 +724,22 @@ final class AppSettings {
     /// Format output filenames using the AI-generated meeting title in snake_case without timestamps.
     var useAITitleForFilenames: Bool {
         didSet { defaults.set(useAITitleForFilenames, forKey: "useAITitleForFilenames") }
+    }
+
+    /// Delete the audio the app recorded and moved into the output folder once
+    /// its outputs are written and `recordingRetentionDays` have passed since
+    /// the recording date. Off by default; imports are never touched.
+    var recordingRetentionEnabled: Bool {
+        didSet { defaults.set(recordingRetentionEnabled, forKey: "recordingRetentionEnabled") }
+    }
+
+    /// Days a recording is kept after its recording date; 0 deletes it as soon
+    /// as its outputs are written. Never negative.
+    var recordingRetentionDays: Int {
+        didSet {
+            if recordingRetentionDays < 0 { recordingRetentionDays = 0 }
+            defaults.set(recordingRetentionDays, forKey: "recordingRetentionDays")
+        }
     }
 
     static let protocolLanguages = [
@@ -543,20 +776,83 @@ final class AppSettings {
         didSet { defaults.set(openAIModel, forKey: "openAIModel") }
     }
 
+    /// Sampling overrides for the OpenAI-compatible provider. Nil (the
+    /// default) leaves the key out of the request so the server's own default
+    /// applies; a set value is clamped into the API's range on write.
+    var openAITemperature: Double? {
+        didSet { storeSamplingOverride(\.openAITemperature, .temperature) }
+    }
+
+    var openAITopP: Double? {
+        didSet { storeSamplingOverride(\.openAITopP, .topP) }
+    }
+
+    /// Normalize a just-written sampling override and persist it (nil removes
+    /// the key). Reassigns only on change, because under @Observable the write
+    /// re-enters the observer and an unconditional one would recurse forever.
+    /// Persists here either way, so storage does not depend on that re-entry.
+    private func storeSamplingOverride(
+        _ keyPath: ReferenceWritableKeyPath<AppSettings, Double?>,
+        _ parameter: OpenAISamplingParameter,
+    ) {
+        let normalized = self[keyPath: keyPath].flatMap(parameter.normalized)
+        if normalized != self[keyPath: keyPath] { self[keyPath: keyPath] = normalized }
+        defaults.set(normalized, forKey: parameter.defaultsKey)
+    }
+
+    private static func loadSamplingOverride(
+        _ defaults: UserDefaults, _ parameter: OpenAISamplingParameter,
+    ) -> Double? {
+        (defaults.object(forKey: parameter.defaultsKey) as? Double).flatMap(parameter.normalized)
+    }
+
+    var openAIAPIKeyPlacement: OpenAIAPIKeyPlacement {
+        didSet { defaults.set(openAIAPIKeyPlacement.rawValue, forKey: "openAIAPIKeyPlacement") }
+    }
+
+    var openAIAPIKeyHeaderName: String {
+        didSet { defaults.set(openAIAPIKeyHeaderName, forKey: "openAIAPIKeyHeaderName") }
+    }
+
+    /// API key of the selected connection.
     var openAIAPIKey: String {
-        get { KeychainHelper.read(key: apiKeyAccount) ?? "" }
+        get { KeychainHelper.read(key: activeOpenAIKeyAccount) ?? "" }
         set {
             if newValue.isEmpty {
-                KeychainHelper.delete(key: apiKeyAccount)
+                KeychainHelper.delete(key: activeOpenAIKeyAccount)
             } else {
-                KeychainHelper.save(key: apiKeyAccount, value: newValue)
+                KeychainHelper.save(key: activeOpenAIKeyAccount, value: newValue)
             }
         }
     }
 
+    /// Saved OpenAI-compatible connections; never empty. The selected one's
+    /// entry is refreshed from the live `openAI*` values only when the selection
+    /// changes (see `AppSettings+OpenAIConnections.swift`), so between switches
+    /// the live values are the truth for it.
+    var openAIConnections: [OpenAIConnection] {
+        didSet {
+            defaults.set(try? JSONEncoder().encode(openAIConnections), forKey: "openAIConnections")
+        }
+    }
+
+    var activeOpenAIConnectionID: UUID {
+        didSet { defaults.set(activeOpenAIConnectionID.uuidString, forKey: "activeOpenAIConnectionID") }
+    }
+
+    /// Keychain account holding a connection's API key. Derived from the
+    /// injected `apiKeyAccount`, so tests never reach the production items.
+    func openAIKeyAccount(for connection: OpenAIConnection) -> String {
+        connection.usesOriginalKeychainItem ? apiKeyAccount : "\(apiKeyAccount).\(connection.id.uuidString)"
+    }
+
+    private var activeOpenAIKeyAccount: String {
+        activeOpenAIConnection.map(openAIKeyAccount(for:)) ?? apiKeyAccount
+    }
+
     #if !APPSTORE
         /// API key for the Claude CLI protocol generator, entered by the user
-        /// in Settings → Protocol Generation. Empty means use the CLI's own
+        /// in Settings → Output → AI Provider. Empty means use the CLI's own
         /// `claude login` session; this is never populated automatically.
         var claudeAPIKey: String {
             get { KeychainHelper.read(key: claudeAPIKeyAccount) ?? "" }
@@ -569,6 +865,40 @@ final class AppSettings {
             }
         }
     #endif
+
+    // MARK: - Notion Export
+
+    var notionExportEnabled: Bool {
+        didSet { defaults.set(notionExportEnabled, forKey: "notionExportEnabled") }
+    }
+
+    var notionDatabaseID: String {
+        didSet { defaults.set(notionDatabaseID, forKey: "notionDatabaseID") }
+    }
+
+    var notionSkipLocalMarkdownOnSuccess: Bool {
+        didSet { defaults.set(notionSkipLocalMarkdownOnSuccess, forKey: "notionSkipLocalMarkdownOnSuccess") }
+    }
+
+    var notionSpeakerTagsEnabled: Bool {
+        didSet { defaults.set(notionSpeakerTagsEnabled, forKey: "notionSpeakerTagsEnabled") }
+    }
+
+    var notionAPIKey: String {
+        get {
+            access(keyPath: \.notionAPIKey)
+            return KeychainHelper.read(key: notionAPIKeyAccount) ?? ""
+        }
+        set {
+            withMutation(keyPath: \.notionAPIKey) {
+                if newValue.isEmpty {
+                    KeychainHelper.delete(key: notionAPIKeyAccount)
+                } else {
+                    KeychainHelper.save(key: notionAPIKeyAccount, value: newValue)
+                }
+            }
+        }
+    }
 
     // MARK: - Output Directory
 
@@ -621,64 +951,94 @@ final class AppSettings {
         defaults: UserDefaults = .standard,
         apiKeyAccount: String = "openAIAPIKey",
         claudeAPIKeyAccount: String = "claudeAPIKey",
+        notionAPIKeyAccount: String = "notionAPIKey",
         defaultOutputDir: URL = AppPaths.downloadsProtocolsDir,
     ) {
         self.defaults = defaults
         self.apiKeyAccount = apiKeyAccount
         self.claudeAPIKeyAccount = claudeAPIKeyAccount
+        self.notionAPIKeyAccount = notionAPIKeyAccount
         self.defaultOutputDir = defaultOutputDir
 
-        watchTeams = defaults.object(forKey: "watchTeams") as? Bool ?? true
-        watchZoom = defaults.object(forKey: "watchZoom") as? Bool ?? true
-        watchWebex = defaults.object(forKey: "watchWebex") as? Bool ?? true
-        watchBrowserMeetings = defaults.object(forKey: "watchBrowserMeetings") as? Bool ?? false
+        watchTeams = defaults.bool(forKey: "watchTeams", default: true)
+        watchZoom = defaults.bool(forKey: "watchZoom", default: true)
+        watchWebex = defaults.bool(forKey: "watchWebex", default: true)
+        watchBrowserMeetings = defaults.bool(forKey: "watchBrowserMeetings", default: false)
         consentDeniedApps = defaults.stringArray(forKey: "consentDeniedApps") ?? []
         browserAutoRecordTitleKeywords = defaults.string(forKey: "browserAutoRecordTitleKeywords") ?? ""
-        watchWeChat = defaults.object(forKey: "watchWeChat") as? Bool ?? false
-        watchTencentMeeting = defaults.object(forKey: "watchTencentMeeting") as? Bool ?? false
-        watchFaceTime = defaults.object(forKey: "watchFaceTime") as? Bool ?? false
-        watchWhatsApp = defaults.object(forKey: "watchWhatsApp") as? Bool ?? false
+        watchWeChat = defaults.bool(forKey: "watchWeChat", default: false)
+        watchTencentMeeting = defaults.bool(forKey: "watchTencentMeeting", default: false)
+        watchFaceTime = defaults.bool(forKey: "watchFaceTime", default: false)
+        watchWhatsApp = defaults.bool(forKey: "watchWhatsApp", default: false)
+        watchSlack = defaults.bool(forKey: "watchSlack", default: false)
         watchCustomApps = defaults.stringArray(forKey: "watchCustomApps") ?? []
-        autoWatch = defaults.object(forKey: "autoWatch") as? Bool ?? false
-        calendarTitlesEnabled = defaults.object(forKey: "calendarTitlesEnabled") as? Bool ?? false
-        autoRecordCalendarMeetings = defaults.object(forKey: "autoRecordCalendarMeetings") as? Bool ?? false
-        promptInRoomMeetings = defaults.object(forKey: "promptInRoomMeetings") as? Bool ?? false
+        autoWatch = defaults.bool(forKey: "autoWatch", default: false)
+        calendarTitlesEnabled = defaults.bool(forKey: "calendarTitlesEnabled", default: false)
+        autoRecordCalendarMeetings = defaults.bool(forKey: "autoRecordCalendarMeetings", default: false)
+        promptInRoomMeetings = defaults.bool(forKey: "promptInRoomMeetings", default: false)
         extraConferenceDomains = defaults.string(forKey: "extraConferenceDomains") ?? ""
 
         pollInterval = defaults.object(forKey: "pollInterval") as? Double ?? 3.0
         endGrace = defaults.object(forKey: "endGrace") as? Double ?? 15.0
-        noMic = defaults.object(forKey: "noMic") as? Bool ?? false
-        recordOnly = defaults.object(forKey: "recordOnly") as? Bool ?? false
+        noMic = defaults.bool(forKey: "noMic", default: false)
+        recordOnly = defaults.bool(forKey: "recordOnly", default: false)
         micDeviceUID = defaults.object(forKey: "micDeviceUID") as? String ?? ""
         micName = defaults.object(forKey: "micName") as? String ?? "Me"
-        perChannelIndicatorEnabled = defaults.object(forKey: "perChannelIndicatorEnabled") as? Bool ?? true
-        silentTrackWatchdogEnabled = defaults.object(forKey: "silentTrackWatchdogEnabled") as? Bool ?? false
-        liveTranscriptionEnabled = defaults.object(forKey: "liveTranscriptionEnabled") as? Bool ?? false
-        liveCaptionsOverlayEnabled = defaults.object(forKey: "liveCaptionsOverlayEnabled") as? Bool ?? true
+        perChannelIndicatorEnabled = defaults.bool(forKey: "perChannelIndicatorEnabled", default: true)
+        startRecordingsMicMuted = defaults.bool(forKey: "startRecordingsMicMuted", default: false)
+        micMuteHotkey = defaults.data(forKey: "micMuteHotkey").flatMap { try? JSONDecoder().decode(GlobalHotkey.self, from: $0) }
+        silentTrackWatchdogEnabled = defaults.bool(forKey: "silentTrackWatchdogEnabled", default: false)
+        liveTranscriptionEnabled = defaults.bool(forKey: "liveTranscriptionEnabled", default: false)
+        liveCaptionsOverlayEnabled = defaults.bool(forKey: "liveCaptionsOverlayEnabled", default: true)
         liveCaptionsSize = defaults.string(forKey: "liveCaptionsSize")
             .flatMap(LiveCaptionsSize.init(rawValue:)) ?? .medium
         asymmetricSilenceWarningSeconds = max(30, min(300, defaults.object(forKey: "asymmetricSilenceWarningSeconds") as? Double ?? 90))
 
+        unloadModelsWhenIdle = defaults.bool(forKey: "unloadModelsWhenIdle", default: true)
         transcriptionEngine = (defaults.string(forKey: "transcriptionEngine")
             .flatMap(TranscriptionEngineSetting.init(rawValue:))) ?? .whisperKit
         whisperKitModel = defaults.object(forKey: "whisperKitModel") as? String
             ?? "openai_whisper-large-v3-v20240930_turbo"
+        whisperKitCustomModelEnabled = defaults.bool(forKey: "whisperKitCustomModelEnabled", default: false)
+        whisperKitCustomRepo = defaults.string(forKey: "whisperKitCustomRepo") ?? ""
+        whisperKitCustomVariant = defaults.string(forKey: "whisperKitCustomVariant") ?? ""
+        whisperKitCustomModelFolderPath = defaults.string(forKey: "whisperKitCustomModelFolderPath") ?? ""
+        whisperKitCustomModelFolderBookmark = defaults.data(forKey: "whisperKitCustomModelFolderBookmark")
+        whisperKitCustomModelValidation = .notConfigured
         whisperLanguage = defaults.object(forKey: "whisperLanguage") as? String ?? "de"
         parakeetLanguage = defaults.object(forKey: "parakeetLanguage") as? String ?? ""
         customVocabularyPath = defaults.string(forKey: "customVocabularyPath") ?? ""
         customVocabularyBookmark = defaults.data(forKey: "customVocabularyBookmark")
-        whisperKitVocabularyPromptEnabled = defaults.object(forKey: "whisperKitVocabularyPromptEnabled") as? Bool ?? false
+        if let stored = defaults.flag(forKey: "customVocabularyEnabled") {
+            customVocabularyEnabled = stored
+        } else {
+            let storedEngine = defaults.string(forKey: "transcriptionEngine")
+                .flatMap(TranscriptionEngineSetting.init(rawValue:)) ?? .whisperKit
+            let derived = Self.initialCustomVocabularyEnabled(
+                whisperKitPromptEnabled: defaults.bool(forKey: "whisperKitVocabularyPromptEnabled", default: false),
+                hasVocabularyFile: !(defaults.string(forKey: "customVocabularyPath") ?? "").isEmpty,
+                whisperKit: storedEngine == .whisperKit,
+            )
+            customVocabularyEnabled = derived
+            defaults.set(derived, forKey: "customVocabularyEnabled")
+        }
         let savedTerminologyRules = defaults.string(forKey: "terminologyRulesText") ?? ""
         terminologyRulesText = savedTerminologyRules
-        terminologyRulesValidation = TerminologyNormalizer(rulesText: savedTerminologyRules).diagnostics
+        terminologyRulesFilePath = defaults.string(forKey: "terminologyRulesFilePath") ?? ""
+        terminologyRulesFileBookmark = defaults.data(forKey: "terminologyRulesFileBookmark")
+        terminologyRulesValidation = .rules(TerminologyNormalizer(rulesText: savedTerminologyRules).diagnostics)
+        terminologyRulesFileContents = ""
         customVocabularyValidation = .notConfigured
-        diarize = defaults.object(forKey: "diarize") as? Bool ?? true
-        vadEnabled = defaults.object(forKey: "vadEnabled") as? Bool ?? false
+        diarize = defaults.bool(forKey: "diarize", default: true)
+        staleNamingTimeout = defaults.string(forKey: "staleNamingTimeout")
+            .flatMap(StaleNamingTimeout.init(rawValue:)) ?? .oneDay
+        vadEnabled = defaults.bool(forKey: "vadEnabled", default: false)
         vadThreshold = defaults.object(forKey: "vadThreshold") as? Float ?? 0.5
-        echoCancellationEnabled = defaults.object(forKey: "echoCancellationEnabled") as? Bool ?? false
-        echoDedupEnabled = defaults.object(forKey: "echoDedupEnabled") as? Bool ?? false
+        echoCancellationEnabled = defaults.bool(forKey: "echoCancellationEnabled", default: false)
+        echoDedupEnabled = defaults.bool(forKey: "echoDedupEnabled", default: false)
         diarizerMode = (defaults.string(forKey: "diarizerMode")
             .flatMap(DiarizerMode.init(rawValue:))) ?? .offline
+        autoOpenSpeakerNaming = defaults.bool(forKey: "autoOpenSpeakerNaming", default: true)
         numSpeakers = defaults.object(forKey: "numSpeakers") as? Int ?? 0
 
         let t = Self.loadDiarizerTuning(from: defaults)
@@ -695,20 +1055,43 @@ final class AppSettings {
             protocolContextPath = defaults.string(forKey: "protocolContextPath") ?? ""
         #endif
         protocolLanguage = defaults.string(forKey: "protocolLanguage") ?? "German"
-        includeFullTranscriptInProtocol = defaults.object(forKey: "includeFullTranscriptInProtocol") as? Bool ?? true
-        saveRawTranscriptSeparately = defaults.object(forKey: "saveRawTranscriptSeparately") as? Bool ?? true
-        useAITitleForFilenames = defaults.object(forKey: "useAITitleForFilenames") as? Bool ?? false
+        notifyOnMeetingNotesFailure = defaults.bool(forKey: "notifyOnMeetingNotesFailure", default: true)
+        includeFullTranscriptInProtocol = defaults.bool(forKey: "includeFullTranscriptInProtocol", default: true)
+        saveRawTranscriptSeparately = defaults.bool(forKey: "saveRawTranscriptSeparately", default: true)
+        useAITitleForFilenames = defaults.bool(forKey: "useAITitleForFilenames", default: false)
+        recordingRetentionEnabled = defaults.bool(forKey: "recordingRetentionEnabled", default: false)
+        recordingRetentionDays = max(0, defaults.object(forKey: "recordingRetentionDays") as? Int ?? 30)
 
         openAIEndpoint = defaults.object(forKey: "openAIEndpoint") as? String
             ?? Self.defaultOpenAIEndpoint
         openAIModel = defaults.object(forKey: "openAIModel") as? String ?? "llama3.1"
+        openAITemperature = Self.loadSamplingOverride(defaults, .temperature)
+        openAITopP = Self.loadSamplingOverride(defaults, .topP)
+        openAIAPIKeyPlacement = defaults.string(forKey: "openAIAPIKeyPlacement")
+            .flatMap(OpenAIAPIKeyPlacement.init(rawValue:)) ?? .bearerToken
+        openAIAPIKeyHeaderName = defaults.string(forKey: "openAIAPIKeyHeaderName") ?? OpenAIAPIKeyPlacement.defaultHeaderName
+        let storedConnectionData = defaults.data(forKey: "openAIConnections")
+        let decodedConnections = storedConnectionData.map(OpenAIConnection.decodeList)
+        let storedConnections = decodedConnections?.connections ?? []
+        // The next write drops what this build cannot read; keep the first such list.
+        if decodedConnections?.complete == false, defaults.data(forKey: "openAIConnectionsUnreadable") == nil {
+            defaults.set(storedConnectionData, forKey: "openAIConnectionsUnreadable")
+        }
+        let storedActive = defaults.string(forKey: "activeOpenAIConnectionID").flatMap(UUID.init(uuidString:))
+        openAIConnections = storedConnections
+        activeOpenAIConnectionID = storedConnections.first { $0.id == storedActive }?.id
+            ?? storedConnections.first?.id ?? UUID()
         customOutputDirBookmark = defaults.data(forKey: "customOutputDirBookmark")
+        notionExportEnabled = defaults.object(forKey: "notionExportEnabled") as? Bool ?? false
+        notionDatabaseID = defaults.string(forKey: "notionDatabaseID") ?? ""
+        notionSkipLocalMarkdownOnSuccess = defaults.object(forKey: "notionSkipLocalMarkdownOnSuccess") as? Bool ?? false
+        notionSpeakerTagsEnabled = defaults.object(forKey: "notionSpeakerTagsEnabled") as? Bool ?? false
 
         // Migrate legacy "audioDebugLogging" key (renamed to "verboseDiagnostics" 2026-05-04).
         // New key wins if both are set; legacy value seeds the new key on first launch.
-        if let new = defaults.object(forKey: "verboseDiagnostics") as? Bool {
+        if let new = defaults.flag(forKey: "verboseDiagnostics") {
             verboseDiagnostics = new
-        } else if let legacy = defaults.object(forKey: "audioDebugLogging") as? Bool {
+        } else if let legacy = defaults.flag(forKey: "audioDebugLogging") {
             verboseDiagnostics = legacy
             defaults.set(legacy, forKey: "verboseDiagnostics")
         } else {
@@ -721,11 +1104,48 @@ final class AppSettings {
             defaults.removeObject(forKey: "audioDebugLogging")
         }
         #if !APPSTORE
-            debugRPCEnabled = defaults.object(forKey: "debugRPCEnabled") as? Bool ?? false
+            debugRPCEnabled = defaults.bool(forKey: "debugRPCEnabled", default: false)
         #endif
-        checkForUpdates = defaults.object(forKey: "checkForUpdates") as? Bool ?? true
-        includePreReleases = defaults.object(forKey: "includePreReleases") as? Bool ?? false
+        checkForUpdates = defaults.bool(forKey: "checkForUpdates", default: true)
+        includePreReleases = defaults.bool(forKey: "includePreReleases", default: false)
         refreshCustomVocabularyValidation()
+        refreshTerminologyRulesValidation()
+        refreshWhisperKitCustomModelValidation()
+        if defaults.object(forKey: "openAIConnections") == nil {
+            migrateToOpenAIConnections()
+        } else if openAIConnections.isEmpty {
+            startFreshOpenAIConnection()
+        } else if let first = storedConnections.first, !storedConnections.contains(where: { $0.id == storedActive }) {
+            // The live values belong to a selection that is gone; load the
+            // connection that takes its place so its key goes to its endpoint.
+            applyOpenAIConnection(first)
+        }
+    }
+
+    /// Before connections existed: the one configured connection becomes
+    /// "Default" and keeps the Keychain item its key is already in.
+    private func migrateToOpenAIConnections() {
+        let migrated = OpenAIConnection(
+            id: UUID(), name: "Default", endpoint: openAIEndpoint, model: openAIModel,
+            temperature: openAITemperature, topP: openAITopP,
+            apiKeyPlacement: openAIAPIKeyPlacement, apiKeyHeaderName: openAIAPIKeyHeaderName,
+            usesOriginalKeychainItem: true,
+        )
+        openAIConnections = [migrated]
+        activeOpenAIConnectionID = migrated.id
+    }
+
+    /// Stored connections exist but none is readable. The live values belong to
+    /// whichever was selected, so the replacement gets its own empty Keychain
+    /// item: the original key must not go to that connection's endpoint.
+    private func startFreshOpenAIConnection() {
+        let fresh = OpenAIConnection(
+            id: UUID(), name: "Connection 1", endpoint: openAIEndpoint, model: openAIModel,
+            temperature: openAITemperature, topP: openAITopP,
+            apiKeyPlacement: openAIAPIKeyPlacement, apiKeyHeaderName: openAIAPIKeyHeaderName,
+        )
+        openAIConnections = [fresh]
+        activeOpenAIConnectionID = fresh.id
     }
 
     /// Bag of values used during init to read all 5 tuning knobs in one go.
@@ -749,8 +1169,7 @@ final class AppSettings {
                 ?? DiarizerTuningDefaults.warmStartFb,
             minSegmentDuration: defaults.object(forKey: "diarizerMinSegmentDuration") as? Double
                 ?? DiarizerTuningDefaults.minSegmentDurationSeconds,
-            excludeOverlap: defaults.object(forKey: "diarizerExcludeOverlap") as? Bool
-                ?? DiarizerTuningDefaults.excludeOverlap,
+            excludeOverlap: defaults.bool(forKey: "diarizerExcludeOverlap", default: DiarizerTuningDefaults.excludeOverlap),
         )
     }
 }

@@ -24,6 +24,71 @@ final class WorkflowIntegrationTests: XCTestCase {
         let audioPath: URL
     }
 
+    private actor StubNotionExporter: NotionExporting {
+        struct Export: Sendable {
+            let existingPageID: String?
+            let markdown: String
+            let transcript: String?
+            let tags: [String]
+        }
+
+        let result: NotionPageResult
+        let fail: Bool
+        private var failAfterPageCreatedCount: Int
+        private(set) var exports: [Export] = []
+
+        init(result: NotionPageResult, fail: Bool = false, failAfterPageCreatedCount: Int = 0) {
+            self.result = result
+            self.fail = fail
+            self.failAfterPageCreatedCount = failAfterPageCreatedCount
+        }
+
+        // swiftlint:disable:next function_parameter_count
+        func exportMeeting(
+            title _: String,
+            date _: Date?,
+            tags: [String],
+            markdown: String,
+            transcript: String?,
+            existingPageID: String?,
+            onPageCreated: @Sendable (NotionPageResult) async -> Void,
+        ) async throws -> NotionPageResult {
+            exports.append(Export(existingPageID: existingPageID, markdown: markdown, transcript: transcript, tags: tags))
+            if fail { throw URLError(.notConnectedToInternet) }
+            await onPageCreated(result)
+            if failAfterPageCreatedCount > 0 {
+                failAfterPageCreatedCount -= 1
+                throw URLError(.networkConnectionLost)
+            }
+            return result
+        }
+    }
+
+    /// Reports what is on disk at the moment the export starts.
+    private actor LocalFileObservingExporter: NotionExporting {
+        let directory: URL
+        private(set) var markdownFilesAtExport: [String] = []
+
+        init(directory: URL) {
+            self.directory = directory
+        }
+
+        // swiftlint:disable:next function_parameter_count
+        func exportMeeting(
+            title _: String,
+            date _: Date?,
+            tags _: [String],
+            markdown _: String,
+            transcript _: String?,
+            existingPageID _: String?,
+            onPageCreated _: @Sendable (NotionPageResult) async -> Void,
+        ) throws -> NotionPageResult {
+            let files = try FileManager.default.subpathsOfDirectory(atPath: directory.path)
+            markdownFilesAtExport = files.filter { $0.hasSuffix(".md") }
+            return NotionPageResult(pageID: "page-1")
+        }
+    }
+
     /// Reference-type collector for state transitions captured via onJobStateChange.
     private final class TransitionCollector {
         var transitions: [(JobState, JobState)] = []
@@ -40,6 +105,9 @@ final class WorkflowIntegrationTests: XCTestCase {
         echoCancellationEnabled: Bool = false,
         echoCancellerFactory: (() -> (any EchoCancelling)?)? = nil,
         terminologyRules: String = "",
+        notionExportConfiguration: NotionExportConfiguration? = nil,
+        notionExportResolution: NotionExportResolution? = nil,
+        notionExportResolutionProvider: (() -> NotionExportResolution)? = nil,
     ) throws -> (Harness, TransitionCollector) {
         let engine = MockEngine()
         engine.segmentsToReturn = [
@@ -60,6 +128,9 @@ final class WorkflowIntegrationTests: XCTestCase {
 
         let protocolGen = MockProtocolGen()
         let collector = TransitionCollector()
+        let exportConfigurationProvider: () -> NotionExportResolution = notionExportResolutionProvider ?? {
+            notionExportResolution ?? notionExportConfiguration.map(NotionExportResolution.ready) ?? .disabled
+        }
 
         let terminologyNormalizer = { TerminologyNormalizer(rulesText: terminologyRules) }
         let queue = PipelineQueue(
@@ -78,6 +149,7 @@ final class WorkflowIntegrationTests: XCTestCase {
             saveRawTranscriptSeparately: saveRawTranscriptSeparately,
             transcriptOutputOptionsProvider: transcriptOutputOptionsProvider,
             terminologyNormalizer: terminologyNormalizer,
+            notionExportConfigurationProvider: exportConfigurationProvider,
         )
 
         queue.onJobStateChange = { [collector] _, old, new in
@@ -544,6 +616,18 @@ final class WorkflowIntegrationTests: XCTestCase {
         XCTAssertFalse(h.queue.jobs.first?.warnings.isEmpty ?? true)
     }
 
+    /// The kind travels with the job, so the done notification can say why. The
+    /// mock throws an error that is not a `ProtocolError`.
+    func testWorkflowProtocolGenerationFailureRecordsTheReason() async throws {
+        let (h, _) = try makeHarness()
+        h.protocolGen.shouldThrow = true
+
+        h.queue.enqueue(makeJob(audioPath: h.audioPath))
+        await h.queue.processNext()
+
+        XCTAssertEqual(h.queue.jobs.first?.notesFailure, .other)
+    }
+
     func testWorkflowProtocolFailureRetainsRawOutputWhenDisabled() async throws {
         let (h, _) = try makeHarness(saveRawTranscriptSeparately: false)
         h.protocolGen.shouldThrow = true
@@ -819,6 +903,623 @@ final class WorkflowIntegrationTests: XCTestCase {
         XCTAssertTrue(queue.jobs.first?.warnings.isEmpty ?? false)
     }
 
+    // MARK: - Notion export
+
+    func testWorkflowRecordsTheNotionPageOnceTheExportFinishes() async throws {
+        let exporter = StubNotionExporter(
+            result: NotionPageResult(
+                pageID: "page-1",
+                url: "https://www.notion.so/page-1",
+                omittedProperties: ["Date"],
+            ),
+        )
+        let (harness, _) = try makeHarness(
+            notionExportConfiguration: NotionExportConfiguration(exporter: exporter, databaseID: "database-1"),
+        )
+
+        let job = makeJob(title: "Notion Export", audioPath: harness.audioPath)
+        harness.queue.enqueue(job)
+        await harness.queue.processNext()
+        await harness.queue.awaitNotionExports()
+
+        let finished = try XCTUnwrap(harness.queue.jobs.first)
+        XCTAssertEqual(finished.state, .done)
+        XCTAssertEqual(finished.notionPageID, "page-1")
+        XCTAssertEqual(finished.notionDatabaseID, "database-1")
+        XCTAssertEqual(finished.notionPageURL?.absoluteString, "https://www.notion.so/page-1")
+        XCTAssertTrue(finished.warnings.contains { $0.contains("omitted Date") })
+        XCTAssertNotNil(finished.protocolPath, "A successful export keeps local Markdown by default")
+        let exports = await exporter.exports
+        XCTAssertEqual(exports.first?.tags, [], "No speaker or fixed tags are exported by default")
+    }
+
+    func testDirectDiarizationExportsStructuredSpeakerTagsWithoutNamingDialog() async throws {
+        for headless in [false, true] {
+            let exporter = StubNotionExporter(result: NotionPageResult(pageID: "page-1"))
+            let (harness, _) = try makeHarness(
+                diarizeEnabled: true,
+                notionExportConfiguration: NotionExportConfiguration(
+                    exporter: exporter, databaseID: "database-1", speakerTagsEnabled: true,
+                ),
+            )
+            harness.diarization.resultToReturn = DiarizationResult(
+                segments: [
+                    .init(start: 0, end: 5, speaker: "SPEAKER_00"),
+                    .init(start: 5, end: 10, speaker: "SPEAKER_01"),
+                ],
+                speakingTimes: ["SPEAKER_00": 16, "SPEAKER_01": 14],
+                autoNames: ["SPEAKER_00": "Alice", "SPEAKER_01": "Bob"],
+                embeddings: headless ? ["SPEAKER_00": [1, 0, 0], "SPEAKER_01": [0, 1, 0]] : nil,
+            )
+            let job = PipelineJob(
+                meetingTitle: "Direct Export", appName: "File", mixPath: harness.audioPath,
+                appPath: nil, micPath: nil, micDelay: 0,
+                participants: ["Alice", "Bob"], autoSkipNaming: headless,
+            )
+            harness.queue.enqueue(job)
+            await harness.queue.awaitProcessing()
+
+            let exports = await exporter.exports
+            let exported = try XCTUnwrap(exports.first)
+            XCTAssertEqual(exported.tags.sorted(), ["Alice", "Bob"])
+            XCTAssertEqual(harness.queue.jobs.first?.state, .done)
+            XCTAssertNil(harness.queue.speakerNamingDataByJob[job.id])
+        }
+    }
+
+    func testEnabledButUnconfiguredExportWarnsAndKeepsLocalProtocol() async throws {
+        let (harness, _) = try makeHarness(notionExportResolution: .unconfigured)
+        harness.queue.enqueue(makeJob(audioPath: harness.audioPath))
+        await harness.queue.awaitProcessing()
+
+        let finished = try XCTUnwrap(harness.queue.jobs.first)
+        XCTAssertTrue(finished.warnings.contains(PipelineQueue.notionExportUnconfiguredWarning))
+        XCTAssertNotNil(finished.protocolPath)
+        XCTAssertNil(finished.notionExportStatus)
+    }
+
+    func testSuccessfulExportAfterTheConfigurationIsFixedDropsTheSkippedWarning() async throws {
+        let exporter = StubNotionExporter(result: NotionPageResult(pageID: "page-1"))
+        var resolution = NotionExportResolution.unconfigured
+        let provider = { resolution }
+        let (harness, _) = try makeHarness(notionExportResolutionProvider: provider)
+        var job = makeJob(audioPath: harness.audioPath)
+        job.warnings = ["Unrelated warning"]
+        harness.queue.enqueue(job)
+        await harness.queue.awaitProcessing()
+        XCTAssertTrue(try XCTUnwrap(harness.queue.jobs.first).warnings.contains(PipelineQueue.notionExportUnconfiguredWarning))
+
+        // The token and database are added, then the protocol is generated again.
+        resolution = .ready(NotionExportConfiguration(exporter: exporter, databaseID: "database-1"))
+        let finished = try XCTUnwrap(harness.queue.jobs.first)
+        let transcriptPath = try XCTUnwrap(finished.transcriptPath)
+        try await harness.queue.generateProtocol(
+            jobID: job.id, transcript: "again", title: job.meetingTitle,
+            protocolsDir: transcriptPath.deletingLastPathComponent(),
+        )
+        // The job is already done, so nothing else hands the queued export over.
+        harness.queue.startPendingNotionExport(jobID: job.id)
+        await harness.queue.awaitNotionExports()
+
+        let exports = await exporter.exports
+        XCTAssertEqual(exports.count, 1)
+        let exported = try XCTUnwrap(harness.queue.jobs.first)
+        XCTAssertEqual(exported.notionExportStatus, .completed)
+        XCTAssertEqual(exported.warnings, ["Unrelated warning"], "a saved page leaves no warning that says the export was skipped")
+    }
+
+    func testDisabledExportAddsNoWarning() async throws {
+        let (harness, _) = try makeHarness(notionExportResolution: .disabled)
+        harness.queue.enqueue(makeJob(audioPath: harness.audioPath))
+        await harness.queue.awaitProcessing()
+
+        XCTAssertFalse(try XCTUnwrap(harness.queue.jobs.first).warnings.contains(PipelineQueue.notionExportUnconfiguredWarning))
+    }
+
+    func testSuccessfulNotionOnlyExportCountsAsASavedProtocol() async throws {
+        let exporter = StubNotionExporter(result: NotionPageResult(pageID: "page-1", url: "https://www.notion.so/page-1"))
+        let (harness, _) = try makeHarness(
+            saveRawTranscriptSeparately: false,
+            notionExportConfiguration: NotionExportConfiguration(
+                exporter: exporter, databaseID: "database-1", skipLocalMarkdown: true,
+            ),
+        )
+        harness.queue.enqueue(makeJob(audioPath: harness.audioPath))
+        await harness.queue.awaitProcessing()
+
+        let finished = try XCTUnwrap(harness.queue.jobs.first)
+        XCTAssertNil(finished.protocolPath)
+        XCTAssertFalse(finished.warnings.contains { $0.contains("Raw transcript retained") })
+        XCTAssertNil(finished.transcriptPath)
+    }
+
+    func testFailedExportKeepsLocalProtocolAndNamesTheReason() async throws {
+        let exporter = StubNotionExporter(result: NotionPageResult(pageID: "page-1"), fail: true)
+        let (harness, _) = try makeHarness(
+            notionExportConfiguration: NotionExportConfiguration(exporter: exporter, databaseID: "database-1"),
+        )
+        harness.queue.enqueue(makeJob(audioPath: harness.audioPath))
+        await harness.queue.awaitProcessing()
+
+        let finished = try XCTUnwrap(harness.queue.jobs.first)
+        XCTAssertNotNil(finished.protocolPath)
+        XCTAssertEqual(finished.notionExportStatus, .failed)
+        XCTAssertEqual(finished.warnings.filter { $0.hasPrefix("Notion export failed (") }.count, 1)
+    }
+
+    func testSlowExportDoesNotHoldUpTheJobOrTheQueue() async throws {
+        let exporter = GatedNotionExporter()
+        let (harness, _) = try makeHarness(
+            notionExportConfiguration: NotionExportConfiguration(exporter: exporter, databaseID: "database-1"),
+        )
+        harness.queue.enqueue(makeJob(audioPath: harness.audioPath))
+        await harness.queue.processNext()
+
+        let running = try XCTUnwrap(harness.queue.jobs.first)
+        XCTAssertEqual(running.state, .done)
+        XCTAssertEqual(running.notionExportStatus, .inProgress)
+        XCTAssertFalse(harness.queue.isProcessing)
+
+        await exporter.release()
+        await harness.queue.awaitNotionExports()
+        XCTAssertEqual(harness.queue.jobs.first?.notionExportStatus, .completed)
+    }
+
+    func testNotionOnlyExportRemovesItsBackupOnlyAfterSucceeding() async throws {
+        let exporter = GatedNotionExporter()
+        let (harness, _) = try makeHarness(
+            notionExportConfiguration: NotionExportConfiguration(
+                exporter: exporter, databaseID: "database-1", skipLocalMarkdown: true,
+            ),
+        )
+        harness.queue.enqueue(makeJob(audioPath: harness.audioPath))
+        await harness.queue.processNext()
+
+        let backup = try XCTUnwrap(harness.queue.jobs.first?.protocolPath)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: backup.path))
+
+        await exporter.release()
+        await harness.queue.awaitNotionExports()
+        XCTAssertNil(harness.queue.jobs.first?.protocolPath)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: backup.path))
+    }
+
+    func testEveryFinishedExportReportsItsOutcome() async throws {
+        for (fail, reason) in [(false, nil), (true, "network error")] as [(Bool, String?)] {
+            let exporter = StubNotionExporter(result: NotionPageResult(pageID: "page-1"), fail: fail)
+            let (harness, _) = try makeHarness(
+                notionExportConfiguration: NotionExportConfiguration(exporter: exporter, databaseID: "database-1"),
+            )
+            var outcomes: [String?] = []
+            harness.queue.onNotionExportFinished = { _, failure in outcomes.append(failure) }
+            let job = makeJob(audioPath: harness.audioPath)
+            harness.queue.enqueue(job)
+            await harness.queue.awaitProcessing()
+            XCTAssertEqual(outcomes, [reason])
+
+            if fail {
+                await harness.queue.retryNotionExport(id: job.id)
+                XCTAssertEqual(outcomes, [reason, reason], "a retry reports too")
+            }
+        }
+    }
+
+    func testAcceptingAutoNamesExportsOnlyRealNamesAsTags() async throws {
+        let exporter = StubNotionExporter(result: NotionPageResult(pageID: "page-1"))
+        let (harness, _) = try makeHarness(
+            notionExportConfiguration: NotionExportConfiguration(
+                exporter: exporter, databaseID: "database-1", speakerTagsEnabled: true,
+            ),
+        )
+        let transcriptPath = tmpDir.appendingPathComponent("meeting.txt")
+        try "[00:00] Alice: Hello".write(to: transcriptPath, atomically: true, encoding: .utf8)
+        var job = makeJob(audioPath: harness.audioPath)
+        job.state = .speakerNamingPending
+        job.transcriptPath = transcriptPath
+        harness.queue.insertJobForTesting(job)
+        harness.queue.speakerNamingDataByJob[job.id] = NamingSessionFixture.namingData(
+            jobID: job.id, mapping: ["SPEAKER_0": "Alice", "SPEAKER_1": "SPEAKER_1"],
+        )
+
+        harness.queue.completeSpeakerNaming(jobID: job.id, result: .skipped)
+        for _ in 0 ..< 200 where await exporter.exports.isEmpty {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        await harness.queue.awaitNotionExports()
+
+        let exports = await exporter.exports
+        XCTAssertEqual(exports.first?.tags, ["Alice"])
+    }
+
+    func testGenericSpeakerLabelsAreNotExportedAsTags() {
+        XCTAssertEqual(
+            NotionTagFilter.confirmedNames(["Alice", "SPEAKER_00", "R_SPEAKER_1", "M_SPEAKER_2", "Speaker 3", "Smith, John"]),
+            ["Alice", "Smith, John"],
+        )
+    }
+
+    func testOnlyNotionHttpsURLsAreStoredOnTheJob() {
+        for good in ["https://app.notion.com/p/a", "https://www.notion.so/a", "https://team.notion.site/a"] {
+            XCTAssertNotNil(PipelineJob.trustedNotionURL(good), good)
+        }
+        for bad in ["http://www.notion.so/a", "https://evilnotion.so/a", "https://notion.so.evil.com/a", "file:///etc/passwd"] {
+            XCTAssertNil(PipelineJob.trustedNotionURL(bad), bad)
+        }
+    }
+
+    func testLocalProtocolIsOnDiskBeforeTheExportStarts() async throws {
+        let exporter = LocalFileObservingExporter(directory: tmpDir)
+        let (harness, _) = try makeHarness(
+            notionExportConfiguration: NotionExportConfiguration(exporter: exporter, databaseID: "database-1"),
+        )
+        harness.queue.enqueue(makeJob(audioPath: harness.audioPath))
+        await harness.queue.awaitProcessing()
+
+        let files = await exporter.markdownFilesAtExport
+        XCTAssertEqual(files.count, 1)
+    }
+
+    func testHeldFailedExportReleasesItsAudioSidecars() async throws {
+        let exporter = StubNotionExporter(result: NotionPageResult(pageID: "page-1"), fail: true)
+        let (harness, _) = try makeHarness(
+            notionExportConfiguration: NotionExportConfiguration(exporter: exporter, databaseID: "database-1"),
+        )
+        let job = makeJob(audioPath: harness.audioPath)
+        let store = SpeakerNamingStore(outputDir: tmpDir)
+        let recordings = try XCTUnwrap(tmpDir).appendingPathComponent("recordings")
+        var slug: String?
+        harness.protocolGen.onGenerate = { [queue = harness.queue] in
+            slug = queue.jobs.first { $0.id == job.id }?.namingSlug
+            guard let slug else { return }
+            try? FileManager.default.createDirectory(at: recordings, withIntermediateDirectories: true)
+            FileManager.default.createFile(atPath: recordings.appendingPathComponent("\(slug)_16k.wav").path, contents: Data([0]))
+        }
+        harness.queue.enqueue(job)
+        await harness.queue.awaitProcessing()
+
+        XCTAssertEqual(harness.queue.jobs.first?.notionExportStatus, .failed)
+        let observedSlug = try XCTUnwrap(slug)
+        XCTAssertFalse(store.hasSidecar(slug: observedSlug, suffix: SpeakerNamingStore.mixSuffix))
+    }
+
+    func testFailedNotionOnlyExportStillSavesLocalBackup() async throws {
+        let exporter = StubNotionExporter(result: NotionPageResult(pageID: "page-1"), fail: true)
+        let (harness, _) = try makeHarness(
+            notionExportConfiguration: NotionExportConfiguration(
+                exporter: exporter, databaseID: "database-1", skipLocalMarkdown: true,
+            ),
+        )
+        let job = makeJob(audioPath: harness.audioPath)
+        harness.queue.enqueue(job)
+        await harness.queue.awaitProcessing()
+
+        let finished = try XCTUnwrap(harness.queue.jobs.first)
+        let backup = try XCTUnwrap(finished.protocolPath)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: backup.path))
+        XCTAssertTrue(finished.warnings.contains { $0.contains("Notion export failed") })
+    }
+
+    func testPartialNotionExportRetriesSavedMarkdownWithoutReprocessingAudio() async throws {
+        let exporter = StubNotionExporter(
+            result: NotionPageResult(pageID: "page-1", url: "https://www.notion.so/page-1"),
+            failAfterPageCreatedCount: 1,
+        )
+        let (harness, _) = try makeHarness(
+            notionExportConfiguration: NotionExportConfiguration(
+                exporter: exporter, databaseID: "database-1", skipLocalMarkdown: true,
+            ),
+        )
+        var generationCount = 0
+        harness.protocolGen.onGenerate = { generationCount += 1 }
+        let job = makeJob(audioPath: harness.audioPath)
+        harness.queue.enqueue(job)
+        await harness.queue.awaitProcessing()
+
+        let failed = try XCTUnwrap(harness.queue.jobs.first)
+        XCTAssertEqual(failed.state, .done)
+        XCTAssertEqual(failed.notionExportStatus, .failed)
+        XCTAssertEqual(failed.notionPageID, "page-1")
+        let backup = try XCTUnwrap(failed.protocolPath)
+        let savedMarkdown = try String(contentsOf: backup, encoding: .utf8)
+        XCTAssertTrue(savedMarkdown.contains("## Full Transcript"))
+        XCTAssertTrue(savedMarkdown.contains("Hello world"))
+        XCTAssertTrue(harness.queue.canRetryNotionExport(id: job.id))
+        XCTAssertEqual(harness.engine.transcribeCallCount, 1)
+        XCTAssertEqual(generationCount, 1)
+
+        let retrySucceeded = await harness.queue.retryNotionExport(id: job.id)
+        XCTAssertTrue(retrySucceeded)
+
+        let exports = await exporter.exports
+        XCTAssertEqual(exports.count, 2)
+        XCTAssertEqual(exports[1].existingPageID, "page-1")
+        XCTAssertEqual(exports[1].markdown, savedMarkdown)
+        XCTAssertNil(exports[1].transcript, "The transcript is already embedded in the saved Markdown")
+        XCTAssertEqual(harness.engine.transcribeCallCount, 1)
+        XCTAssertEqual(generationCount, 1)
+        XCTAssertEqual(harness.queue.jobs.first?.notionExportStatus, .completed)
+        XCTAssertFalse(harness.queue.jobs.first?.warnings.contains { $0.contains("Notion export failed") } ?? true)
+        XCTAssertNil(harness.queue.jobs.first?.protocolPath)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: backup.path))
+    }
+
+    /// The menu offers the retry from the job's state alone, so a backup removed
+    /// behind the app's back is only discovered when the retry runs. It then
+    /// says so instead of doing nothing, and does not export an empty page.
+    func testNotionRetryReportsAReadFailureWhenTheBackupWasRemovedBehindTheApp() async throws {
+        let exporter = StubNotionExporter(
+            result: NotionPageResult(pageID: "page-1", url: "https://www.notion.so/page-1"),
+            failAfterPageCreatedCount: 1,
+        )
+        let (harness, _) = try makeHarness(
+            notionExportConfiguration: NotionExportConfiguration(exporter: exporter, databaseID: "database-1"),
+        )
+        let job = makeJob(audioPath: harness.audioPath)
+        harness.queue.enqueue(job)
+        await harness.queue.awaitProcessing()
+        let backup = try XCTUnwrap(harness.queue.jobs.first?.protocolPath)
+        try FileManager.default.removeItem(at: backup)
+
+        XCTAssertTrue(harness.queue.canRetryNotionExport(id: job.id), "The hint comes from the job's state, not the file")
+        let retrySucceeded = await harness.queue.retryNotionExport(id: job.id)
+
+        XCTAssertFalse(retrySucceeded)
+        let failed = try XCTUnwrap(harness.queue.jobs.first)
+        XCTAssertEqual(failed.notionExportStatus, .failed)
+        XCTAssertTrue(failed.warnings.contains("Could not read the local protocol backup; Notion export was not retried"))
+        let exports = await exporter.exports
+        XCTAssertEqual(exports.count, 1, "No second export without a backup to export")
+    }
+
+    /// What the exporter turns an export's arguments into: the retry replaces the
+    /// page's blocks, so these are what the page ends up holding.
+    private func sentBlocks(_ export: StubNotionExporter.Export) throws -> Data {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .sortedKeys
+        return try encoder.encode(MarkdownToNotionBlocks.convert(markdown: export.markdown, transcript: export.transcript))
+    }
+
+    private func failedNotionExportWithTranscript(
+        includeFullTranscript: Bool,
+    ) async throws -> (harness: Harness, exporter: StubNotionExporter, job: PipelineJob, backup: URL) {
+        let exporter = StubNotionExporter(
+            result: NotionPageResult(pageID: "page-1", url: "https://www.notion.so/page-1"),
+            failAfterPageCreatedCount: 1,
+        )
+        let (harness, _) = try makeHarness(
+            includeFullTranscriptInProtocol: includeFullTranscript,
+            notionExportConfiguration: NotionExportConfiguration(exporter: exporter, databaseID: "database-1"),
+        )
+        let job = makeJob(audioPath: harness.audioPath)
+        harness.queue.enqueue(job)
+        await harness.queue.awaitProcessing()
+        let failed = try XCTUnwrap(harness.queue.jobs.first)
+        XCTAssertEqual(failed.notionExportStatus, .failed)
+        return try (harness, exporter, failed, XCTUnwrap(failed.protocolPath))
+    }
+
+    /// The retry replaces the page's blocks, so a page that came out poorer
+    /// would delete what the first attempt wrote. With the option on, the
+    /// transcript sits in the backup the retry reads, and the page gets the
+    /// same blocks as before.
+    func testNotionRetrySendsTheSameBlocksAsTheExportItRepeats() async throws {
+        let (harness, exporter, job, _) = try await failedNotionExportWithTranscript(includeFullTranscript: true)
+
+        let retrySucceeded = await harness.queue.retryNotionExport(id: job.id)
+
+        XCTAssertTrue(retrySucceeded)
+        let exports = await exporter.exports
+        XCTAssertEqual(exports.count, 2)
+        let first = try sentBlocks(exports[0])
+        let firstText = try XCTUnwrap(String(data: first, encoding: .utf8))
+        XCTAssertTrue(firstText.contains("Full Transcript"), "The first export carries the transcript toggle")
+        XCTAssertTrue(firstText.contains("Hello world"))
+        XCTAssertEqual(try sentBlocks(exports[1]), first, "The retry must send what the first export sent")
+    }
+
+    /// A backup cut short after the export wrote the transcript cannot recreate
+    /// it. The retry then sends nothing instead of replacing the page with a
+    /// poorer one, and the job stays failed with the reason.
+    func testNotionRetryRefusesABackupThatLostTheTranscriptTheExportIncluded() async throws {
+        let (harness, exporter, job, backup) = try await failedNotionExportWithTranscript(includeFullTranscript: true)
+        let complete = try String(contentsOf: backup, encoding: .utf8)
+        let withoutTranscript = try XCTUnwrap(complete.components(separatedBy: "## Full Transcript").first)
+        try withoutTranscript.write(to: backup, atomically: true, encoding: .utf8)
+
+        let retrySucceeded = await harness.queue.retryNotionExport(id: job.id)
+
+        XCTAssertFalse(retrySucceeded)
+        let exportsAfterRefusal = await exporter.exports
+        XCTAssertEqual(exportsAfterRefusal.count, 1, "A page without the transcript is never sent")
+        let refused = try XCTUnwrap(harness.queue.jobs.first)
+        XCTAssertEqual(refused.notionExportStatus, .failed)
+        XCTAssertTrue(refused.warnings.contains(
+            "The local protocol backup no longer has the transcript; Notion export was not retried",
+        ))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: backup.path), "The backup stays for the user")
+
+        try complete.write(to: backup, atomically: true, encoding: .utf8)
+        let secondTry = await harness.queue.retryNotionExport(id: job.id)
+        XCTAssertTrue(secondTry)
+        XCTAssertFalse(
+            harness.queue.jobs.first?.warnings.contains { $0.hasSuffix("Notion export was not retried") } ?? true,
+            "A retry that goes through takes the refusal back",
+        )
+    }
+
+    /// Only a job whose first export carried the transcript is held to it: with
+    /// the option off there was nothing to lose, and the retry goes ahead.
+    func testNotionRetryWithoutTheTranscriptOptionIsNotRefused() async throws {
+        let (harness, exporter, job, backup) = try await failedNotionExportWithTranscript(includeFullTranscript: false)
+        XCTAssertFalse(try String(contentsOf: backup, encoding: .utf8).contains("Full Transcript"))
+
+        let retrySucceeded = await harness.queue.retryNotionExport(id: job.id)
+
+        XCTAssertTrue(retrySucceeded)
+        let exports = await exporter.exports
+        XCTAssertEqual(exports.count, 2)
+        XCTAssertEqual(try sentBlocks(exports[1]), try sentBlocks(exports[0]))
+    }
+
+    func testSuccessfulNotionRetryKeepsLocalProtocolWithoutSkipLocal() async throws {
+        let exporter = StubNotionExporter(
+            result: NotionPageResult(pageID: "page-1", url: "https://www.notion.so/page-1"),
+            failAfterPageCreatedCount: 1,
+        )
+        let (harness, _) = try makeHarness(
+            notionExportConfiguration: NotionExportConfiguration(exporter: exporter, databaseID: "database-1"),
+        )
+        let job = makeJob(audioPath: harness.audioPath)
+        harness.queue.enqueue(job)
+        await harness.queue.awaitProcessing()
+        let backup = try XCTUnwrap(harness.queue.jobs.first?.protocolPath)
+
+        let retrySucceeded = await harness.queue.retryNotionExport(id: job.id)
+
+        XCTAssertTrue(retrySucceeded)
+        XCTAssertEqual(harness.queue.jobs.first?.protocolPath, backup)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: backup.path))
+    }
+
+    func testNotionRetryReusesPageForEquivalentDatabaseIDFormats() async {
+        let databaseID = "12345678-1234-1234-1234-123456789abc"
+        let exporter = StubNotionExporter(
+            result: NotionPageResult(pageID: "page-1", url: "https://www.notion.so/page-1"),
+        )
+        let queue = PipelineQueue(logDir: tmpDir)
+        var job = PipelineJob(
+            meetingTitle: "Equivalent Database", appName: "File", mixPath: nil,
+            appPath: nil, micPath: nil, micDelay: 0,
+        )
+        job.recordNotionPage(
+            NotionPageResult(pageID: "page-1", url: "https://www.notion.so/page-1"),
+            databaseID: databaseID,
+        )
+        queue.insertJobForTesting(job)
+        let configuration = NotionExportConfiguration(
+            exporter: exporter, databaseID: databaseID.replacingOccurrences(of: "-", with: "").uppercased(),
+        )
+
+        let succeeded = await queue.exportToNotion(
+            jobID: job.id, protocolMD: "# Meeting", transcript: nil,
+            speakerNames: [], configuration: configuration,
+        )
+
+        XCTAssertTrue(succeeded)
+        let exports = await exporter.exports
+        XCTAssertEqual(exports.first?.existingPageID, "page-1")
+    }
+
+    func testFailedNotionExportRestoresAsRetryableWithoutAudio() async throws {
+        let exporter = StubNotionExporter(
+            result: NotionPageResult(pageID: "page-1", url: "https://www.notion.so/page-1"),
+            failAfterPageCreatedCount: 1,
+        )
+        let configuration = NotionExportConfiguration(
+            exporter: exporter, databaseID: "database-1", skipLocalMarkdown: true,
+        )
+        let (harness, _) = try makeHarness(notionExportConfiguration: configuration)
+        let job = makeJob(audioPath: harness.audioPath)
+        harness.queue.enqueue(job)
+        await harness.queue.awaitProcessing()
+        await harness.queue.awaitSnapshotFlush()
+        try FileManager.default.removeItem(at: harness.audioPath)
+
+        let (restoredHarness, _) = try makeHarness(notionExportConfiguration: configuration)
+        restoredHarness.queue.loadSnapshot()
+
+        let restored = try XCTUnwrap(restoredHarness.queue.jobs.first { $0.id == job.id })
+        XCTAssertEqual(restored.notionExportStatus, .failed)
+        XCTAssertTrue(restoredHarness.queue.canRetryNotionExport(id: job.id))
+        let retrySucceeded = await restoredHarness.queue.retryNotionExport(id: job.id)
+        XCTAssertTrue(retrySucceeded)
+        XCTAssertEqual(restoredHarness.queue.jobs.first { $0.id == job.id }?.notionExportStatus, .completed)
+        XCTAssertEqual(restoredHarness.engine.transcribeCallCount, 0)
+        XCTAssertFalse(restoredHarness.protocolGen.generateCalled)
+    }
+
+    func testInterruptedNotionExportRestoresAsFailedWithoutAudio() async throws {
+        let exporter = StubNotionExporter(
+            result: NotionPageResult(pageID: "page-1", url: "https://www.notion.so/page-1"),
+            failAfterPageCreatedCount: 1,
+        )
+        let configuration = NotionExportConfiguration(
+            exporter: exporter, databaseID: "database-1", skipLocalMarkdown: true,
+        )
+        let (harness, _) = try makeHarness(notionExportConfiguration: configuration)
+        let job = makeJob(audioPath: harness.audioPath)
+        harness.queue.enqueue(job)
+        await harness.queue.awaitProcessing()
+        harness.queue.jobs[0].beginNotionExport(speakerNames: [])
+        harness.queue.saveSnapshot()
+        await harness.queue.awaitSnapshotFlush()
+        try FileManager.default.removeItem(at: harness.audioPath)
+
+        let (restoredHarness, _) = try makeHarness(notionExportConfiguration: configuration)
+        restoredHarness.queue.loadSnapshot()
+
+        let restored = try XCTUnwrap(restoredHarness.queue.jobs.first { $0.id == job.id })
+        XCTAssertEqual(restored.notionExportStatus, .failed)
+        XCTAssertEqual(
+            restored.warnings.filter { $0.hasPrefix("Notion export failed") },
+            ["Notion export failed (interrupted when the app quit); saved locally as backup"],
+        )
+        XCTAssertTrue(restoredHarness.queue.canRetryNotionExport(id: job.id))
+        XCTAssertEqual(restoredHarness.engine.transcribeCallCount, 0)
+        XCTAssertFalse(restoredHarness.protocolGen.generateCalled)
+    }
+
+    func testInterruptedNotionExportWithoutBackupDoesNotClaimOne() async throws {
+        let configuration = NotionExportConfiguration(
+            exporter: StubNotionExporter(result: NotionPageResult(pageID: "page-1")), databaseID: "database-1",
+        )
+        let (harness, _) = try makeHarness(notionExportConfiguration: configuration)
+        var job = makeJob(audioPath: harness.audioPath)
+        job.state = .done
+        job.beginNotionExport(speakerNames: [])
+        harness.queue.insertJobForTesting(job)
+        harness.queue.saveSnapshot()
+        await harness.queue.awaitSnapshotFlush()
+
+        let (restoredHarness, _) = try makeHarness(notionExportConfiguration: configuration)
+        restoredHarness.queue.loadSnapshot()
+
+        let restored = try XCTUnwrap(restoredHarness.queue.jobs.first { $0.id == job.id })
+        XCTAssertEqual(
+            restored.warnings.filter { $0.hasPrefix("Notion export failed") },
+            ["Notion export failed (interrupted when the app quit); local backup could not be saved"],
+        )
+    }
+
+    func testLateSpeakerConfirmationExportsCorrectedTranscriptToExistingPage() async throws {
+        let exporter = StubNotionExporter(result: NotionPageResult(pageID: "page-1"))
+        let (harness, _) = try makeHarness(
+            notionExportConfiguration: NotionExportConfiguration(
+                exporter: exporter, databaseID: "database-1",
+                skipLocalMarkdown: true, speakerTagsEnabled: true,
+            ),
+        )
+        let transcriptPath = tmpDir.appendingPathComponent("meeting.txt")
+        try "[00:00] SPEAKER_0: Hello".write(to: transcriptPath, atomically: true, encoding: .utf8)
+        var job = makeJob(audioPath: harness.audioPath)
+        job.state = .speakerNamingPending
+        job.transcriptPath = transcriptPath
+        job.recordNotionPage(NotionPageResult(pageID: "page-1"), databaseID: "database-1")
+        harness.queue.insertJobForTesting(job)
+        harness.queue.speakerNamingDataByJob[job.id] = NamingSessionFixture.namingData(jobID: job.id)
+
+        await harness.queue.naming.reapplySpeakerNames(jobID: job.id, mapping: ["SPEAKER_0": "Smith, John"])
+        await harness.queue.awaitNotionExports()
+
+        let exports = await exporter.exports
+        let exported = try XCTUnwrap(exports.first)
+        XCTAssertEqual(exported.existingPageID, "page-1")
+        XCTAssertEqual(exported.transcript, "[00:00] Smith, John: Hello")
+        XCTAssertEqual(exported.tags, ["Smith, John"], "Use structured names supplied by speaker confirmation")
+        XCTAssertNil(harness.queue.jobs.first?.protocolPath, "Explicit opt-out skips a successful local save")
+        XCTAssertEqual(harness.queue.jobs.first?.state, .done)
+    }
+
     // MARK: - Echo bleed warning
 
     /// The shared aperiodic generator, deliberately not a local copy: an
@@ -833,12 +1534,12 @@ final class WorkflowIntegrationTests: XCTestCase {
         try AudioMixer.saveWAV(samples: samples, sampleRate: 16000, url: url)
     }
 
-    private func runDualSource(_ h: Harness, app: URL, mic: URL) async {
+    private func runDualSource(_ h: Harness, app: URL, mic: URL, micDelay: TimeInterval = 0) async {
         h.queue.speakerNamingHandler = { _ in .skipped }
         h.queue.enqueue(PipelineJob(
             meetingTitle: "meeting", appName: "File",
             mixPath: nil, appPath: app, micPath: mic,
-            micDelay: 0,
+            micDelay: micDelay,
         ))
         await h.queue.processNext()
         await awaitJobTerminalState(h.queue)
@@ -869,6 +1570,29 @@ final class WorkflowIntegrationTests: XCTestCase {
             warnings.contains("picked up by the microphone"),
             "expected an echo-bleed warning, got: \(warnings)",
         )
+        XCTAssertTrue(warnings.contains("% of the"), "the plain share fired, so the warning quotes it: \(warnings)")
+    }
+
+    /// The job records the alignment the measurement was centred on, so the
+    /// lags in a field report's log can be read against it. A microphone that
+    /// started half a second late is the case where it matters: without the
+    /// delay the bleed is outside the search and the recording reads as clean.
+    func testDualSourceVerdictRecordsTheMicDelayItWasMeasuredAt() async throws {
+        let (h, _) = try makeHarness()
+        let recordings = tmpDir.appendingPathComponent("late-mic")
+        try FileManager.default.createDirectory(at: recordings, withIntermediateDirectories: true)
+
+        let far = speechLike(seconds: 40, seed: 13)
+        let appURL = recordings.appendingPathComponent("meeting_app.wav")
+        let micURL = recordings.appendingPathComponent("meeting_mic.wav")
+        try writeTrack(far, to: appURL)
+        try writeTrack(Array(EchoTestAudio.bleed(far, delayMs: 15, gain: 0.5).dropFirst(8000)), to: micURL)
+
+        await runDualSource(h, app: appURL, mic: micURL, micDelay: 0.5)
+
+        let echo = try XCTUnwrap(h.queue.jobs.first?.echo)
+        XCTAssertTrue(echo.detected, "centred on the recorded delay, the late copy is found")
+        XCTAssertEqual(echo.micDelaySeconds, 0.5)
     }
 
     /// The negative case guards the same path: two people on separate devices
@@ -898,6 +1622,41 @@ final class WorkflowIntegrationTests: XCTestCase {
             warnings.contains("picked up by the microphone"),
             "independent tracks must not be reported as bleed, got: \(warnings)",
         )
+    }
+
+    /// Bleed under a louder local talker is called affected by its stable lag,
+    /// while only two of its windows clear the per-window threshold. Quoting
+    /// that share to the user ("in 10 %") would understate the problem and read
+    /// as contradicting the warning, so the sentence leaves the share out.
+    func testMaskedBleedWarnsWithoutQuotingTheShare() async throws {
+        let (h, _) = try makeHarness()
+        let recordings = tmpDir.appendingPathComponent("masked")
+        try FileManager.default.createDirectory(at: recordings, withIntermediateDirectories: true)
+
+        let far = speechLike(seconds: 200, seed: 43)
+        let local = speechLike(seconds: 200, seed: 44)
+        var mic = EchoTestAudio.bleed(far, delayMs: 40, gain: 0.5)
+        for i in (20 * 16000) ..< mic.count {
+            mic[i] += local[i]
+        }
+        let appURL = recordings.appendingPathComponent("meeting_app.wav")
+        let micURL = recordings.appendingPathComponent("meeting_mic.wav")
+        try writeTrack(far, to: appURL)
+        try writeTrack(mic, to: micURL)
+
+        await runDualSource(h, app: appURL, mic: micURL)
+
+        let echo = try XCTUnwrap(h.queue.jobs.first?.echo)
+        XCTAssertTrue(echo.detected)
+        XCTAssertEqual(echo.windowsAffected, 2, "the fixture is the masked case, not a plain share")
+        let warning = try XCTUnwrap(
+            h.queue.jobs.first?.warnings.first { $0.contains("picked up by the microphone") },
+        )
+        XCTAssertTrue(
+            warning.hasPrefix("Speaker output was picked up by the microphone in the 3 minutes analysed."),
+            "got: \(warning)",
+        )
+        XCTAssertFalse(warning.contains("%"), "got: \(warning)")
     }
 
     // MARK: - Withholding a verdict beats guessing one
@@ -942,13 +1701,15 @@ final class WorkflowIntegrationTests: XCTestCase {
         try AudioMixer.saveWAV(samples: far, sampleRate: 16000, url: appURL)
         try AudioMixer.saveWAV(samples: far, sampleRate: 8000, url: micURL)
 
-        let id = UUID()
-        h.queue.enqueue(PipelineJob(
+        let job = PipelineJob(
             meetingTitle: "meeting", appName: "File",
             mixPath: nil, appPath: appURL, micPath: micURL, micDelay: 0,
-        ))
+        )
+        // Attached without starting the pipeline, so only this call can
+        // record anything on the job.
+        h.queue.insertJobForTesting(job)
         let analysis = await h.queue.measureEchoBleed(
-            jobID: id, appURL: appURL, micURL: micURL, micDelay: 0,
+            jobID: job.id, appURL: appURL, micURL: micURL, micDelay: 0,
         )
         XCTAssertEqual(analysis.verdict, .notMeasured)
         XCTAssertNil(
@@ -1043,6 +1804,28 @@ final class WorkflowIntegrationTests: XCTestCase {
             kept.first?.contains("Local Sentence") ?? false,
             "the rule still applies to the line that stays, got: \(kept)",
         )
+    }
+
+    /// With the app track lost to a transcription failure, the far end exists
+    /// only on the microphone. Dedup must not remove it as a copy of a
+    /// transcript that was never written.
+    @MainActor
+    func testBleedIsKeptWhenTheAppTrackFailedToTranscribe() async throws {
+        let (h, _) = try makeHarness()
+        h.engine.segmentsToReturn = [
+            TimestampedSegment(start: 2, end: 28, text: "far end talking"),
+            TimestampedSegment(start: 32, end: 58, text: "local sentence"),
+        ]
+        h.engine.throwingPathSuffixes = ["app_16k.wav"]
+        let pair = try writeDedupPair(tmpDir.appendingPathComponent("dedup-app-failed"), bleed: true)
+
+        await runDualSource(h, app: pair.app, mic: pair.mic)
+
+        let job = try XCTUnwrap(h.queue.jobs.first)
+        XCTAssertEqual(job.state, .done, "error: \(job.error ?? "none")")
+        let transcript = try String(contentsOf: XCTUnwrap(job.transcriptPath), encoding: .utf8)
+        XCTAssertEqual(micLines(transcript).count, 2, "the only copy of the far end was removed, got:\n\(transcript)")
+        XCTAssertEqual(job.echo?.suppressedSegments ?? 0, 0)
     }
 
     /// What the transcripts of an affected recording look like once the far

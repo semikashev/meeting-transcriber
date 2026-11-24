@@ -1,5 +1,8 @@
 import Foundation
 import Observation
+import os
+
+private let logger = Logger(subsystem: AppPaths.logSubsystem, category: "LiveTranscription")
 
 // MARK: - LiveTranscriptionCoordinator
 
@@ -18,12 +21,19 @@ import Observation
 /// never holds an AppState back-reference. `liveEnabled` / `engineSupportsLive` /
 /// `engineLanguage` / `verboseDiagnostics` are settings-backed closures.
 ///
-/// Not `@Observable` — it exposes no observable state (it drives the controller
-/// + captions imperatively). It still uses `withObservationTracking` internally
-/// to watch the settings keys, which works regardless of this type's annotation.
+/// `@Observable` for `captionsUseEngine`, which the engine lifetime observer
+/// reads, and `warmup`, which Settings and the menu show. It also uses `withObservationTracking` internally to watch the
+/// settings keys.
 @MainActor
+@Observable
 final class LiveTranscriptionCoordinator {
     private var controller: LiveTranscriptionController?
+
+    /// Where the current controller's model warm-up stands; `.idle` without one.
+    private(set) var warmup: LiveCaptionsWarmup = .idle
+
+    /// Whether the prepared controller's captions run on the active engine.
+    private(set) var captionsUseEngine = false
 
     /// Source of the currently-active engine. Set by `beginPrewarm`; nil before
     /// then (so `ensureController` safely no-ops if called early). Captures the
@@ -37,14 +47,14 @@ final class LiveTranscriptionCoordinator {
 
     /// Set when a settings change arrived during a recording and its re-warm was
     /// deferred; applied at the next idle `flush()`.
-    private var needsRewarmWhenIdle = false
+    private(set) var needsRewarmWhenIdle = false
 
     /// True while `attachSinks` is mid-flight (it awaits `prepareForNextRecording()`
     /// between reading the controller and installing its sinks). The deferred
     /// re-warm in `flush()` must not swap the controller out during that window,
     /// or a fast manual stop→restart could leave the new recording feeding an
     /// orphaned controller the coordinator no longer owns.
-    private var attachInFlight = false
+    private(set) var attachInFlight = false
 
     private let captions: LiveCaptionsState
     private let liveEnabled: () -> Bool
@@ -89,7 +99,10 @@ final class LiveTranscriptionCoordinator {
         self.warmupQueue = warmupQueue
     }
 
-    private static func makeDefaultController(
+    /// The real controller, whose `prepare()` loads the speaker-matcher, VAD and
+    /// streaming-ASR CoreML models. Not private: `AppState.init` defaults its
+    /// `liveControllerFactory` to it.
+    static func makeDefaultController(
         engine: (any StreamingTranscribingEngine)?,
         captions: LiveCaptionsState,
         engineLanguage: String?,
@@ -176,7 +189,7 @@ final class LiveTranscriptionCoordinator {
         // would orphan the one it is binding (fast manual stop→restart).
         if needsRewarmWhenIdle, !isRecording(), !attachInFlight {
             needsRewarmWhenIdle = false
-            controller = nil
+            dropController()
             prewarmIfEligible()
         }
     }
@@ -211,15 +224,26 @@ final class LiveTranscriptionCoordinator {
     /// controller (so no CoreML recompile lands mid-recording and the overlay
     /// stays live on the current engine), re-arm the observer, and apply the
     /// rebuild at the next idle `flush()`. Either way the engine change takes
-    /// effect on the next recording.
+    /// effect on the next recording. An `attachSinks` in flight counts as a
+    /// recording: a manual start builds its recorder before the state says so,
+    /// and dropping the controller it is binding would cancel its warm-up.
     private func handleSettingsChange() {
-        guard !isRecording() else {
+        guard !isRecording(), !attachInFlight else {
             needsRewarmWhenIdle = true
             observeSettings()
             return
         }
-        controller = nil
+        dropController()
         prewarmAndObserve()
+    }
+
+    /// Drop the controller and stop the rest of its warm-up, so a stale one does
+    /// not hold the warm-up queue ahead of its successor's.
+    private func dropController() {
+        controller?.cancelPrepare()
+        controller = nil
+        captionsUseEngine = false
+        warmup = .idle
     }
 
     private func prewarmIfEligible() {
@@ -252,10 +276,36 @@ final class LiveTranscriptionCoordinator {
         guard strategy != .reTranscribe || streamingEngine != nil else { return nil }
         let controller = makeController(streamingEngine, captions, language, verboseDiagnostics)
         self.controller = controller
+        let started = Date()
+        warmup = .preparing(since: started)
+        logger.notice("Live caption warm-up started (language: \(language ?? "auto", privacy: .public))")
+        // Before prepare(), so a release cannot land while its engine load runs.
+        captionsUseEngine = strategy == .reTranscribe
+        // The fallback after a failed streaming load reaches the engine load later.
+        controller.willLoadEngine = { [weak self, weak controller] in
+            if let self, self.controller === controller { self.captionsUseEngine = true }
+        }
         // Route `prepare()` through the shared warm-up queue (see `warmupQueue`).
-        // Bind it locally so the fire-and-forget Task doesn't capture `self`.
+        // Bind it locally; the fire-and-forget Task holds `self` only weakly.
         let queue = warmupQueue
-        Task { @MainActor in await queue.run { await controller.prepare() } }
+        Task { @MainActor [weak self] in
+            await queue.run {
+                await controller.prepare()
+                // Counted from the build, so time spent waiting in the queue is included.
+                let seconds = Date().timeIntervalSince(started)
+                guard let self, self.controller === controller else {
+                    logger.notice("Live caption warm-up dropped after \(seconds, format: .fixed(precision: 1), privacy: .public) s")
+                    return
+                }
+                self.captionsUseEngine = controller.usesTranscriptionEngine
+                // A CoreML load error can carry a model path under the home directory.
+                self.warmup = controller.prepareFailure
+                    .map { .failed(AppPaths.abbreviatingHome(in: $0, home: NSHomeDirectory())) } ?? .ready
+                logger.notice(
+                    "Live caption warm-up \(self.warmup.name, privacy: .public) after \(seconds, format: .fixed(precision: 1), privacy: .public) s",
+                )
+            }
+        }
         return controller
     }
 }

@@ -12,9 +12,12 @@ name: Quality & Safety
 # runs for SAME-REPO branches only. Fork PR code never runs here: the
 # sanitizer legs execute on the self-hosted Mini right next to an unlocked
 # CI keychain, and fork `pull_request` tokens are read-only, which would
-# also break the cancel-on-failure step.
+# also break the cancel-on-failure step. Dependabot PRs are same-repo
+# branches, so they are held separately: their legs wait until a maintainer
+# applies `run-quality` (see the `self-hosted` output of `changes`).
 #
-# What a PR gets (issue #688). ASan runs on every same-repo PR: at about
+# What a PR gets (issue #688). ASan runs on every same-repo PR not held
+# as a Dependabot PR: at about
 # three minutes for both packages it is cheaper than the required
 # GitHub-hosted test jobs, so it needs no gate. TSan runs on the
 # `run-quality` label, or when the PR's changed source lines add, remove or
@@ -33,8 +36,9 @@ on:
   push:
     branches: [main]
   # PR runs: opening or updating a PR triggers the workflow. ASan runs on
-  # every same-repo PR; TSan and the quality gate wait for the `run-quality`
-  # label (TSan also for what the PR's diff contains). `labeled` lets the
+  # every same-repo PR but a Dependabot one, which waits for the
+  # `run-quality` label; TSan and the quality gate wait for that label
+  # (TSan also for what the PR's diff contains). `labeled` lets the
   # label start the run on an already-open PR; a `labeled` event for any
   # other label produces a run in which the legs are skipped and the gate
   # reports, under a different check name, that nothing was evaluated (see
@@ -75,7 +79,7 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' && github.event.action == 'synchronize' }}
 
 jobs:
-  # Two facts for the sanitizer jobs, computed once, because an `if:`
+  # Three facts for the sanitizer jobs, computed once, because an `if:`
   # expression cannot see a diff and a condition repeated across four jobs
   # drifts. Issue #688: the label is off by default because TSan is slow,
   # but its absence was invisible at review time, so a PR reported green
@@ -172,12 +176,13 @@ jobs:
   # change to the TSan job can be exercised before merge only by running
   # it: proving the keyword arm actually started the legs took a throwaway
   # commit with a keyword line. Left out on purpose, so as not to pad the
-  # list: `.github/actions/sanitizer-tests` and `verify-xcode`, which the
-  # unconditional ASan leg executes on every same-repo PR and which carry
-  # nothing TSan-specific; `cancel-on-failure`, which never runs on a
-  # passing test; and the manifests of mt-cli and meeting-simulator, which
-  # the legs do not build. tools/audiotap has no Package.resolved today; the
-  # entry covers its first dependency. In the forty-PR sample the four
+  # list: `.github/actions/sanitizer-tests`, `sanitizer-prep` and
+  # `verify-xcode`, which the unconditional ASan leg executes on every
+  # same-repo PR and which carry nothing TSan-specific;
+  # `cancel-on-failure`, which never runs on a passing test; and the
+  # manifests of mt-cli and meeting-simulator, which the legs do not
+  # build. tools/audiotap has no Package.resolved today; the entry covers
+  # its first dependency. In the forty-PR sample the four
   # manifest-only hits are the 0.15.6 bump (#657) and its three repairs
   # (#658, #659, #662); nothing in the sample touched this workflow.
   #
@@ -264,6 +269,7 @@ jobs:
     outputs:
       verdict: ${{ steps.kind.outputs.verdict }}
       gate-name: ${{ steps.kind.outputs.gate-name }}
+      self-hosted: ${{ steps.hold.outputs.self-hosted }}
       tsan-relevant: ${{ steps.diff.outputs.tsan-relevant || 'false' }}
       tsan-reason: ${{ steps.diff.outputs.tsan-reason }}
     steps:
@@ -281,8 +287,40 @@ jobs:
             echo "verdict=true" >> "$GITHUB_OUTPUT"
             echo "gate-name=sanitizer-gate" >> "$GITHUB_OUTPUT"
           fi
+      # Fact 3: may this PR run start the self-hosted legs at all? Dependabot
+      # opens its PRs as same-repo branches, so the fork exclusion does not
+      # stop them, and a dependency bump is exactly the code nobody has read
+      # yet: a package's sources, build plugins and macros would be built and
+      # run on a Mini, next to its keychain and caches, before a maintainer
+      # saw the diff. A Dependabot PR therefore starts the legs only on a run
+      # a person started (`triggering_actor`, which is the person on a label
+      # event and on a re-run, while `actor` stays the bot on a re-run) AND
+      # with the `run-quality` label on the PR. Both halves: without the
+      # actor half a label would be a standing approval for every later
+      # Dependabot push to the branch, and without the label half a person
+      # re-running the `opened` run would start them with no visible marker.
+      # Keyed on the PR author, not the actor, so a person's commit pushed
+      # onto a Dependabot branch is held too. Every other event and every
+      # other PR gets `true`; the legs require exactly `true`, so a missing
+      # output holds rather than releases. Push runs on `main` are unaffected,
+      # so the merged commit still gets both legs.
+      - id: hold
+        name: Hold Dependabot PRs off the self-hosted runners until a maintainer asks
+        env:
+          EVENT: ${{ github.event_name }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          TRIGGERED_BY: ${{ github.triggering_actor }}
+          LABELLED: ${{ contains(github.event.pull_request.labels.*.name, 'run-quality') }}
+        run: |
+          if [ "$EVENT" = "pull_request" ] && [ "$AUTHOR" = "dependabot[bot]" ] \
+            && { [ "$LABELLED" != "true" ] || [ "$TRIGGERED_BY" = "dependabot[bot]" ]; }; then
+            echo "self-hosted=false" >> "$GITHUB_OUTPUT"
+            printf 'Dependabot PR: the sanitizer legs are held off the self-hosted runners. A maintainer who has read the bump applies run-quality, or re-runs a run that already carried it, to start them.\n' | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo "self-hosted=true" >> "$GITHUB_OUTPUT"
+          fi
       - if: github.event_name == 'pull_request' && steps.kind.outputs.verdict == 'true'
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           # The merge commit and its two parents; see the job comment.
           fetch-depth: 2
@@ -373,8 +411,9 @@ jobs:
     # `withUnsafePointer` slabs in audio mixing, and any C-imported framework
     # boundary. Every same-repo PR, no label and no diff arm: 3m12s for both
     # packages when measured, cheaper than the required GitHub-hosted test
-    # jobs. Fork PRs are excluded for the reason in the trigger comment, and
-    # a run that is no verdict for its commit skips (see `changes`).
+    # jobs. Fork PRs are excluded for the reason in the trigger comment, a
+    # Dependabot PR waits for a maintainer (`self-hosted`, see `changes`),
+    # and a run that is no verdict for its commit skips (see `changes`).
     if: |
       github.event_name == 'push' ||
       github.event_name == 'schedule' ||
@@ -382,23 +421,60 @@ jobs:
       (
         github.event_name == 'pull_request' &&
         github.event.pull_request.head.repo.full_name == github.repository &&
+        needs.changes.outputs.self-hosted == 'true' &&
         needs.changes.outputs.verdict == 'true'
       )
     runs-on: [self-hosted, macOS, ARM64]
-    # Generous next to the 3 min observed, but the same budget as TSan keeps
-    # a cold-cache build from being the thing that turns the gate red.
-    timeout-minutes: 20
+    # Generous next to the 3 min observed, but a wide budget keeps
+    # a cold-cache build from being the thing that turns the gate red: the
+    # pre-warm and test steps carry 20 min each and sanitizer-prep 10, 50 in
+    # all; the job adds 15 min for checkout, the Xcode check and the cancel
+    # step, none of which has a bound of its own. The pre-warm's share is
+    # spent only on a cold runner, prep's only on a stalled ffmpeg download.
+    # The headroom is what keeps a hang ending as that step's timeout rather
+    # than as a job timeout, which reports `cancelled`, a result
+    # sanitizer-gate can only count as a failure of unreported cause.
+    timeout-minutes: 65
     permissions:
       contents: read
       actions: write
+    # What sanitizer-gate reads to tell a sanitizer finding from a failed
+    # setup: `skipped` when the leg died before the test step, `failure` when
+    # the test step itself failed.
+    outputs:
+      tests-outcome: ${{ steps.tests.outcome }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - uses: ./.github/actions/verify-xcode
-      - uses: ./.github/actions/sanitizer-tests
+      # Own step so its cold run (an unsanitized build plus about 1 GB of
+      # model downloads, once per runner and dependency set) is bounded and
+      # fails as `timed_out`, not as an opaque job cancellation. Warm, it is a
+      # file check.
+      - id: home
+        uses: ./.github/actions/runner-home
+        timeout-minutes: 20
+        with:
+          prewarm: "true"
+      # Right before the tests, not before the pre-warm where it would fail
+      # faster: the keychain re-assert guards against macOS dropping the CI
+      # keychain from the search list, and a cold pre-warm would leave up to
+      # 20 min for that to happen again before the tests run. The timeout
+      # bounds a stalled ffmpeg download (see the job budget) and cuts short
+      # setup-ffmpeg's own curl retries.
+      - uses: ./.github/actions/sanitizer-prep
+        timeout-minutes: 10
+      - id: tests
+        uses: ./.github/actions/sanitizer-tests
+        timeout-minutes: 20
         with:
           sanitizer-flag: "--sanitize=address"
+          user-home: ${{ steps.home.outputs.home }}
+      # Cancels the run only on a sanitizer verdict, which needs a new push, so
+      # stopping the other leg frees a Mini sooner (TSan holds one ~15 min). A
+      # failure in a step before it is no sanitizer verdict, and cancelling
+      # there would throw away the other leg's verdict as well.
       - name: Cancel run on failure
-        if: failure()
+        if: failure() && steps.tests.outcome == 'failure'
         uses: ./.github/actions/cancel-on-failure
         with:
           job-name: sanitizers (asan)
@@ -408,11 +484,14 @@ jobs:
     needs: changes
     # ThreadSanitizer catches races the static @Sendable checker can't see:
     # C-pointer shared state, GCD-callback closures over class properties.
-    # PR leg: same-repo branches only (see the trigger comment), on a run
-    # that is a verdict for its commit, and then either the `run-quality`
-    # label or one of the two arms `changes` computes. The repo check sits
-    # outside the arms on purpose: a diff or manifest match must never widen
-    # the audience to fork PRs, whatever the lists grow into. The label-arm
+    # PR leg: same-repo branches only (see the trigger comment), not on a
+    # Dependabot PR a maintainer has not released (`self-hosted`, see
+    # `changes`), on a run that is a verdict for its commit, and then either
+    # the `run-quality` label or one of the two arms `changes` computes. The
+    # repo and Dependabot checks sit outside the arms on purpose: a diff or
+    # manifest match must never widen the audience to fork PRs or to an
+    # unreleased bump (the manifest arm fires on every Swift package bump),
+    # whatever the lists grow into. The label-arm
     # deduplication for `labeled` events lives in `verdict`, which is false
     # for any label but `run-quality`.
     if: |
@@ -422,6 +501,7 @@ jobs:
       (
         github.event_name == 'pull_request' &&
         github.event.pull_request.head.repo.full_name == github.repository &&
+        needs.changes.outputs.self-hosted == 'true' &&
         needs.changes.outputs.verdict == 'true' &&
         (
           contains(github.event.pull_request.labels.*.name, 'run-quality') ||
@@ -431,29 +511,51 @@ jobs:
     runs-on: [self-hosted, macOS, ARM64]
     # ~7 min wall-clock observed for the app package alone; the AudioTapLib
     # step adds roughly 1.5 to 2.5 min, most of it waiting out real restart
-    # deadlines rather than compiling, and the most recent full leg took
-    # 15m13s. 20 min still leaves room for cold-build variance while
-    # surfacing runaways before they cost an hour.
-    timeout-minutes: 20
+    # deadlines rather than compiling. The test step alone took 17m48s on
+    # 2026-11-02 and 19m21s on 2026-11-14, as the suite grew; at a 20 min
+    # bound two PR runs sharing the runner already pushed one over it with
+    # no test failing. Its 30 min leave room for that growth and for
+    # cold-build variance while still surfacing runaways before they cost an
+    # hour; the job budget adds the pre-warm step's 20 min, sanitizer-prep's
+    # 10 and the same headroom (see test-asan).
+    timeout-minutes: 75
     permissions:
       contents: read
       actions: write
+    # Read by sanitizer-gate; see test-asan.
+    outputs:
+      tests-outcome: ${{ steps.tests.outcome }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - uses: ./.github/actions/verify-xcode
-      - uses: ./.github/actions/sanitizer-tests
+      # Own bounded step: see the same step in test-asan.
+      - id: home
+        uses: ./.github/actions/runner-home
+        timeout-minutes: 20
+        with:
+          prewarm: "true"
+      # See the same step in test-asan.
+      - uses: ./.github/actions/sanitizer-prep
+        timeout-minutes: 10
+      - id: tests
+        uses: ./.github/actions/sanitizer-tests
+        timeout-minutes: 30
         with:
           sanitizer-flag: "--sanitize=thread"
+          user-home: ${{ steps.home.outputs.home }}
+      # Scoped to the test step for the reasons in test-asan.
       - name: Cancel run on failure
-        if: failure()
+        if: failure() && steps.tests.outcome == 'failure'
         uses: ./.github/actions/cancel-on-failure
         with:
           job-name: sanitizers (tsan)
 
   # The check to require. A skipped job reports success and satisfies a
-  # required check, so neither leg can be required directly: TSan is skipped
-  # by design on most PRs, and a skipped job also reports under its
-  # unexpanded name. This job always runs, needs both legs and `changes`,
+  # required check, so neither leg is enough as a requirement on its own: TSan
+  # is skipped by design on most PRs, and a skipped job also reports under its
+  # unexpanded name. The stable-tag ruleset (.github/tag-ruleset.json)
+  # requires this job under the name a push run gives it, `sanitizer-gate`,
+  # next to the two legs. This job always runs, needs both legs and `changes`,
   # and fails when the sanitizer work did not actually pass: a leg that
   # reports `failure` or `cancelled`, `changes` not succeeding (the legs are
   # then skipped through `needs` and nothing was checked), or a leg that
@@ -461,7 +563,8 @@ jobs:
   # `if:` and this job disagree and the workflow is misconfigured.
   #
   # `cancelled` counts as failure on purpose. The cancel-on-failure step
-  # cancels the whole run when a leg fails, and the run-level cancellation
+  # cancels the whole run when a leg's sanitizer tests fail, and the
+  # run-level cancellation
   # races the failing job's own conclusion, so the culprit usually ends up
   # marked `cancelled` like its victims (the push run for #684 on 2026-09-06
   # is one: `test (tsan)` cancelled, `test (asan)` success). A gate that
@@ -500,8 +603,11 @@ jobs:
           CHANGES_RESULT: ${{ needs.changes.result }}
           ASAN_RESULT: ${{ needs.test-asan.result }}
           TSAN_RESULT: ${{ needs.test-tsan.result }}
+          ASAN_TESTS: ${{ needs.test-asan.outputs.tests-outcome }}
+          TSAN_TESTS: ${{ needs.test-tsan.outputs.tests-outcome }}
           TSAN_RELEVANT: ${{ needs.changes.outputs.tsan-relevant }}
           TSAN_REASON: ${{ needs.changes.outputs.tsan-reason }}
+          SELF_HOSTED: ${{ needs.changes.outputs.self-hosted }}
         run: |
           if [ "$VERDICT" = "false" ]; then
             {
@@ -540,7 +646,16 @@ jobs:
               fi
               ;;
             pull_request)
-              if [ "$SAME_REPO" = "true" ]; then
+              # A held Dependabot PR expects neither leg, so its gate is green
+              # with both rows reading "not run", never red for the skip. Only
+              # the literal `false` holds here: any other value takes the
+              # same-repo arm below, which expects ASan, and the legs, which
+              # need the literal `true`, skip, so a missing output turns the
+              # gate red instead of quietly green.
+              if [ "$SAME_REPO" = "true" ] && [ "$SELF_HOSTED" = "false" ]; then
+                not_run_reason="Dependabot PR: held off the self-hosted runners until a maintainer applies run-quality, or re-runs a run that already carried it"
+                tsan_why="$not_run_reason"
+              elif [ "$SAME_REPO" = "true" ]; then
                 expect_asan=true
                 # Both branches read tsan-relevant, never the reason text as a
                 # stand-in for it. Reading `-n "$TSAN_REASON"` here would be
@@ -579,21 +694,33 @@ jobs:
           fi
 
           failed=0
-          # describe <leg> <result> <expected> <why> -> appends one table row
-          # and records a failure where the row is not a pass or a legitimate
-          # skip.
+          # describe <leg> <result> <expected> <why> <tests-outcome> -> appends
+          # one table row and records a failure where the row is not a pass or
+          # a legitimate skip. The test step's outcome only words a failed row.
           describe() {
-            local leg="$1" result="$2" expected="$3" why="$4" cell
+            local leg="$1" result="$2" expected="$3" why="$4" tests="$5" cell
             case "$result" in
               success)
                 cell="passed ($why)"
                 ;;
               failure)
-                cell="FAILED"
+                case "$tests" in
+                  failure) cell="FAILED: the sanitizer tests failed" ;;
+                  skipped) cell="FAILED in setup, before the sanitizer tests ran: no sanitizer verdict. Check the leg's log: the model pre-warm also compiles the tests, so a compile error there needs a fix; a download, keychain or toolchain error wants a rerun" ;;
+                  *) cell="FAILED (test step outcome: ${tests:-not reported})" ;;
+                esac
                 failed=1
                 ;;
               cancelled)
-                cell="CANCELLED: a sanitizer failure cancels the run, so this counts as a failure, not as a cancel by a person"
+                # The leg whose tests failed usually ends up cancelled by its
+                # own cancel step; it is named when its output survived. Any
+                # other cancel (the other leg's cancel step, a job timeout, a
+                # person) cannot be told apart here, so it is worded neutrally.
+                if [ "$tests" = "failure" ]; then
+                  cell="CANCELLED after its own sanitizer tests failed: this leg is the culprit"
+                else
+                  cell="CANCELLED: counted as a failure; cause not reported. Check the run summary for a culprit annotation (this leg's own may have lost its output), whether the other leg failed, a newer push or a person cancelled the run, or this job hit its time budget"
+                fi
                 failed=1
                 ;;
               skipped)
@@ -622,8 +749,8 @@ jobs:
             printf '| changes | %s: the legs were skipped through needs, nothing was checked |\n' "$CHANGES_RESULT" | tee -a "$GITHUB_STEP_SUMMARY"
             failed=1
           fi
-          describe "ASan" "$ASAN_RESULT" "$expect_asan" "runs on every same-repo PR and on push, schedule and dispatch"
-          describe "TSan" "$TSAN_RESULT" "$expect_tsan" "$tsan_why"
+          describe "ASan" "$ASAN_RESULT" "$expect_asan" "runs on every same-repo PR and on push, schedule and dispatch" "$ASAN_TESTS"
+          describe "TSan" "$TSAN_RESULT" "$expect_tsan" "$tsan_why" "$TSAN_TESTS"
           {
             echo
             echo "A leg listed as not run is absent evidence, not passing evidence. ASan finds memory errors, not data races; only TSan does, and TSan is asked on the run-quality label, on concurrency primitives in the changed source lines, and on package manifest or workflow changes (issue #688)."
@@ -635,9 +762,9 @@ jobs:
 
   quality-baseline:
     # The label arm of test-tsan's PR gate, without its diff arms. Same
-    # audience: this job is GH-hosted, but the fork token would be read-only
-    # (403 on cancel-on-failure), and one label driving both jobs must mean
-    # one consistent audience. No diff arm: this job downloads ~1 GB of model
+    # audience: this job is GH-hosted, but it runs the PR's Swift code and
+    # downloads ~1 GB, and one label driving both jobs must mean one
+    # consistent audience, so fork PRs stay out here too. No diff arm: this job downloads ~1 GB of model
     # weights to measure WER/DER against committed fixtures, which a new lock
     # or queue cannot move, so a concurrency change is no reason to pay for
     # it.
@@ -653,15 +780,14 @@ jobs:
       )
     runs-on: xcode-27
     env:
-      # Xcode 27.0 by its own path rather than /Applications/Xcode.app: the image also
-      # ships 27.1 and a 27.2 beta, and a moved default must never reach a build here.
-      DEVELOPER_DIR: /Applications/Xcode_27.0.app/Contents/Developer
+      # Xcode 27.2 by its own path rather than /Applications/Xcode.app: the image also
+      # ships 27.0 and 27.1, and a moved default must never reach a build here.
+      DEVELOPER_DIR: /Applications/Xcode_27.2.app/Contents/Developer
     timeout-minutes: 45
     permissions:
       contents: read
-      actions: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       # 20 min covers SPM + ML cache restore plus the cold-cache pre-warm
       # download; well below the 45 min job timeout so a hung download
       # surfaces as a step failure, not a job-timeout.
@@ -669,10 +795,12 @@ jobs:
         timeout-minutes: 20
         with:
           cache-key-suffix: quality-v2
-      # Filter explicitly to engine-quality test classes — `--filter Quality`
-      # would also pull in `QualityResultsTests`, which exercises the writer
-      # via fake rows and would pollute the shared singleton's row buffer.
-      # When adding a new engine quality class, append it to the alternation.
+      # Filter explicitly to engine-quality test classes: `--filter Quality`
+      # would also run `QualityBaselineGateTests`, which sorts between the
+      # engine classes and would read a half-written results file.
+      # When adding a new engine quality class, append it to the alternation
+      # here and in `scripts/generate_real_meeting_fixture.sh`, which prints
+      # the same command.
       # Pin the model variant explicitly so changes to the in-code default
       # in `WhisperKitEngine.modelVariant` don't silently shift the
       # baseline. When this needs to change, change it here and document
@@ -697,13 +825,37 @@ jobs:
           RUN_QUALITY_TESTS: "1"
           QUALITY_RESULTS_PATH: ${{ github.workspace }}/quality-results.json
         run: cd app/MeetingTranscriber && swift test --filter QualityBaselineGateTests
+      # The post-hoc WeSpeaker embeddings in Sortformer and Nemotron mode are
+      # what lets those modes recognise known voices. Their only end-to-end
+      # test is gated on RUN_QUALITY_TESTS like the suite above but was in no
+      # filter, so it ran nowhere. A separate invocation, without
+      # QUALITY_RESULTS_PATH and after the gate: it measures nothing, and it
+      # must not be able to add rows to or reorder the run the gate reads.
+      - name: Check Sortformer and Nemotron speaker embeddings
+        timeout-minutes: 10
+        env:
+          RUN_QUALITY_TESTS: "1"
+        run: cd app/MeetingTranscriber && swift test --filter SortformerEmbeddingsE2ETests
+      # No cancel-on-failure in this job: it would cancel the sanitizer legs,
+      # and sanitizer-gate counts a cancelled leg as a sanitizer failure, so a
+      # quality regression or a transport error here read as a red sanitizer
+      # check. A failure here stays this job's. (The reverse still holds: a
+      # leg whose sanitizer tests fail cancels the run, this job included.)
+      #
+      # The upload is best-effort for the same reason: a failed upload (e.g.
+      # the artifact service unreachable) is no quality verdict, so it warns
+      # instead of failing the job.
       - name: Upload quality results
+        id: upload-quality
         if: always()
-        uses: actions/upload-artifact@v7
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: quality-results
           path: ${{ github.workspace }}/quality-results.json
           if-no-files-found: warn
-      - name: Cancel run on failure
-        if: failure()
-        uses: ./.github/actions/cancel-on-failure
+      - name: Report a failed upload
+        if: always() && steps.upload-quality.outcome == 'failure'
+        run: |
+          echo "::warning title=quality-results not uploaded::The artifact upload failed; this run has no quality-results.json baseline. bless_quality_baseline.sh needs another run's artifact or a local measurement."
+          echo "### ⚠️ quality-results.json was not uploaded" >> "$GITHUB_STEP_SUMMARY"

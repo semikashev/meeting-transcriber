@@ -14,7 +14,7 @@ final class CustomVocabularyTests: XCTestCase {
     override func setUp() {
         super.setUp()
         testSuiteName = "CustomVocabularyTests-\(getpid())-\(UUID().uuidString)"
-        guard let suite = UserDefaults(suiteName: testSuiteName) else {
+        guard let suite = DefaultsSuite.open(testSuiteName) else {
             XCTFail("Could not create test UserDefaults suite")
             return
         }
@@ -36,13 +36,46 @@ final class CustomVocabularyTests: XCTestCase {
         XCTAssertEqual(settings.customVocabularyPath, "")
     }
 
-    func testWhisperKitVocabularyPromptDefaultsOffAndPersists() {
-        XCTAssertFalse(settings.whisperKitVocabularyPromptEnabled)
+    func testCustomVocabularySwitchDefaultsOffAndPersists() {
+        XCTAssertFalse(settings.customVocabularyEnabled)
 
-        settings.whisperKitVocabularyPromptEnabled = true
+        settings.customVocabularyEnabled = true
 
-        XCTAssertTrue(defaults.bool(forKey: "whisperKitVocabularyPromptEnabled"))
-        XCTAssertTrue(AppSettings(defaults: defaults).whisperKitVocabularyPromptEnabled)
+        XCTAssertTrue(defaults.bool(forKey: "customVocabularyEnabled"))
+        XCTAssertTrue(AppSettings(defaults: defaults).customVocabularyEnabled)
+    }
+
+    /// An upgrade keeps what the engine in use did: only WhisperKit had a switch.
+    func testUpgradeStartsTheSwitchWhereTheActiveMethodWas() {
+        XCTAssertTrue(AppSettings.initialCustomVocabularyEnabled(
+            whisperKitPromptEnabled: false, hasVocabularyFile: true, whisperKit: false,
+        ))
+        XCTAssertFalse(AppSettings.initialCustomVocabularyEnabled(
+            whisperKitPromptEnabled: true, hasVocabularyFile: false, whisperKit: false,
+        ))
+        XCTAssertFalse(AppSettings.initialCustomVocabularyEnabled(
+            whisperKitPromptEnabled: false, hasVocabularyFile: true, whisperKit: true,
+        ))
+        XCTAssertTrue(AppSettings.initialCustomVocabularyEnabled(
+            whisperKitPromptEnabled: true, hasVocabularyFile: false, whisperKit: true,
+        ))
+    }
+
+    func testUpgradeStoresTheDerivedSwitch() throws {
+        defaults.removeObject(forKey: "customVocabularyEnabled")
+        defaults.set("parakeet", forKey: "transcriptionEngine")
+        defaults.set("/tmp/terms.txt", forKey: "customVocabularyPath")
+
+        XCTAssertTrue(AppSettings(defaults: defaults).customVocabularyEnabled)
+        XCTAssertTrue(try XCTUnwrap(defaults.flag(forKey: "customVocabularyEnabled")))
+    }
+
+    func testUpgradeReadsTheOldWhisperKitFlag() {
+        defaults.removeObject(forKey: "customVocabularyEnabled")
+        defaults.set("whisperKit", forKey: "transcriptionEngine")
+        defaults.set(true, forKey: "whisperKitVocabularyPromptEnabled")
+
+        XCTAssertTrue(AppSettings(defaults: defaults).customVocabularyEnabled)
     }
 
     // MARK: - Persistence
@@ -78,6 +111,42 @@ final class CustomVocabularyTests: XCTestCase {
             reloaded.customVocabularyFile?.resolvingSymlinksInPath().path,
             file.resolvingSymlinksInPath().path,
         )
+    }
+
+    /// What macOS reports as stale: the file a bookmark was made for has moved.
+    /// The launch repair stores the file's current path and a current bookmark.
+    func testAStaleVocabularyBookmarkIsRepaired() throws {
+        let directory = try makeTempDirectory(prefix: "vocabulary-stale")
+        let file = directory.appendingPathComponent("vocabulary.txt")
+        try "Northstar\n".write(to: file, atomically: true, encoding: .utf8)
+        settings.setCustomVocabularyFile(file)
+        let stale = try XCTUnwrap(settings.customVocabularyBookmark)
+        let moved = directory.appendingPathComponent("moved.txt")
+        try FileManager.default.moveItem(at: file, to: moved)
+
+        settings.repairStaleCustomVocabularyBookmark()
+
+        XCTAssertEqual(
+            URL(fileURLWithPath: settings.customVocabularyPath).resolvingSymlinksInPath().path,
+            moved.resolvingSymlinksInPath().path,
+        )
+        let refreshed = try XCTUnwrap(settings.customVocabularyBookmark)
+        XCTAssertNotEqual(refreshed, stale)
+        var isStale = false
+        _ = try URL(resolvingBookmarkData: refreshed, options: .withSecurityScope, relativeTo: nil, bookmarkDataIsStale: &isStale)
+        XCTAssertFalse(isStale, "The refreshed bookmark must be current")
+    }
+
+    func testRepairLeavesACurrentVocabularyBookmarkAlone() throws {
+        let file = try makeTempDirectory(prefix: "vocabulary-current").appendingPathComponent("vocabulary.txt")
+        try "Northstar\n".write(to: file, atomically: true, encoding: .utf8)
+        settings.setCustomVocabularyFile(file)
+        let bookmark = try XCTUnwrap(settings.customVocabularyBookmark)
+
+        settings.repairStaleCustomVocabularyBookmark()
+
+        XCTAssertEqual(settings.customVocabularyBookmark, bookmark)
+        XCTAssertEqual(settings.customVocabularyPath, file.path)
     }
 
     func testClearingVocabularyFileClearsPathAndBookmark() throws {

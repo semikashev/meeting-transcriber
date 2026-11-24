@@ -10,13 +10,14 @@ final class ManualRecordingTests: XCTestCase {
     ) -> (WatchLoop, MockRecorder) {
         let mock = recorder ?? MockRecorder()
         mock.mixPath = URL(fileURLWithPath: "/tmp/test_mix.wav")
+        let noMicSetting: () -> Bool = { noMic }
         let loop = WatchLoop(
             detector: MeetingDetector(patterns: AppMeetingPattern.all),
             recorderFactory: { mock },
             pipelineQueue: pipelineQueue,
             pollInterval: 0.05,
             maxDuration: 10,
-            noMic: noMic,
+            noMic: noMicSetting,
         )
         loop.permissionChecker = {
             HealthCheckResult(screenRecording: .healthy, microphone: .healthy)
@@ -70,11 +71,11 @@ final class ManualRecordingTests: XCTestCase {
     // MARK: - Stop
 
     func testStopManualRecordingEnqueuesJob() async throws {
-        let queue = PipelineQueue()
+        let queue = try makeIsolatedQueue()
         let (loop, _) = makeLoop(pipelineQueue: queue)
         try await loop.startManualRecording(pid: 1234, appName: "Chrome", title: "Standup")
 
-        loop.stopManualRecording()
+        await loop.stopManualRecording()
 
         XCTAssertEqual(queue.jobs.count, 1)
         XCTAssertEqual(queue.jobs.first?.meetingTitle, "Standup")
@@ -85,7 +86,7 @@ final class ManualRecordingTests: XCTestCase {
         let (loop, _) = makeLoop()
         try await loop.startManualRecording(pid: 1234, appName: "Chrome", title: "Meeting")
 
-        loop.stopManualRecording()
+        await loop.stopManualRecording()
 
         XCTAssertEqual(loop.state, .idle)
         XCTAssertFalse(loop.isManualRecording)
@@ -96,7 +97,7 @@ final class ManualRecordingTests: XCTestCase {
         let (loop, mock) = makeLoop()
         try await loop.startManualRecording(pid: 1234, appName: "Chrome", title: "Meeting")
 
-        loop.stopManualRecording()
+        await loop.stopManualRecording()
 
         XCTAssertTrue(mock.stopCalled)
     }
@@ -120,7 +121,7 @@ final class ManualRecordingTests: XCTestCase {
     func testManualRecordingTriggersStateChangeCallback() async throws {
         let (loop, _) = makeLoop()
         var transitions: [(WatchLoop.State, WatchLoop.State)] = []
-        loop.onStateChange = { old, new in
+        loop.onStateChange = { old, new, _ in
             transitions.append((old, new))
         }
 
@@ -129,7 +130,7 @@ final class ManualRecordingTests: XCTestCase {
         XCTAssertEqual(transitions[0].0, .idle)
         XCTAssertEqual(transitions[0].1, .recording)
 
-        loop.stopManualRecording()
+        await loop.stopManualRecording()
         XCTAssertEqual(transitions.count, 2)
         XCTAssertEqual(transitions[1].0, .recording)
         XCTAssertEqual(transitions[1].1, .idle)
@@ -197,17 +198,17 @@ final class ManualRecordingTests: XCTestCase {
         XCTAssertNil(loop.activeRecordingSource, "nothing is recording, so there are no channels to watch")
 
         try await loop.startMicrophoneRecording()
-        loop.stopManualRecording()
+        await loop.stopManualRecording()
 
         XCTAssertNil(loop.activeRecordingSource, "and none again once it stopped")
     }
 
     func testStopMicrophoneRecordingEnqueuesJob() async throws {
-        let queue = PipelineQueue()
+        let queue = try makeIsolatedQueue()
         let (loop, _) = makeLoop(pipelineQueue: queue)
         try await loop.startMicrophoneRecording()
 
-        loop.stopManualRecording()
+        await loop.stopManualRecording()
 
         XCTAssertEqual(loop.state, .idle)
         XCTAssertEqual(queue.jobs.count, 1)

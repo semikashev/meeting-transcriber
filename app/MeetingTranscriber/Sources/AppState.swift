@@ -30,6 +30,13 @@ final class AppState {
     var updateChecker: UpdateChecker
     var selectedNamingJobID: UUID?
 
+    /// Pin the naming selection to the job the naming window shows. Unpinned,
+    /// a job reaching naming could switch the window and lose typed names.
+    func pinShownNamingJob() {
+        let shown = pipeline.queue.namingJobID(preferring: selectedNamingJobID)
+        if selectedNamingJobID != shown { selectedNamingJobID = shown }
+    }
+
     /// Transcription-engine concern (the three engine instances, active-engine
     /// selection, and settings → engine language/vocabulary sync), extracted
     /// into its own controller. Read as `engines.activeTranscriptionEngine` by
@@ -80,7 +87,7 @@ final class AppState {
     #if !APPSTORE
         /// Debug RPC server lifecycle (launch gate, settings-driven start/stop,
         /// token rotation), extracted into its own controller. `AppState` supplies
-        /// the wired server via `buildDebugRPCServer()` and keeps the state
+        /// the wired server via `buildDebugRPCServer(token:tokenFile:)` and keeps the state
         /// projection (`rpcStateSnapshot`) + speaker-DB actions.
         let rpcController: RPCServerController
 
@@ -105,16 +112,21 @@ final class AppState {
         // inject their own, so none of them touch the real domains.
         LegacyDefaultsMigration.run(into: .standard)
         let settings = AppSettings()
-        // Once, here, rather than from `customOutputDir` — that getter is read
-        // during view updates, and repairing there would write observed state
-        // mid-`body`.
-        settings.repairStaleCustomOutputDirBookmark()
-        settings.repairStaleCustomVocabularyBookmark()
+        // Once, here, rather than from `customOutputDir` or
+        // `terminologyRulesFile` — those getters are read during view updates,
+        // and repairing there would write observed state mid-`body`.
+        settings.repairStaleBookmarks()
         return settings
     }
 
     private static func makeUpdateChecker() -> UpdateChecker {
-        UpdateChecker()
+        // The sandboxed App Store build is never a cask install, so it must
+        // never be offered a brew command.
+        #if APPSTORE
+            UpdateChecker()
+        #else
+            UpdateChecker(installedCask: UpdateInstallRoute.installedCask())
+        #endif
     }
 
     /// The in-room prompter's view of the watching controller, as closures:
@@ -139,11 +151,16 @@ final class AppState {
 
     // MARK: - Init
 
+    /// `liveControllerFactory` builds the controller the live-caption prewarm
+    /// loads. Tests with live captions on pass one that loads no models: the real
+    /// load outlives the test, and its CoreML compiles can crash a later class.
     init(
+        pipelineEnvironment: PipelineController.QueueEnvironment,
         settings: AppSettings = AppState.makeDefaultSettings(),
         notifier: any AppNotifying = SilentNotifier(),
         updateChecker: UpdateChecker? = nil,
-        pipelineEnvironment: PipelineController.QueueEnvironment = .production,
+        liveControllerFactory: @escaping LiveTranscriptionCoordinator.ControllerFactory =
+            LiveTranscriptionCoordinator.makeDefaultController,
     ) {
         // Dependency defaults are resolved through explicitly-typed factory
         // helpers (above) rather than inline `?? SomeType()` expressions (and an
@@ -177,6 +194,7 @@ final class AppState {
             engineSupportsLive: { [settings] in settings.transcriptionEngine.supportsLiveTranscription },
             engineLanguage: { [settings] in settings.activeEngineLanguageOrNil },
             verboseDiagnostics: { [settings] in settings.verboseDiagnostics },
+            makeController: liveControllerFactory,
             warmupQueue: warmupQueue,
         )
         self.watching = WatchingController(
@@ -192,22 +210,24 @@ final class AppState {
 
         #if !APPSTORE
             // Not trailing-closure: `isEnabled` is the first param (the other two
-            // have defaults), so a trailing closure would bind to `rotateToken`.
+            // have defaults), so a trailing closure would bind to `makeToken`.
             // swiftlint:disable:next trailing_closure
             self.rpcController = RPCServerController(isEnabled: { [settings] in settings.debugRPCEnabled })
         #endif
 
-        // Wire the active-engine source + the watch-start up-front engine sync
-        // (post stored-property init so the `[weak self]` closures are valid).
-        // `EngineController` does its own up-front sync + reactive observe in its
-        // init; these hooks let the pipeline / live-transcription / watch paths
-        // reach the active engine and re-sync before the first transcription.
+        // Wire engine, pipeline and recording probes after stored-property init.
+        // The lifetime probe includes the caption tail after recording stops.
         liveTranscription.beginPrewarm(
             engineProvider: { [weak self] in self?.engines.activeTranscriptionEngine },
             isRecording: { [weak self] in self?.watching.isRecording == true },
         )
         pipeline.activate { [weak self] in self?.engines.activeTranscriptionEngine }
         watching.activate { [weak self] in self?.engines.syncEngineSettings() }
+        engines.activateModelLifetime(
+            queue: { [weak self] in self?.pipeline.queue },
+            isRecording: { [weak self] in self?.watching.isRecording == true || (self?.watching.captionFlushesInFlight ?? 0) > 0 },
+            captionsUseEngine: { [weak self] in self?.liveTranscription.captionsUseEngine == true },
+        )
 
         #if !APPSTORE
             applyForcedChannelFlagsFromEnvironment()
@@ -216,27 +236,29 @@ final class AppState {
             // in RPCServerController.activate; AppState only supplies the wired
             // server. The closure is set here (post stored-property init) so it
             // can capture self.
-            rpcController.activate { [weak self] in self?.buildDebugRPCServer() }
+            rpcController.activate { [weak self] in self?.buildDebugRPCServer(token: $0, tokenFile: DebugRPCServer.tokenFileURL) }
+            // The diagnostic log's launch steps (cleanup of expired files, the
+            // orphan reap and `startPersistentLogStreamer`) run from the app's
+            // entry point, not here: tests construct `AppState` too, and those
+            // steps touch the user's diagnostics folder and spawn `log stream`.
+        #endif
+    }
 
-            PersistentDiagnosticLog.cleanup()
-            // Reap any `log stream` children orphaned by a previous crash/SIGKILL
-            // (re-parented to launchd) so they can't accumulate across launches.
-            // Off the main thread: it shells out to `ps` + waitUntilExit(), which
-            // would otherwise stall launch proportional to the process-table size.
-            // The reap is deliberately NOT ordered before `startForToday()` — an
-            // orphan surviving a few extra ms is benign next to blocking launch,
-            // and the new streamer is matched by parent pid so it's never reaped.
-            Task.detached(priority: .utility) { PersistentDiagnosticLog.reapOrphans() }
+    #if !APPSTORE
+        /// Start mirroring the app's log into `directory`. Stopped on the quit
+        /// path (`tearDownBeforeExit`). A running streamer is kept: replacing it
+        /// would leave its `log stream` child writing on with nothing to stop it.
+        func startPersistentLogStreamer(in directory: URL = PersistentDiagnosticLog.logDirectory) {
+            guard persistentLogStreamer == nil else { return }
             do {
-                self.persistentLogStreamer = try PersistentDiagnosticLog.startForToday()
+                persistentLogStreamer = try PersistentDiagnosticLog.startForToday(in: directory)
             } catch {
                 Logger(subsystem: AppPaths.logSubsystem, category: "AppState")
                     .error("persistent_log_streamer_failed_to_start error=\(error.localizedDescription, privacy: .public)")
-                self.persistentLogStreamer = nil
+                persistentLogStreamer = nil
             }
-            // Stopped on the quit path (`tearDownBeforeExit`), not here.
-        #endif
-    }
+        }
+    #endif
 
     #if !APPSTORE
         /// Stop the persistent log streamer cleanly, so the file handle
@@ -270,13 +292,12 @@ final class AppState {
     #if !APPSTORE
         /// Build a fully-wired debug RPC server (state snapshot + speaker-DB
         /// actions + skip-naming + file-enqueue closures). `RPCServerController`
-        /// owns when to start/stop it; this just constructs it. port/token
-        /// default to production values but are parameterised so a test can
-        /// build the wired server on an OS-assigned port with a known token and
-        /// exercise the injected closures over a real socket.
+        /// owns when to start/stop it and hands in a fresh token for each start.
+        /// Every caller names the token file (nil publishes none); tests that start it use port 0.
         func buildDebugRPCServer(
+            token: String,
+            tokenFile: URL?,
             port: UInt16 = DebugRPCServer.defaultPort,
-            token: String = DebugRPCServer.loadOrCreateToken(),
         ) -> DebugRPCServer {
             let snapshot: () -> RPCStateSnapshot = { [weak self] in
                 self?.rpcStateSnapshot() ?? RPCStateSnapshot.empty
@@ -332,15 +353,16 @@ final class AppState {
             let naming = namingRPCClosures()
             // Blocking one-call: enqueue + wait until terminal (auto-skipping
             // the headless naming pause), returning the final status inline.
-            let transcribe: (URL, Double) async -> BlockingTranscribeResult = { [weak self] url, maxWait in
+            let transcribe: BlockingTranscribe = { [weak self] url, maxWait, onEnqueued in
                 guard let self else { return .noFile }
-                return await pipeline.transcribeAndWait(path: url, maxWaitSeconds: maxWait)
+                return await pipeline.transcribeAndWait(path: url, maxWaitSeconds: maxWait, onEnqueued: onEnqueued)
             }
             let watch = watchRPCClosures()
             let record = recordRPCClosures()
             return DebugRPCServer(
                 port: port,
                 token: token,
+                tokenFile: tokenFile,
                 snapshot: snapshot,
                 speakerActions: makeSpeakerDBActions(),
                 skipNaming: skipNaming,
@@ -357,6 +379,7 @@ final class AppState {
                 watchControl: watch.control,
                 recordStatus: record.status,
                 recordControl: record.control,
+                meetingNotes: meetingNotesRPCActions(),
             )
         }
     #endif
@@ -394,6 +417,7 @@ final class AppState {
             activeJobState: pipeline.queue.activeJobs.first?.state,
             updateAvailable: updateChecker.availableUpdate != nil,
             permissionProblem: permissions.health?.isHealthy == false,
+            consentPending: loop?.pendingConsentApp != nil,
         )
     }
 
@@ -442,13 +466,25 @@ final class AppState {
         watching.watchLoop?.isManualRecording == true
     }
 
+    /// The browser whose consent prompt is open, for the menu-bar item that
+    /// mirrors it. Hoisted for the same type-check-budget reason as
+    /// `isManualRecording`.
+    var pendingConsentApp: String? {
+        watching.watchLoop?.pendingConsentApp
+    }
+
+    /// Answer the open consent prompt from the menu bar.
+    func answerPendingConsent(granted: Bool) {
+        watching.watchLoop?.answerParkedConsent(granted: granted)
+    }
+
     /// Menu-bar **top-half** red tint: mic channel silent, OR both channels
     /// silent (`recordingSilentActive` paints both halves). Hoisted out of the
     /// menu-bar body for the same type-check-budget reason as
     /// `hasPermissionProblem` — reading two `channelHealth.*` flags through the
     /// sub-controller inline is more than the body can afford on slow CI.
     var micSilentOverlay: Bool {
-        channelHealth.micSilentOverlay
+        channelHealth.micSilentOverlay && !isMicMuted
     }
 
     /// Menu-bar **bottom-half** red tint: app-audio channel silent, OR both

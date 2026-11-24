@@ -13,7 +13,7 @@ final class AppSettingsTests: XCTestCase {
     // swiftlint:disable:next implicitly_unwrapped_optional
     private var apiKeyAccount: String!
 
-    /// Each test gets its own volatile `UserDefaults(suiteName:)` so
+    /// Each test gets its own scratch suite (`DefaultsSuite.open`) so
     /// `swift test --parallel` doesn't race on the shared on-disk plist.
     /// AppSettings receives the suite via constructor injection.
     ///
@@ -29,7 +29,7 @@ final class AppSettingsTests: XCTestCase {
         super.setUp()
         testSuiteName = "AppSettingsTests-\(getpid())-\(UUID().uuidString)"
         apiKeyAccount = "AppSettingsTests-openAIAPIKey-\(getpid())-\(UUID().uuidString)"
-        guard let suite = UserDefaults(suiteName: testSuiteName) else {
+        guard let suite = DefaultsSuite.open(testSuiteName) else {
             XCTFail("Could not create test UserDefaults suite")
             return
         }
@@ -110,8 +110,8 @@ final class AppSettingsTests: XCTestCase {
     }
 
     func testEndGraceBoundaryValue() {
-        settings.endGrace = 5.0
-        XCTAssertEqual(settings.endGrace, 5.0)
+        settings.endGrace = 1.0
+        XCTAssertEqual(settings.endGrace, 1.0)
     }
 
     func testNumSpeakersClampedToMinimum() {
@@ -134,7 +134,7 @@ final class AppSettingsTests: XCTestCase {
         XCTAssertEqual(settings.asymmetricSilenceWarningSeconds, 120)
     }
 
-    func testNumSpeakersClampedToMinimumZero() {
+    func testNumSpeakersAcceptsTheMinimumZero() {
         settings.numSpeakers = 0
         XCTAssertEqual(settings.numSpeakers, 0)
     }
@@ -416,9 +416,12 @@ final class AppSettingsTests: XCTestCase {
         XCTAssertFalse(settings.includePreReleases)
     }
 
+    /// Read back through a fresh instance: the default is `true`, so only a
+    /// reload can tell a persisted `false` from a key that was never written.
     func testCheckForUpdatesPersistence() {
         settings.checkForUpdates = false
-        XCTAssertFalse(defaults.bool(forKey: "checkForUpdates"))
+        let reloaded = AppSettings(defaults: defaults, apiKeyAccount: apiKeyAccount)
+        XCTAssertFalse(reloaded.checkForUpdates)
     }
 
     func testIncludePreReleasesPersistence() {
@@ -450,7 +453,7 @@ final class AppSettingsTests: XCTestCase {
 
     func test_verboseDiagnostics_migratesFromLegacyAudioDebugLoggingKey() {
         let suiteName = "AppSettingsTests-migration-\(UUID().uuidString)"
-        guard let suite = UserDefaults(suiteName: suiteName) else {
+        guard let suite = DefaultsSuite.open(suiteName) else {
             XCTFail("Could not create suite")
             return
         }
@@ -465,7 +468,7 @@ final class AppSettingsTests: XCTestCase {
 
     func test_verboseDiagnostics_newKeyTakesPrecedenceOverLegacy() {
         let suiteName = "AppSettingsTests-precedence-\(UUID().uuidString)"
-        guard let suite = UserDefaults(suiteName: suiteName) else {
+        guard let suite = DefaultsSuite.open(suiteName) else {
             XCTFail("Could not create suite")
             return
         }
@@ -480,7 +483,7 @@ final class AppSettingsTests: XCTestCase {
 
     func test_verboseDiagnostics_migrationRemovesLegacyKey() {
         let suiteName = "AppSettingsTests-cleanup-\(UUID().uuidString)"
-        guard let suite = UserDefaults(suiteName: suiteName) else {
+        guard let suite = DefaultsSuite.open(suiteName) else {
             XCTFail("Could not create suite")
             return
         }
@@ -551,49 +554,31 @@ final class AppSettingsTests: XCTestCase {
         XCTAssertTrue(settings.diarizerTuningIsAllDefaults)
     }
 
-    // MARK: - Keychain
-
-    func testKeychainRoundTrip() {
-        KeychainHelper.delete(key: "HF_TOKEN_TEST")
-
-        XCTAssertFalse(KeychainHelper.exists(key: "HF_TOKEN_TEST"))
-        XCTAssertNil(KeychainHelper.read(key: "HF_TOKEN_TEST"))
-
-        KeychainHelper.save(key: "HF_TOKEN_TEST", value: "hf_abc123")
-        XCTAssertTrue(KeychainHelper.exists(key: "HF_TOKEN_TEST"))
-        XCTAssertEqual(KeychainHelper.read(key: "HF_TOKEN_TEST"), "hf_abc123")
-
-        KeychainHelper.save(key: "HF_TOKEN_TEST", value: "hf_xyz789")
-        XCTAssertEqual(KeychainHelper.read(key: "HF_TOKEN_TEST"), "hf_xyz789")
-
-        KeychainHelper.delete(key: "HF_TOKEN_TEST")
-        XCTAssertFalse(KeychainHelper.exists(key: "HF_TOKEN_TEST"))
-        XCTAssertNil(KeychainHelper.read(key: "HF_TOKEN_TEST"))
-    }
-
     /// `DiarizerMode` is persisted via `PipelineSnapshot` (PipelineJob.usedDiarizerMode)
     /// and via UserDefaults (AppSettings.diarizerMode). The JSON/UserDefaults
     /// shape is keyed off the implicit rawValues `"offline"` / `"sortformer"`
-    /// — a future case rename without a stable rawValue would silently break
-    /// snapshot decode. This test pins the wire format so any rename forces
-    /// an explicit migration decision.
+    /// / `"nemotron"` — a future case rename without a stable rawValue would
+    /// silently break snapshot decode. This test pins the wire format so any
+    /// rename forces an explicit migration decision.
     func testDiarizerModeRawValuesPinJSONShape() throws {
         XCTAssertEqual(DiarizerMode.offline.rawValue, "offline")
         XCTAssertEqual(DiarizerMode.sortformer.rawValue, "sortformer")
+        XCTAssertEqual(DiarizerMode.nemotron.rawValue, "nemotron")
 
-        let json = try JSONEncoder().encode([DiarizerMode.offline, .sortformer])
-        XCTAssertEqual(String(bytes: json, encoding: .utf8), #"["offline","sortformer"]"#)
+        let json = try JSONEncoder().encode([DiarizerMode.offline, .sortformer, .nemotron])
+        XCTAssertEqual(String(bytes: json, encoding: .utf8), #"["offline","sortformer","nemotron"]"#)
 
         let roundTrip = try JSONDecoder().decode([DiarizerMode].self, from: json)
-        XCTAssertEqual(roundTrip, [.offline, .sortformer])
+        XCTAssertEqual(roundTrip, [.offline, .sortformer, .nemotron])
     }
 
     /// `DiarizerMode.speakerCap` is the single source of truth for the
     /// max-speaker constraint shared by `SpeakersSettingsView` and
     /// `SpeakerNamingView`. Lock the values so a FluidAudio bump that
-    /// changes Sortformer's cap will surface here first.
+    /// changes Sortformer's or Nemotron 3's cap will surface here first.
     func testDiarizerModeSpeakerCap() {
         XCTAssertEqual(DiarizerMode.sortformer.speakerCap, 4)
         XCTAssertEqual(DiarizerMode.offline.speakerCap, 10)
+        XCTAssertEqual(DiarizerMode.nemotron.speakerCap, 8)
     }
 }

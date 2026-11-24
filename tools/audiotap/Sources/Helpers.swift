@@ -77,6 +77,36 @@ func writeAllToFileHandle(_ fd: Int32, _ ptr: UnsafeRawPointer, count: Int) {
     }
 }
 
+/// Resolve a device UID to its current `AudioDeviceID`, or
+/// `kAudioObjectUnknown` when the device is gone. Plain CoreAudio, no engine
+/// involved: the mic restart policy asks "is my device still there" without
+/// going anywhere near the calls that can wedge, and the app-audio tap build
+/// finds the output device its aggregate was bound to by this UID, rather than
+/// asking for the default output again and possibly getting another device.
+func deviceIDForUID(_ uid: String) -> AudioDeviceID {
+    var address = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyTranslateUIDToDevice,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain,
+    )
+    var deviceID: AudioDeviceID = kAudioObjectUnknown
+    var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+    // A UID of 15 bytes or fewer bridges to a fresh CFString that nothing else
+    // holds, and `passUnretained` does not hold it either, so without the
+    // extended lifetime it can be freed before the HAL reads the qualifier.
+    let cfUID = uid as CFString
+    var qualifier: Unmanaged<CFString>? = .passUnretained(cfUID)
+    let qualifierSize = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+    _ = withExtendedLifetime(cfUID) {
+        AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address, qualifierSize, &qualifier,
+            &size, &deviceID,
+        )
+    }
+    return deviceID
+}
+
 /// Get the UID of the current default output device.
 func getDefaultOutputDeviceUID() -> String? {
     var address = AudioObjectPropertyAddress(
@@ -150,6 +180,13 @@ public func getExecutableName(pid: pid_t) -> String {
     return stringFromNullTerminated(name)
 }
 
+/// `Name(pid), Name(pid)` for a log line. The tap summary and the helpers the
+/// tap leaves out (`ChromiumHelperFilter`) are read side by side, so both
+/// render through this one function.
+func pidSummary(_ pids: [pid_t]) -> String {
+    pids.map { "\(getExecutableName(pid: $0))(\($0))" }.joined(separator: ", ")
+}
+
 /// Decodes a null-terminated `[CChar]` into a Swift `String`. Replaces the
 /// deprecated `String(cString: [CChar])` initializer with the buffer-pointer
 /// variant; the precondition is that `buffer` is non-empty (the only callers
@@ -203,6 +240,22 @@ func nominalSampleRateReading(deviceID: AudioObjectID) -> ProcessOutputState.Rea
     let status = AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &rate)
     guard status == noErr else { return .failed(status) }
     return .value(Int(rate))
+}
+
+/// How many input streams `deviceID` exposes, as a reading: on the private
+/// aggregate, how many buffers its IOProc hands over per callback (issue #803).
+/// Sized with `GetPropertyDataSize` alone, the ids are not needed; a device
+/// that is gone answers a status, not 0.
+func inputStreamCountReading(deviceID: AudioObjectID) -> ProcessOutputState.Reading<Int> {
+    var address = AudioObjectPropertyAddress(
+        mSelector: kAudioDevicePropertyStreams,
+        mScope: kAudioObjectPropertyScopeInput,
+        mElement: kAudioObjectPropertyElementMain,
+    )
+    var size: UInt32 = 0
+    let status = AudioObjectGetPropertyDataSize(deviceID, &address, 0, nil, &size)
+    guard status == noErr else { return .failed(status) }
+    return .value(Int(size) / MemoryLayout<AudioStreamID>.size)
 }
 
 /// Resolve the AudioObjectID of the system default input or output device.

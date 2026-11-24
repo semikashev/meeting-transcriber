@@ -47,17 +47,41 @@ enum PowerAssertionFixture {
         return out
     }
 
+    /// Stamps `id` as the IOKit `AssertionId` on every entry; nil leaves the
+    /// key out, the shape of an assertion that cannot be told apart.
+    static func identified(_ assertions: [Int32: [[String: Any]]], id: Int?) -> [Int32: [[String: Any]]] {
+        assertions.mapValues { entries in
+            entries.map { entry in
+                var stamped = entry
+                stamped["AssertionId"] = id
+                return stamped
+            }
+        }
+    }
+
+    /// A Teams call as measured (issue #765): `MSTeams` holds one idle-sleep
+    /// and one display-sleep "Call in progress" assertion, each with its own
+    /// ID, and the next call gets new ones.
+    static func teamsCall(_ idleID: Int?, _ displayID: Int?, pid: Int32 = 1234) -> [Int32: [[String: Any]]] {
+        let name = "Microsoft Teams Call in progress"
+        let idle = identified(typedAssertions([(pid, "MSTeams", name, "NoIdleSleepAssertion")]), id: idleID)
+        let display = identified(typedAssertions([(pid, "MSTeams", name, "NoDisplaySleepAssertion")]), id: displayID)
+        return idle.merging(display) { first, second in first + second }
+    }
+
     static func assertionDict(processName: String, assertName: String) -> [Int32: [[String: Any]]] {
         assertions((1, processName, assertName))
     }
 
-    /// A detector watching only the browser category, with the window list
-    /// stubbed empty so a test opts in to titles explicitly.
-    static func browserDetector(confirmationCount: Int = 1) -> PowerAssertionDetector {
+    /// A detector watching the browser category (and whatever else `watching`
+    /// names), with the window list stubbed empty so a test opts in to titles
+    /// explicitly.
+    static func browserDetector(
+        watching: [String] = [AppMeetingPattern.browserMeetings.appName],
+        confirmationCount: Int = 1,
+    ) -> PowerAssertionDetector {
         let detector = PowerAssertionDetector(
-            patterns: PowerAssertionDetector.patterns(
-                watching: [AppMeetingPattern.browserMeetings.appName],
-            ),
+            patterns: PowerAssertionDetector.patterns(watching: watching),
             confirmationCount: confirmationCount,
         )
         detector.windowListProvider = { [] }

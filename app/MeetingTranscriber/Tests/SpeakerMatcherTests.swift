@@ -386,7 +386,7 @@ final class SpeakerMatcherTests: XCTestCase {
             speakingTimes: ["S0": 1.0],
             now: Self.testEpoch,
         )
-        XCTAssertEqual(outcome["S0"], .tooShort)
+        XCTAssertEqual(outcome.admissions["S0"], .tooShort)
         XCTAssertTrue(matcher.loadDB().isEmpty, "A second of speech is not enough to learn a voice from")
     }
 
@@ -412,7 +412,7 @@ final class SpeakerMatcherTests: XCTestCase {
         // No duration known (legacy callers): the sample is kept, the centroid is not moved.
         let matcher = SpeakerMatcher(dbPath: dbPath)
         let outcome = matcher.updateDB(mapping: ["S0": "Speaker B"], embeddings: ["S0": [1, 0]])
-        XCTAssertEqual(outcome["S0"], .admitted)
+        XCTAssertEqual(outcome.admissions["S0"], .admitted)
         XCTAssertNil(matcher.loadDB().first?.centroid)
         XCTAssertEqual(matcher.loadDB().first?.embeddings, [[1, 0]])
     }
@@ -426,7 +426,7 @@ final class SpeakerMatcherTests: XCTestCase {
             speakingTimes: ["S0": 30],
             now: Self.testEpoch,
         )
-        XCTAssertEqual(outcome["S0"], .ambiguous(nearest: "Speaker A"))
+        XCTAssertEqual(outcome.admissions["S0"], .ambiguous(nearest: "Speaker A"))
         XCTAssertEqual(
             matcher.loadDB().map(\.name), ["Speaker A"],
             "A vector that already stands for another person would match both and neither",
@@ -446,7 +446,7 @@ final class SpeakerMatcherTests: XCTestCase {
             embeddings: ["S0": [0.98, 0.2, 0]],
             speakingTimes: ["S0": 30],
         )
-        XCTAssertEqual(outcome["S0"], .admitted)
+        XCTAssertEqual(outcome.admissions["S0"], .admitted)
         XCTAssertEqual(matcher.loadDB().first { $0.name == "Speaker B" }?.embeddings.count, 2)
     }
 
@@ -463,7 +463,7 @@ final class SpeakerMatcherTests: XCTestCase {
         let outcome = matcher.updateDB(
             mapping: ["S0": "Speaker A"], embeddings: ["S0": [1, 0, 0]], speakingTimes: ["S0": 30],
         )
-        XCTAssertEqual(outcome["S0"], .hub(near: ["Speaker B", "Speaker C"]))
+        XCTAssertEqual(outcome.admissions["S0"], .hub(near: ["Speaker B", "Speaker C"]))
         XCTAssertEqual(matcher.loadDB().first { $0.name == "Speaker A" }?.embeddings.count, 1)
     }
 
@@ -476,7 +476,7 @@ final class SpeakerMatcherTests: XCTestCase {
         let outcome = matcher.updateDB(
             mapping: ["S0": "Speaker A"], embeddings: ["S0": [1, 0, 0]], speakingTimes: ["S0": 30],
         )
-        XCTAssertEqual(outcome["S0"], .admitted)
+        XCTAssertEqual(outcome.admissions["S0"], .admitted)
     }
 
     func testUpdateDBLetsTheLongerSpeakerClaimAVoiceSharedWithinOneRecording() {
@@ -490,8 +490,8 @@ final class SpeakerMatcherTests: XCTestCase {
                 embeddings: [longer: [1, 0, 0], shorter: [0.99, 0.01, 0]],
                 speakingTimes: [longer: 120, shorter: 20],
             )
-            XCTAssertEqual(outcome[longer], .admitted)
-            XCTAssertEqual(outcome[shorter], .ambiguous(nearest: "Long"))
+            XCTAssertEqual(outcome.admissions[longer], .admitted)
+            XCTAssertEqual(outcome.admissions[shorter], .ambiguous(nearest: "Long"))
             XCTAssertEqual(matcher.loadDB().map(\.name), ["Long"])
         }
     }
@@ -502,18 +502,19 @@ final class SpeakerMatcherTests: XCTestCase {
         let outcome = matcher.updateDB(
             mapping: ["S0": "Real"], embeddings: ["S0": [1, 0, 0]], speakingTimes: ["S0": 30],
         )
-        XCTAssertEqual(outcome["S0"], .admitted, "Random seeded vectors must not block a real voice")
+        XCTAssertEqual(outcome.admissions["S0"], .admitted, "Random seeded vectors must not block a real voice")
     }
 
     // MARK: - match with centroid
 
     func testMatchPrefersCentroidOverNoisySample() {
-        // A speaker whose centroid says "[1, 0]" but whose embeddings list has
-        // a noisy outlier "[0.7, 0.7]". A query "[0.99, 0.01]" should match.
+        // A speaker whose centroid says "[1, 0]" but whose only recent sample
+        // is a noisy outlier "[0, 1]". The query "[0.99, 0.01]" is far from the
+        // sample, so only the centroid can bring it inside the threshold.
         let matcher = SpeakerMatcher(dbPath: dbPath, threshold: 0.5)
         matcher.saveDB([StoredSpeaker(
             name: "Speaker B",
-            embeddings: [[1, 0], [0.7, 0.7]],
+            embeddings: [[0, 1]],
             centroid: [1, 0],
             centroidSampleCount: 5,
         )])
@@ -522,7 +523,7 @@ final class SpeakerMatcherTests: XCTestCase {
     }
 
     func testMatchUsesSamplesAsFallbackForLegacyEntries() {
-        // Legacy entry: no centroid; matcher should compute meanEmbedding lazily.
+        // Legacy entry: no centroid; the recent samples are the only anchors.
         let matcher = SpeakerMatcher(dbPath: dbPath, threshold: 0.5)
         matcher.saveDB([StoredSpeaker(name: "Speaker B", embeddings: [[1, 0]])])
         let result = matcher.match(embeddings: ["S0": [0.99, 0.01]])
@@ -744,17 +745,19 @@ final class SpeakerMatcherTests: XCTestCase {
     }
 
     func testMultiEmbeddingMatchesBest() {
-        // Speaker has 3 stored embeddings, match against the closest one
+        // Speaker has 3 stored embeddings, match against the closest one.
+        // Only meeting 2's sample is within the threshold, so a matcher that
+        // read just one of them (the first, or the last) would miss.
         let matcher = SpeakerMatcher(dbPath: dbPath)
         let stored = [StoredSpeaker(name: "Speaker A", embeddings: [
             [1, 0, 0], // embedding from meeting 1
-            [0.9, 0.3, 0], // embedding from meeting 2
-            [0.8, 0.5, 0], // embedding from meeting 3
+            [0, 1, 0], // embedding from meeting 2
+            [0, 0, 1], // embedding from meeting 3
         ])]
         matcher.saveDB(stored)
 
         // New embedding close to meeting 2's embedding
-        let embeddings: [String: [Float]] = ["SPEAKER_0": [0.88, 0.35, 0]]
+        let embeddings: [String: [Float]] = ["SPEAKER_0": [0.05, 1, 0]]
         let result = matcher.match(embeddings: embeddings)
         XCTAssertEqual(result["SPEAKER_0"], "Speaker A")
     }
@@ -929,14 +932,20 @@ final class SpeakerMatcherTests: XCTestCase {
 
     // MARK: - Corrupt DB & Edge Cases
 
-    func testLoadDBCorruptJSONReturnsEmpty() throws {
-        // Write invalid JSON to dbPath — loadDB should return empty, not crash
+    func testLoadDBCorruptJSONReadsEmptyAndLeavesFileInPlace() throws {
+        // Invalid JSON reads as empty for read-only callers, but the file is
+        // kept as-is: only a mutation may move it aside, never a read.
+        // Mutation behaviour is pinned in SpeakerMatcherPersistenceTests.
         let garbage = Data("{ not valid json !!!".utf8)
         try garbage.write(to: dbPath)
 
         let matcher = SpeakerMatcher(dbPath: dbPath)
         let loaded = matcher.loadDB()
         XCTAssertTrue(loaded.isEmpty)
+        XCTAssertEqual(try Data(contentsOf: dbPath), garbage)
+        if case .undecodable = matcher.readDB() {} else {
+            XCTFail("a present but undecodable DB must read as undecodable, not missing")
+        }
     }
 
     func testLoadDBEmptyFileReturnsEmpty() throws {
@@ -1196,9 +1205,9 @@ final class SpeakerMatcherTests: XCTestCase {
             StoredSpeaker(name: "Speaker A", embeddings: [[1, 0, 0]]),
             StoredSpeaker(name: "Speaker B", embeddings: [[0, 1, 0]]),
         ])
-        XCTAssertTrue(matcher.deleteSpeaker(name: "Speaker A"))
+        XCTAssertEqual(matcher.deleteSpeaker(name: "Speaker A"), .applied)
         XCTAssertEqual(matcher.allSpeakerNames(), ["Speaker B"])
-        XCTAssertFalse(matcher.deleteSpeaker(name: "Speaker A"))
+        XCTAssertEqual(matcher.deleteSpeaker(name: "Speaker A"), .notFound)
     }
 
     func testMergeSpeakersCombinesMetrics() {
@@ -1217,7 +1226,7 @@ final class SpeakerMatcherTests: XCTestCase {
             ),
         ])
 
-        XCTAssertTrue(matcher.mergeSpeakers(from: "Speaker A", into: "Speaker B"))
+        XCTAssertEqual(matcher.mergeSpeakers(from: "Speaker A", into: "Speaker B"), .applied)
         let stored = matcher.loadDB()
         XCTAssertEqual(stored.count, 1)
         XCTAssertEqual(stored[0].name, "Speaker B")
@@ -1234,7 +1243,7 @@ final class SpeakerMatcherTests: XCTestCase {
     func testMergeSpeakersMissingSourceReturnsFalse() {
         let matcher = SpeakerMatcher(dbPath: dbPath)
         matcher.saveDB([StoredSpeaker(name: "Speaker A", embeddings: [[1, 0, 0]])])
-        XCTAssertFalse(matcher.mergeSpeakers(from: "missing", into: "Speaker A"))
+        XCTAssertEqual(matcher.mergeSpeakers(from: "missing", into: "Speaker A"), .notFound)
     }
 
     func testMergeCentroidsBothNilReturnsNil() {
@@ -1290,16 +1299,16 @@ final class SpeakerMatcherTests: XCTestCase {
         XCTAssertTrue(bothSynthetic.isSynthetic)
     }
 
-    func testMergedKeepsCentroidlessEntriesLazyUntilARealSampleJoins() {
-        // Neither side ever had a centroid (pre-v3 entries). The merge keeps
-        // both samples as anchors and seeds nothing; the first qualifying
-        // confirmation then averages all of them, as it would have for either
-        // entry alone.
+    func testMergedCentroidlessEntriesSeedFromBothAndKeepTheirWeight() {
+        // Neither side ever had a centroid (pre-v3 entries). The merge seeds
+        // one from both samples, and the next qualifying confirmation averages
+        // all three, as it would have for either entry alone.
         let a = StoredSpeaker(name: "A", embeddings: [[1, 0]])
         let b = StoredSpeaker(name: "B", embeddings: [[0, 1]])
 
         let result = SpeakerMatcher.merged(into: a, from: b)
-        XCTAssertNil(result.centroid)
+        XCTAssertEqual(result.centroid, [0.5, 0.5])
+        XCTAssertEqual(result.centroidSampleCount, 2)
         XCTAssertEqual(result.embeddings, [[1, 0], [0, 1]])
 
         let confirmed = SpeakerMatcher.applyConfirmation(

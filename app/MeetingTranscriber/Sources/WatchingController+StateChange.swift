@@ -33,7 +33,7 @@ extension WatchingController {
     /// `notifyOnRecording` only fires "Meeting Detected" notifications for the
     /// auto-detect path; manual recording emits its own start notification.
     func attachStateChangeHandler(to loop: WatchLoop, notifyOnRecording: Bool) {
-        loop.onStateChange = { [weak self, weak loop, notifier] oldState, newState in
+        loop.onStateChange = { [weak self, weak loop, notifier] oldState, newState, cause in
             // Leaving `.recording` (natural meeting end, manual stop, or
             // mid-recording cancel — all route through this transition) is the
             // unified stop signal for both the auto-detect and manual paths.
@@ -42,13 +42,22 @@ extension WatchingController {
             // flush runs after `recorder.stop()` (WatchLoop stops the recorder
             // before this transition fires); the buffered tail lives in the
             // streaming actors, not the recorder, so it survives the stop.
-            if oldState == .recording {
-                Task { @MainActor in await self?.liveTranscription.flush() }
-                self?.resumeWatchingAfterManualIfNeeded()
+            if oldState == .recording, cause != .callSplit {
+                self?.startCaptionFlush()
+                // Only a manual loop gives watching back. An auto loop that
+                // Stop Watching let go of can leave `.recording` when its mix
+                // ends, during a manual recording whose flag is not its own.
+                if !notifyOnRecording { self?.resumeWatchingAfterManualIfNeeded() }
             }
+            if newState == .error, let err = loop?.lastError {
+                notifier.notify(title: "Error", body: err)
+            }
+            // A loop Stop Watching let go of still changes state when its mix
+            // ends, maybe during a newer recording: the monitor is not its own.
+            guard let self, let loop, self.watchLoop === loop else { return }
             switch newState {
             case .recording:
-                if notifyOnRecording, let meeting = loop?.currentMeeting {
+                if notifyOnRecording, let meeting = loop.currentMeeting {
                     notifier.notify(
                         title: "Meeting Detected",
                         body: "Recording: \(meeting.windowTitle)",
@@ -56,20 +65,14 @@ extension WatchingController {
                 }
                 // No source means no live recording, so there are no channels to
                 // watch and starting the monitor would only assume a topology.
-                if let source = self?.watchLoop?.activeRecordingSource {
-                    self?.channelHealth.start(source: source) { [weak self] in
+                if let source = loop.activeRecordingSource {
+                    channelHealth.start(source: source) { [weak self] in
                         self?.watchLoop?.activeRecorder
                     }
                 }
 
-            case .error:
-                if let err = loop?.lastError {
-                    notifier.notify(title: "Error", body: err)
-                }
-                self?.channelHealth.stop()
-
             default:
-                self?.channelHealth.stop()
+                channelHealth.stop()
             }
         }
     }

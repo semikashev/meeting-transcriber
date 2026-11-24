@@ -33,12 +33,12 @@
             dbPath = tmpDir.appendingPathComponent("speakers.json")
             let suite = "AppStateRPCActionsTests-\(getpid())-\(UUID().uuidString)"
             addTeardownBlock { DefaultsSuite.remove(suite) }
-            guard let defaults = UserDefaults(suiteName: suite) else {
+            guard let defaults = DefaultsSuite.open(suite) else {
                 XCTFail("Could not create test UserDefaults suite")
                 return
             }
             let settings = AppSettings(defaults: defaults)
-            state = AppState(settings: settings)
+            state = try AppState(pipelineEnvironment: makeIsolatedPipelineEnvironment(), settings: settings)
             actions = state.makeSpeakerDBActions { [dbPath] in
                 SpeakerMatcher(dbPath: dbPath)
             }
@@ -152,6 +152,67 @@
             XCTAssertEqual(entry.centroid?.count, AppState.seedEmbeddingDimension)
         }
 
+        // MARK: - unreadable DB
+
+        /// A DB that could not be read must not answer `ok` for a seed that
+        /// was never written, nor `notFound` for a speaker that may well be
+        /// in the unread file.
+        func test_actionsOnUnreadableDB_reportNotSaved() throws {
+            seedSpeaker(name: "Alice")
+            seedSpeaker(name: "Bob")
+            try makeUnreadable(dbPath)
+            let blocked = state.makeSpeakerDBActions { [dbPath] in
+                SpeakerMatcher(dbPath: dbPath) { _ in }
+            }
+
+            XCTAssertEqual(blocked.seed("Carol"), .notSaved)
+            XCTAssertEqual(blocked.rename("Alice", "Alicia"), .notSaved)
+            XCTAssertEqual(blocked.delete("Alice"), .notSaved)
+            XCTAssertEqual(blocked.merge("Alice", "Bob"), .notSaved)
+        }
+
+        /// An action that found the DB undecodable replaced it with an empty
+        /// one: not a 404 for a name that may be in the set-aside copy, and a
+        /// change the cached names must follow.
+        func test_renameOnUndecodableDB_reportsResetAndRefreshesCache() throws {
+            try Data("not json".utf8).write(to: dbPath)
+            let actions = state.makeSpeakerDBActions { [dbPath] in
+                SpeakerMatcher(dbPath: dbPath, onDBProblem: { _ in }, settleBeforeReread: {})
+            }
+
+            let outcome = actions.rename("Alice", "Alicia")
+
+            XCTAssertEqual(outcome, .dbReset)
+            XCTAssertTrue(outcome.changedDB, "the file was replaced, so cached names must refresh")
+        }
+
+        // MARK: - speaker database from the environment
+
+        /// A state reads and changes the speaker database its environment
+        /// names, as its queues do. With the matcher's default it read and
+        /// changed the installed app's `speakers.json` instead.
+        func test_snapshot_readsTheEnvironmentsSpeakerDatabase() throws {
+            let (isolated, _) = try makeStateOnSeededSpeakerDatabase()
+            XCTAssertEqual(isolated.rpcStateSnapshot().speakerDB.recentNames, ["Speaker A"])
+        }
+
+        func test_defaultSpeakerActionsChangeTheEnvironmentsSpeakerDatabase() throws {
+            let (isolated, database) = try makeStateOnSeededSpeakerDatabase()
+            XCTAssertEqual(isolated.makeSpeakerDBActions().rename("Speaker A", "Speaker B"), .ok)
+            XCTAssertEqual(SpeakerMatcher(dbPath: database).allSpeakerNames(), ["Speaker B"])
+        }
+
+        private func makeStateOnSeededSpeakerDatabase() throws -> (AppState, URL) {
+            var environment = try makeIsolatedPipelineEnvironment()
+            environment.speakersDB = makeTempFile(suffix: "-speakers.json")
+            SpeakerMatcher(dbPath: environment.speakersDB).mutateDB { speakers in
+                speakers = [StoredSpeaker(name: "Speaker A", embeddings: [[1, 0, 0]])]
+            }
+            let isolated = try AppState(pipelineEnvironment: environment, settings: makeIsolatedSettings())
+            addTeardownBlock { isolated.liveCaptions.clear() }
+            return (isolated, environment.speakersDB)
+        }
+
         // MARK: - pendingNamingJobs mapping in rpcStateSnapshot
 
         /// Drives the `pendingSpeakerNamingJobs.map` closure in
@@ -233,6 +294,57 @@
             XCTAssertEqual(snapshot.liveCaptions.recentFinals[1].text, "guten morgen")
         }
 
+        /// An `AppState` with captions on, whose English caption load is a fake.
+        private func makeWarmingState(loadError: (any Error)? = nil) throws -> AppState {
+            let suite = "RPCWarmup-\(getpid())-\(UUID().uuidString)"
+            addTeardownBlock { DefaultsSuite.remove(suite) }
+            let settings = try AppSettings(defaults: XCTUnwrap(DefaultsSuite.open(suite)))
+            settings.liveTranscriptionEnabled = true
+            let eouFactory: LiveTranscriptionController.EouSessionFactory = { MockEouManager(loadError: loadError) }
+            let factory: LiveTranscriptionCoordinator.ControllerFactory = { _, captions, _, _ in
+                LiveTranscriptionController(
+                    engine: nil, vad: FluidVAD(threshold: 0.5), captions: captions,
+                    speakerMatcher: FakeLiveSpeakerMatcher(), engineLanguage: "en",
+                    eouSessionFactory: eouFactory,
+                )
+            }
+            return try AppState(
+                pipelineEnvironment: makeIsolatedPipelineEnvironment(),
+                settings: settings,
+                liveControllerFactory: factory,
+            )
+        }
+
+        func test_snapshot_liveCaptions_carriesTheWarmupState() async throws {
+            XCTAssertEqual(state.rpcStateSnapshot().liveCaptions.warmup, "none")
+
+            let warming = try makeWarmingState()
+
+            // Set when the controller is built; its prepare() has not run yet.
+            XCTAssertEqual(warming.rpcStateSnapshot().liveCaptions.warmup, "preparing")
+
+            await waitFor(!warming.liveTranscription.warmup.isPreparing, timeout: .seconds(10))
+            XCTAssertEqual(warming.rpcStateSnapshot().liveCaptions.warmup, "ready")
+            XCTAssertNil(warming.rpcStateSnapshot().liveCaptions.warmupFailure)
+        }
+
+        func test_snapshot_liveCaptions_carriesLanguageDetection() {
+            XCTAssertFalse(state.rpcStateSnapshot().liveCaptions.detectingLanguage)
+            state.liveCaptions.setDetectingLanguage(true)
+            XCTAssertTrue(state.rpcStateSnapshot().liveCaptions.detectingLanguage)
+        }
+
+        func test_snapshot_liveCaptions_carriesTheWarmupFailure() async throws {
+            let error = URLError(.notConnectedToInternet)
+            let warming = try makeWarmingState(loadError: error)
+
+            await waitFor(!warming.liveTranscription.warmup.isPreparing, timeout: .seconds(10))
+
+            let snapshot = warming.rpcStateSnapshot().liveCaptions
+            XCTAssertEqual(snapshot.warmup, "failed")
+            XCTAssertEqual(snapshot.warmupFailure, error.localizedDescription)
+        }
+
         // MARK: - notifications mapping in rpcStateSnapshot
 
         /// `rpcStateSnapshot()` reads the notifier the AppState was constructed
@@ -241,7 +353,7 @@
         /// the posted flag (false here: `setUp()` never ran in the test host).
         func test_snapshot_notifications_readsInjectedNotifier() throws {
             let manager = NotificationManager()
-            let notifierState = AppState(settings: state.settings, notifier: manager)
+            let notifierState = try AppState(pipelineEnvironment: makeIsolatedPipelineEnvironment(), settings: state.settings, notifier: manager)
             defer { notifierState.liveCaptions.clear() }
             manager.notify(title: "Silent Recording", body: "Both channels silent")
             manager.notify(title: "Meeting Detected", body: "Recording: Standup (Teams)")

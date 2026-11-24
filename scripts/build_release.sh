@@ -5,7 +5,8 @@
 #   ./scripts/build_release.sh [--no-notarize] [--staple] [--appstore]
 #
 # Output:
-#   .build/release/MeetingTranscriber.dmg
+#   .build/release/MeetingTranscriber-<version>.dmg
+#   (MeetingTranscriber-AppStore-<version>.dmg with --appstore)
 #
 # Requirements:
 #   - macOS 14+ (Sonoma) on Apple Silicon
@@ -81,12 +82,19 @@ echo "Step 1: Building Swift menu bar app..."
 
 SPM_DIR="$PROJECT_ROOT/app/MeetingTranscriber"
 SWIFT_BUILD_FLAGS=(-c release --disable-sandbox)
+SPM_SCRATCH=".build"
 if [ "$APPSTORE" = true ]; then
-    SWIFT_BUILD_FLAGS+=(-Xswiftc -DAPPSTORE)
+    # The App Store variant compiles with a different flag set, so it gets its
+    # own scratch directory. Sharing `.build` with the Homebrew variant makes
+    # SwiftPM discard and rebuild everything every time the flags flip, which
+    # costs a full build in each direction for anyone building both. (The
+    # bundle output at the repo-root .build/release is a different directory.)
+    SPM_SCRATCH=".build-appstore"
+    SWIFT_BUILD_FLAGS+=(-Xswiftc -DAPPSTORE --scratch-path "$SPM_SCRATCH")
 fi
 (cd "$SPM_DIR" && swift build "${SWIFT_BUILD_FLAGS[@]}")
 
-cp "$SPM_DIR/.build/release/MeetingTranscriber" "$MACOS_DIR/MeetingTranscriber"
+cp "$SPM_DIR/$SPM_SCRATCH/release/MeetingTranscriber" "$MACOS_DIR/MeetingTranscriber"
 
 # ── Step 2: Assemble app bundle ──────────────────────────────────────────────
 
@@ -118,12 +126,13 @@ if [ -d "$ICONSET_SRC" ]; then
     echo "  App icon: $RESOURCES/AppIcon.icns"
 fi
 
-# Licences for the third-party code and weights this bundle redistributes.
-# Installed before the model, and unconditionally, so no failure further down
-# can produce a bundle that ships the components without their notices.
+# Licences for the app itself and the third-party code and weights this bundle
+# redistributes. Installed before the model, and unconditionally, so no failure
+# further down can produce a bundle that ships the components without their
+# notices.
 # shellcheck source=lib/bundle-licenses.sh
 source "$SCRIPT_DIR/lib/bundle-licenses.sh"
-install_third_party_licenses "$RESOURCES"
+install_bundled_licenses "$RESOURCES"
 
 # LocalVQE acoustic echo cancellation model.
 # Bundled rather than downloaded on first use; the reasoning is in the header of
@@ -226,7 +235,7 @@ else
     fi
 fi
 
-# ── Step 5: Create DMG ───────────────────────────────────────────────────────
+# ── Step 4: Create DMG ───────────────────────────────────────────────────────
 
 if [ "$APPSTORE" = true ]; then
     DMG_NAME="MeetingTranscriber-AppStore-${VERSION}.dmg"
@@ -235,57 +244,52 @@ else
 fi
 DMG_PATH="$BUILD_DIR/$DMG_NAME"
 
-if [ -z "${HOMEBREW_TEMP:-}" ]; then
+echo ""
+echo "Step 4: Creating DMG..."
+
+rm -f "$DMG_PATH"
+
+DMG_STAGING="$BUILD_DIR/dmg-staging"
+rm -rf "$DMG_STAGING"
+mkdir -p "$DMG_STAGING"
+mv "$APP_BUNDLE" "$DMG_STAGING/MeetingTranscriber.app"
+ln -s /Applications "$DMG_STAGING/Applications"
+
+hdiutil create -volname "MeetingTranscriber" \
+    -srcfolder "$DMG_STAGING" \
+    -ov -format UDZO \
+    "$DMG_PATH"
+
+mv "$DMG_STAGING/MeetingTranscriber.app" "$APP_BUNDLE"
+rm -rf "$DMG_STAGING"
+
+# ── Step 5: Notarize (optional) ──────────────────────────────────────────────
+
+if [ "$NOTARIZE" = true ]; then
     echo ""
-    echo "Step 4: Creating DMG..."
+    echo "Step 5: Notarizing DMG..."
 
-    rm -f "$DMG_PATH"
-
-    DMG_STAGING="$BUILD_DIR/dmg-staging"
-    rm -rf "$DMG_STAGING"
-    mkdir -p "$DMG_STAGING"
-    mv "$APP_BUNDLE" "$DMG_STAGING/MeetingTranscriber.app"
-    ln -s /Applications "$DMG_STAGING/Applications"
-
-    hdiutil create -volname "MeetingTranscriber" \
-        -srcfolder "$DMG_STAGING" \
-        -ov -format UDZO \
-        "$DMG_PATH"
-
-    mv "$DMG_STAGING/MeetingTranscriber.app" "$APP_BUNDLE"
-    rm -rf "$DMG_STAGING"
-
-    # ── Step 5: Notarize (optional) ──────────────────────────────────────────
-
-    if [ "$NOTARIZE" = true ]; then
-        echo ""
-        echo "Step 5: Notarizing DMG..."
-
-        if [ -z "${APPLE_ID:-}" ] || [ -z "${TEAM_ID:-}" ] || [ -z "${APP_PASSWORD:-}" ]; then
-            echo "  ERROR: APPLE_ID, TEAM_ID, and APP_PASSWORD must be set for notarization."
-            exit 1
-        fi
-
-        WAIT_FLAG=""
-        [ "$STAPLE" = true ] && WAIT_FLAG="--wait"
-
-        xcrun notarytool submit "$DMG_PATH" \
-            --apple-id "$APPLE_ID" \
-            --team-id "$TEAM_ID" \
-            --password "$APP_PASSWORD" \
-            $WAIT_FLAG
-
-        if [ "$STAPLE" = true ]; then
-            echo "  Stapling notarization ticket to DMG..."
-            xcrun stapler staple "$DMG_PATH"
-            xcrun stapler validate "$DMG_PATH"
-        else
-            echo "  DMG submitted for notarization (Gatekeeper will verify online)"
-        fi
+    if [ -z "${APPLE_ID:-}" ] || [ -z "${TEAM_ID:-}" ] || [ -z "${APP_PASSWORD:-}" ]; then
+        echo "  ERROR: APPLE_ID, TEAM_ID, and APP_PASSWORD must be set for notarization."
+        exit 1
     fi
-else
-    echo ""
-    echo "Step 4: Skipping DMG (Homebrew mode)"
+
+    WAIT_FLAG=""
+    [ "$STAPLE" = true ] && WAIT_FLAG="--wait"
+
+    xcrun notarytool submit "$DMG_PATH" \
+        --apple-id "$APPLE_ID" \
+        --team-id "$TEAM_ID" \
+        --password "$APP_PASSWORD" \
+        $WAIT_FLAG
+
+    if [ "$STAPLE" = true ]; then
+        echo "  Stapling notarization ticket to DMG..."
+        xcrun stapler staple "$DMG_PATH"
+        xcrun stapler validate "$DMG_PATH"
+    else
+        echo "  DMG submitted for notarization (Gatekeeper will verify online)"
+    fi
 fi
 
 # ── Done ──────────────────────────────────────────────────────────────────────

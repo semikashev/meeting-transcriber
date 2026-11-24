@@ -6,6 +6,8 @@ speakers.json
 
 # Swift build artifacts
 app/MeetingTranscriber/.build/
+app/MeetingTranscriber/.build-appstore/
+app/MeetingTranscriber/.build-fault/
 tools/audiotap/.build/
 
 # Release build artifacts
@@ -28,7 +30,6 @@ __pycache__/
 # docs/plans/ stays committed for future-feature RFCs and reference docs.
 docs/plans/.local/
 scripts/fixtures/node_modules/
-scripts/fixtures/package-lock.json
 
 # Developer ID provisioning profiles (account artifacts, like the signing cert)
 signing/

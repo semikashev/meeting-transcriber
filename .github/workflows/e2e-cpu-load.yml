@@ -35,7 +35,7 @@ jobs:
     timeout-minutes: 15
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - uses: ./.github/actions/verify-xcode
 
@@ -65,6 +65,12 @@ jobs:
           set -o pipefail
           bash scripts/e2e-cpu-load.sh | tee /tmp/e2e-cpu-load-run.log
 
+      # See the same step in e2e-app.yml.
+      - name: End e2e drivers a step timeout left behind
+        if: always()
+        timeout-minutes: 3
+        run: source scripts/lib/e2e-helpers.sh && e2e_reap_registered_drivers
+
       # The RESULT line is the machine-readable summary (idle + active
       # window averages + contamination flag). Collected as an artifact so
       # trend analysis across runs needs no log scraping.
@@ -76,7 +82,7 @@ jobs:
 
       - name: Upload measurement result
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: cpu-load-result
           path: /tmp/cpu-load-result.json
@@ -84,7 +90,7 @@ jobs:
 
       - name: Upload simulator log
         if: failure()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: cpu-load-simulator.log
           path: /tmp/e2e-cpu-load-sim.log

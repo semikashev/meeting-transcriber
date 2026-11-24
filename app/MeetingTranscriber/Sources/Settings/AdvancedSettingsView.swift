@@ -19,12 +19,14 @@ private enum PrivacyPane: String {
 
 struct AdvancedSettingsView: View {
     @Bindable var settings: AppSettings
+    /// Whether to show the Accessibility row. A build that cannot use the
+    /// grant has nothing to offer there (`PermissionHealthCheck.accessibilityApplies`).
+    var showsAccessibility: Bool = PermissionHealthCheck.accessibilityApplies
 
     @State private var micPermission: AVAuthorizationStatus = .notDetermined
     @State private var screenRecordingOK = false
     @State private var accessibilityOK = false
-    @State private var lastExportFile: String?
-    @State private var lastExportError: String?
+    @State private var lastExportStatus: DiagnosticExportStatus?
     /// True while a `DiagnosticExporter.export` call is running off-main.
     /// Used to dim the button and surface a spinner so a 50-200 MB persistent
     /// log doesn't look like the app froze.
@@ -51,14 +53,9 @@ struct AdvancedSettingsView: View {
                     help: "System Settings → Privacy & Security → Microphone → enable Meeting Transcriber",
                     settingsURL: PrivacyPane.microphone.url,
                 )
-                PermissionRow(
-                    label: "Accessibility",
-                    detail: "Optional — enables mute detection and meeting naming",
-                    granted: accessibilityOK,
-                    optional: true,
-                    help: "System Settings → Privacy & Security → Accessibility → enable Meeting Transcriber",
-                    settingsURL: PrivacyPane.accessibility.url,
-                )
+                if showsAccessibility {
+                    accessibilityRow
+                }
 
                 Button("Refresh") {
                     refreshPermissions()
@@ -71,7 +68,7 @@ struct AdvancedSettingsView: View {
                 Toggle("Verbose Diagnostic Logging", isOn: $settings.verboseDiagnostics)
                 Text(
                     "Logs detailed diagnostics across recording, transcription,"
-                        + " diarization, and protocol generation. Used to debug"
+                        + " diarization, and meeting notes generation. Used to debug"
                         + " issues. Off by default — toggle on, reproduce the"
                         + " problem, then click \"Export Diagnostics…\" below to"
                         + " attach a redacted log file to a bug report.",
@@ -87,15 +84,8 @@ struct AdvancedSettingsView: View {
                             .controlSize(.small)
                     }
                 }
-                if let file = lastExportFile {
-                    Text("Exported to: \(file)")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                if let err = lastExportError {
-                    Text("Export failed: \(err)")
-                        .font(.caption)
-                        .foregroundStyle(.red)
+                if let lastExportStatus {
+                    DiagnosticExportStatusText(status: lastExportStatus)
                 }
 
                 #if !APPSTORE
@@ -129,11 +119,22 @@ struct AdvancedSettingsView: View {
         .onAppear { refreshPermissions() }
     }
 
-    #if APPSTORE
-        private static let screenRecordingDetail = "Required for app audio capture"
-    #else
-        private static let screenRecordingDetail = "Required for meeting detection and app audio capture"
-    #endif
+    private var accessibilityRow: some View {
+        PermissionRow(
+            label: "Accessibility",
+            detail: "Optional — reads Teams participant names",
+            granted: accessibilityOK,
+            optional: true,
+            help: "System Settings → Privacy & Security → Accessibility → enable Meeting Transcriber",
+            settingsURL: PrivacyPane.accessibility.url,
+        )
+        .accessibilityIdentifier(A11yID.accessibilityPermissionRow)
+    }
+
+    /// Meeting detection reads no window titles. The grant sharpens the meeting
+    /// title and is one of the two grants the app-audio tap accepts, the other
+    /// being Audio Recording, which has no row because it cannot be checked.
+    private static let screenRecordingDetail = "Meeting titles, and app audio capture without Audio Recording"
 
     private func refreshPermissions() {
         micPermission = AVCaptureDevice.authorizationStatus(for: .audio)
@@ -161,27 +162,24 @@ struct AdvancedSettingsView: View {
         )
 
         isExportingDiagnostics = true
-        // The persistent-log file source can be 50-200 MB and reads via
-        // `String(contentsOf:)` + `split(separator:)` — and the OSLogStore
-        // fallback's `getEntries` is famously slow on the main actor. Detach
+        // The persistent-log file source can be 50-200 MB and is decoded and
+        // split into lines in one go, and the OSLogStore fallback's
+        // `getEntries` is famously slow on the main actor. Detach
         // so the Settings UI stays responsive while the export runs.
         Task.detached(priority: .userInitiated) {
             let result = Result { try DiagnosticExporter.export(to: outURL, info: info) }
             await MainActor.run {
                 isExportingDiagnostics = false
+                lastExportStatus = DiagnosticExportStatus(fileName: outURL.lastPathComponent, outcome: result)
                 switch result {
                 case let .success(count):
-                    lastExportFile = outURL.lastPathComponent
-                    lastExportError = nil
                     NSWorkspace.shared.activateFileViewerSelecting([outURL])
                     let exportedFile = outURL.lastPathComponent
                     logger.info(
-                        "diagnostics_exported lines=\(count, privacy: .public) file=\(exportedFile, privacy: .public)",
+                        "diagnostics_exported entries=\(count, privacy: .public) file=\(exportedFile, privacy: .public)",
                     )
 
                 case let .failure(error):
-                    lastExportFile = nil
-                    lastExportError = error.localizedDescription
                     logger.error(
                         "diagnostics_export_failed error=\(error.localizedDescription, privacy: .public)",
                     )

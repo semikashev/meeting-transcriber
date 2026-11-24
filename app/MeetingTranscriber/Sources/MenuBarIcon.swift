@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 
 /// Badge overlay kind for the menu bar icon.
 ///
@@ -62,9 +63,21 @@ enum MenuBarIcon {
     /// open (cosmetic, sub-second) and resumes when tracking ends.
     nonisolated static let animationRunLoopMode: RunLoop.Mode = .default
 
+    /// The ticks that drive `AnimatedMenuBarIcon`'s frame: the 0.4 s timer
+    /// for an animated badge, nothing for a static one. A static badge ignores
+    /// ticks anyway (`nextFrame`), so subscribing to the timer for it would only
+    /// wake the main run loop 2.5 times a second while the app idles in the
+    /// menu bar, which is its normal state.
+    static func animationTicks(for badge: BadgeKind) -> AnyPublisher<Date, Never> {
+        guard badge.isAnimated else { return Empty().eraseToAnyPublisher() }
+        return Timer.publish(every: 0.4, on: .main, in: animationRunLoopMode)
+            .autoconnect()
+            .eraseToAnyPublisher()
+    }
+
     /// Returns the next animation frame for `badge`, or `current` if `badge`
-    /// is non-animated. Static badges (idle, error, …) ignore the timer tick
-    /// so the App scene's body does not re-evaluate every 0.4 s. Pure math —
+    /// is non-animated. A static badge gets no ticks (`animationTicks`); this
+    /// keeps the frame still should one arrive anyway. Pure math —
     /// `nonisolated` so it can be called from any context (tests, off-main).
     nonisolated static func nextFrame(_ current: Int, badge: BadgeKind) -> Int {
         guard badge.isAnimated else { return current }
@@ -122,7 +135,9 @@ enum MenuBarIcon {
     /// the **bottom half** is red — signalling the app-audio channel went silent. The two are
     /// independent; if both are true, both halves are red (effectively all-red bars).
     /// Any of these bypass the pre-rendered cache and force a non-template image, because red
-    /// would not survive template rendering.
+    /// would not survive template rendering. If `micMutedOverlay` is true, a diagonal strike
+    /// crosses the waveform: the user muted the mic in this recording. It takes the mic-silent
+    /// tint's place, which callers drop while muted.
     static func image(
         badge: BadgeKind,
         animationFrame: Int = 0,
@@ -130,8 +145,9 @@ enum MenuBarIcon {
         recordOnlyOverlay: Bool = false,
         micSilentOverlay: Bool = false,
         appSilentOverlay: Bool = false,
+        micMutedOverlay: Bool = false,
     ) -> NSImage {
-        if permissionOverlay || recordOnlyOverlay || micSilentOverlay || appSilentOverlay {
+        if permissionOverlay || recordOnlyOverlay || micSilentOverlay || appSilentOverlay || micMutedOverlay {
             // Honour the cache's frame discipline: animated badges advance, static ones
             // stay on frame 0. Without this, the live animationFrame leaks through and
             // makes `.inactive` (idle waveform) bounce as if recording.
@@ -142,6 +158,7 @@ enum MenuBarIcon {
                 recordOnlyOverlay: recordOnlyOverlay,
                 micSilentOverlay: micSilentOverlay,
                 appSilentOverlay: appSilentOverlay,
+                micMutedOverlay: micMutedOverlay,
             )
         }
         guard let frames = cache[badge] else { return renderImage(badge: badge, frame: animationFrame) }
@@ -157,6 +174,7 @@ enum MenuBarIcon {
         recordOnlyOverlay: Bool = false,
         micSilentOverlay: Bool = false,
         appSilentOverlay: Bool = false,
+        micMutedOverlay: Bool = false,
     ) -> NSImage {
         let size = NSSize(width: 18, height: 18)
         // The `.error` badge and any red overlay all need an explicit foreground color
@@ -197,6 +215,10 @@ enum MenuBarIcon {
                 }
             }
 
+            if micMutedOverlay {
+                drawMutedStrike(in: rect, color: needsExplicitForeground && isDark ? .white : .black)
+            }
+
             // Overlay precedence: permission errors win over record-only because a permission
             // problem actually breaks recording, so the user must see it first.
             if permissionOverlay || badge == .error {
@@ -234,6 +256,26 @@ enum MenuBarIcon {
         default:
             drawRecordingAnimation(in: rect, frame: frame)
         }
+    }
+
+    /// A strike with a cleared halo either side, so it stays readable over the bars.
+    private static func drawMutedStrike(in rect: NSRect, color: NSColor) {
+        guard let ctx = NSGraphicsContext.current else { return }
+
+        let strike = NSBezierPath()
+        strike.move(to: NSPoint(x: rect.minX + 2, y: rect.maxY - 2))
+        strike.line(to: NSPoint(x: rect.maxX - 2, y: rect.minY + 2))
+        strike.lineCapStyle = .round
+
+        ctx.saveGraphicsState()
+        ctx.compositingOperation = .clear
+        strike.lineWidth = 4
+        strike.stroke()
+        ctx.restoreGraphicsState()
+
+        color.setStroke()
+        strike.lineWidth = 1.8
+        strike.stroke()
     }
 
     private enum Half { case top, bottom }
@@ -447,9 +489,14 @@ extension BadgeKind {
         activeJobState: JobState?,
         updateAvailable: Bool,
         permissionProblem: Bool = false,
+        consentPending: Bool = false,
     ) -> BadgeKind {
         if watchLoopActive {
             if watchLoopState == .recording { return .recording }
+            // An open browser-consent prompt has a deadline and is the one
+            // question that can go unseen as a notification (issue #814), so
+            // it outranks everything but a running recording and an error.
+            if consentPending, transcriberState != .error { return .userAction }
             switch transcriberState {
             case .waitingForSpeakerCount, .waitingForSpeakerNames: return .userAction
             case .protocolReady: return .done

@@ -7,14 +7,15 @@
     private let logger = Logger(subsystem: AppPaths.logSubsystem, category: "DebugRPCServer")
 
     /// Local-only HTTP server that exposes app state for shell-driven inspection.
-    /// Gated by `MEETINGTRANSCRIBER_DEBUG_RPC=1` env var; never started in
-    /// production builds (the `#if !APPSTORE` wraps the whole file).
+    /// Off by default: started by the Local Automation API toggle in Settings or
+    /// by `MEETINGTRANSCRIBER_DEBUG_RPC=1`. Not in the App Store build (`#if !APPSTORE`).
     ///
     /// Bind: `127.0.0.1:9876`. Two layers of defense:
     /// - Origin-header reject blocks browser CSRF / DNS-rebinding (`fetch()` from a
     ///   page on the user's machine sends Origin; curl and native CLIs don't).
-    /// - Bearer-token auth read from `~/Library/Application Support/MeetingTranscriber/.rpc-token`
-    ///   (chmod 0600) keeps other local users on a shared Mac out and adds
+    /// - Bearer-token auth, the token written to
+    ///   `~/Library/Application Support/MeetingTranscriber/.rpc-token` (chmod 0600)
+    ///   and replaced at every server start, keeps other local users on a shared Mac out and adds
     ///   defense-in-depth against compromised processes that lack read access
     ///   to the user's data dir.
     @MainActor
@@ -87,13 +88,22 @@
         let namingStatus: (UUID) -> NamingStatusDTO? // GET /v1/jobs/<id>/naming
         let confirmNaming: (UUID, [String: String]) -> Bool // POST .../naming
         let skipJobNaming: (UUID) -> Bool // POST .../naming/skip
-        let transcribe: (URL, Double) async -> BlockingTranscribeResult // POST /v1/transcribe
+        let transcribe: BlockingTranscribe // POST /v1/transcribe
         let watchStatus: () -> WatchStatusDTO // GET /v1/watch
         let watchControl: (WatchAction) async -> WatchControlOutcome // POST /v1/watch
         let recordStatus: () -> RecordStatusDTO // GET /v1/record
         let recordControl: (RecordAction) async -> RecordControlOutcome // POST /v1/record
+        let meetingNotes: MeetingNotesActions // POST /v1/jobs/<id>/notes/retry, /v1/jobs/notes/retry
         var idempotency = IdempotencyStore() // Idempotency-Key -> job IDs; internal for the +V1 extension
+        let logReader: LogReader // GET /log; internal for the +Log extension
+        var logReadInFlight = false // GET /log serves one read at a time; internal for the +Log extension
+        private let token: String
         private let expectedAuth: String
+        /// Where to publish `token` once the listener is ready; nil publishes
+        /// nothing (tests). Written only after the bind succeeded: a server that
+        /// cannot bind, because another instance sharing the data folder holds
+        /// the port, must not replace the token that instance is serving.
+        private let tokenFile: URL?
         private var listener: NWListener?
         /// OS-assigned port once the listener is `.ready`. Useful for tests
         /// that bind to port 0 and need to know where to connect back.
@@ -104,8 +114,9 @@
         }
 
         init(
-            port: UInt16 = DebugRPCServer.defaultPort,
-            token: String = DebugRPCServer.loadOrCreateToken(),
+            port: UInt16,
+            token: String,
+            tokenFile: URL? = nil,
             snapshot: @escaping () -> RPCStateSnapshot,
             speakerActions: SpeakerDBActions = .noop,
             skipNaming: @escaping () -> Void = {},
@@ -117,14 +128,18 @@
             namingStatus: @escaping (UUID) -> NamingStatusDTO? = { _ in nil },
             confirmNaming: @escaping (UUID, [String: String]) -> Bool = { _, _ in false },
             skipJobNaming: @escaping (UUID) -> Bool = { _ in false },
-            transcribe: @escaping (URL, Double) async -> BlockingTranscribeResult = { _, _ in .noFile },
+            transcribe: @escaping BlockingTranscribe = { _, _, _ in .noFile },
             watchStatus: @escaping () -> WatchStatusDTO = { .notWatching },
             watchControl: @escaping (WatchAction) async -> WatchControlOutcome = { _ in .failed },
             recordStatus: @escaping () -> RecordStatusDTO = { .notRecording },
             recordControl: @escaping (RecordAction) async -> RecordControlOutcome = { _ in .failed },
+            meetingNotes: MeetingNotesActions = MeetingNotesActions(),
+            logReader: @escaping LogReader = DebugRPCServer.osLogStoreReader,
         ) {
             self.port = NWEndpoint.Port(rawValue: port) ?? NWEndpoint.Port.any
+            self.token = token
             self.expectedAuth = "Bearer \(token)"
+            self.tokenFile = tokenFile
             self.snapshot = snapshot
             self.speakerActions = speakerActions
             self.skipNaming = skipNaming
@@ -141,47 +156,47 @@
             self.watchControl = watchControl
             self.recordStatus = recordStatus
             self.recordControl = recordControl
+            self.meetingNotes = meetingNotes
+            self.logReader = logReader
         }
 
-        /// Generate a 32-byte hex token, persist atomically with mode 0600, return it.
-        /// Reuses an existing non-empty file so `mt-cli` survives across launches.
-        nonisolated static func loadOrCreateToken() -> String {
-            let url = tokenFileURL
-            if let data = try? Data(contentsOf: url),
-               let existing = String(data: data, encoding: .utf8)?
-               .trimmingCharacters(in: .whitespacesAndNewlines),
-               !existing.isEmpty {
-                return existing
-            }
-            return rotateToken(at: url)
-        }
-
-        /// Unconditionally write a fresh 32-byte hex token to `url`. Used by the
-        /// settings toggle so that flipping the server off → on invalidates any
-        /// previously-leaked token. Mode 0600 is set at create time to avoid
-        /// the brief 0644 window a write-then-chmod sequence would have.
-        @discardableResult
-        nonisolated static func rotateToken(at url: URL = tokenFileURL) -> String {
+        /// A fresh 32-byte hex token. `RPCServerController` makes one for every
+        /// server start, so a token never outlives the server it was made for.
+        nonisolated static func makeToken() -> String {
             var bytes = [UInt8](repeating: 0, count: 32)
             // SecRandomCopyBytes returning non-zero means the buffer is
-            // unmodified (all zeros) — refuse to write that as a token.
+            // unmodified (all zeros), so it must not become the token.
             guard SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) == errSecSuccess else {
                 logger.error("DebugRPCServer: SecRandomCopyBytes failed; using UUID fallback")
                 return UUID().uuidString
             }
-            let token = bytes.map { String(format: "%02x", $0) }.joined()
-            try? FileManager.default.createDirectory(
-                at: url.deletingLastPathComponent(), withIntermediateDirectories: true,
-            )
-            // Remove any prior file so createFile re-applies the 0600 attribute
-            // even if the existing inode had drifted to a looser mode.
-            try? FileManager.default.removeItem(at: url)
-            FileManager.default.createFile(
-                atPath: url.path,
-                contents: Data(token.utf8),
-                attributes: [.posixPermissions: 0o600],
-            )
-            return token
+            return bytes.map { String(format: "%02x", $0) }.joined()
+        }
+
+        /// Replace the token file at `url` with `token`, mode 0600. Written to a
+        /// temporary file and renamed over the old one, so a client reading at
+        /// that moment sees the old token or the new one, never a missing or
+        /// half-written file. The temporary file gets mode 0600 in the `open`
+        /// call itself, before any byte is written; `FileManager.createFile
+        /// (attributes:)` documents no such order (not measured either way).
+        /// Returns whether the file now holds `token`.
+        nonisolated static func writeToken(_ token: String, to url: URL) -> Bool {
+            let dir = url.deletingLastPathComponent()
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let temp = dir.appendingPathComponent(".\(url.lastPathComponent).\(UUID().uuidString)")
+            let data = Array(token.utf8)
+            let fd = open(temp.path, O_WRONLY | O_CREAT | O_EXCL, mode_t(FileManager.ownerOnlyPermissions))
+            let written = fd >= 0 && write(fd, data, data.count) == data.count
+            var failure = errno // before close() can overwrite it
+            if fd >= 0 { close(fd) }
+            let renamed = written && rename(temp.path, url.path) == 0
+            if written, !renamed { failure = errno }
+            guard renamed else {
+                try? FileManager.default.removeItem(at: temp)
+                logger.error("DebugRPCServer: could not write the token file (errno \(failure, privacy: .public))")
+                return false
+            }
+            return true
         }
 
         /// Start listening. Failures (port in use, etc.) are logged and the
@@ -228,7 +243,7 @@
                 listener.stateUpdateHandler = { [weak self] state in
                     switch state {
                     case .ready:
-                        Task { @MainActor in self?.boundPort = self?.listener?.port?.rawValue }
+                        Task { @MainActor in self?.listenerBecameReady() }
 
                     case let .failed(error):
                         // Without this, a post-start bind failure (e.g. the
@@ -253,6 +268,20 @@
             } catch {
                 logger.error("DebugRPCServer failed to start: \(error.localizedDescription, privacy: .public)")
             }
+        }
+
+        /// The bind succeeded: publish the token, then record the port. Only now
+        /// does the file stop describing whichever server held the port before.
+        /// A server whose token cannot be written stops: no client could reach
+        /// it, and a running server would claim otherwise.
+        private func listenerBecameReady() {
+            guard let listener else { return }
+            if let tokenFile, !Self.writeToken(token, to: tokenFile) {
+                logger.error("DebugRPCServer: stopping, clients could not authenticate without the token file")
+                stop()
+                return
+            }
+            boundPort = listener.port?.rawValue
         }
 
         /// Cancel the listener and free the port. Idempotent.
@@ -322,7 +351,9 @@
         /// Returns a rejection response (403/401) when a check fails, or nil
         /// when the request may proceed.
         private func rejectionForFailedGuards(_ request: HTTPRequest) -> HTTPResponse? {
-            if let origin = request.headers["origin"], !origin.isEmpty, origin != "null" {
+            // Any non-empty Origin is a browser, including the literal "null" that
+            // file://, data: and sandboxed-iframe pages send.
+            if let origin = request.headers["origin"], !origin.isEmpty {
                 return HTTPResponse.forbidden()
             }
             let hostPort = boundPort ?? port.rawValue
@@ -352,6 +383,10 @@
                 || Self.controlResourcePaths.contains(pathWithoutQuery) {
                 return await routeV1(request, path: pathWithoutQuery)
             }
+
+            // Debug log readback, off `/v1` on purpose (see `logResponse`). The
+            // raw target carries `?since=&limit=`.
+            if request.method == "GET", pathWithoutQuery == "/log" { return await logResponse(target: request.path) }
 
             // Debug `/ui/*` surface (tree, press, type) — no stability contract.
             if let uiResponse = routeUI(request, path: pathWithoutQuery) { return uiResponse }
@@ -510,7 +545,8 @@
         }
 
         /// Map the action outcome to an HTTP response. `notFound` → 404,
-        /// `invalid` → 400, everything else → 200 with the outcome string in the body.
+        /// `invalid` → 400, `notSaved` → 503, `dbReset` → 409, everything else → 200 with the
+        /// outcome string in the body.
         private static func respond(to outcome: SpeakerActionOutcome) -> HTTPResponse {
             switch outcome {
             case .notFound:
@@ -518,6 +554,21 @@
 
             case .invalid:
                 return HTTPResponse.badRequest()
+
+            case .notSaved:
+                return HTTPResponse.serviceUnavailable(
+                    "speaker database could not be read or written; nothing was changed\n",
+                )
+
+            case .dbReset:
+                return HTTPResponse(
+                    status: 409, reason: "Conflict",
+                    body: Data(
+                        ("speaker database was damaged and set aside; only the profiles that could "
+                            + "still be read were kept, and the action found nothing to act on among them\n").utf8,
+                    ),
+                    contentType: "text/plain",
+                )
 
             case .ok, .noop, .merged:
                 let body = Data(#"{"outcome":"\#(outcome.rawValue)"}"#.utf8)
@@ -540,37 +591,6 @@
         static func closeSettings() {
             NotificationCenter.default.post(name: .closeSettings, object: nil)
         }
-    }
-
-    // MARK: - Speaker DB action types
-
-    enum SpeakerActionOutcome: String {
-        case ok
-        case noop
-        case merged
-        case notFound
-        case invalid
-    }
-
-    /// Default `.noop` rejects every request so tests and dry-launches can't
-    /// accidentally mutate state — wire real closures explicitly when starting.
-    /// `@MainActor`-isolated closures so the struct is `Sendable` (every
-    /// invocation happens on MainActor anyway — RPC routing is itself
-    /// MainActor-bound — so the isolation doesn't change call-site semantics).
-    struct SpeakerDBActions {
-        let rename: @MainActor (String, String) -> SpeakerActionOutcome
-        let delete: @MainActor (String) -> SpeakerActionOutcome
-        let merge: @MainActor (String, String) -> SpeakerActionOutcome
-        /// Insert a synthetic speaker with a random embedding. Test-only path
-        /// — production never calls this.
-        let seed: @MainActor (String) -> SpeakerActionOutcome
-
-        static let noop = Self(
-            rename: { _, _ in .invalid },
-            delete: { _ in .invalid },
-            merge: { _, _ in .invalid },
-            seed: { _ in .invalid },
-        )
     }
 
 #endif

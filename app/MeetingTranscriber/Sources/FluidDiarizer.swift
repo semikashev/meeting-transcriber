@@ -43,10 +43,12 @@ struct OfflineDiarizerTuning: Equatable {
 }
 
 /// CoreML-based speaker diarization using FluidAudio (on-device, no HuggingFace token needed).
-/// `@unchecked Sendable` because `PipelineQueue` shares one instance across
-/// two `async let` diarisation runs. The mutable `offlineProcessor` /
-/// `sortformerDiarizer` are init-once-then-read; the underlying FluidAudio
-/// CoreML inference is documented thread-safe.
+/// `@unchecked Sendable` because `DiarizationProvider` is `Sendable`: one
+/// instance diarizes both tracks of a dual-source job, which
+/// `PipelineQueue.runDualTrackDiarization` runs one after the other, not in
+/// parallel. The lazily set `offlineProcessor` / `sortformerDiarizer` state is
+/// not synchronised and relies on that order. Nemotron 3 mode does not: its
+/// stream state is not thread-safe, so its runs go through `nemotronRunGate`.
 final class FluidDiarizer: DiarizationProvider, @unchecked Sendable {
     let mode: DiarizerMode
     private var offlineProcessor: any OfflineDiarizationProcessing
@@ -56,11 +58,31 @@ final class FluidDiarizer: DiarizationProvider, @unchecked Sendable {
     /// reports the units its loaded model carries. Everything that needs the
     /// real model sits behind this one seam, so a test can supply a stub.
     private let makeSortformerDiarizer: (MLComputeUnits) async throws -> (SortformerDiarizer, MLComputeUnits)
+    /// Lazily-loaded Nemotron 3 diarizer, used only by
+    /// `FluidDiarizer+Nemotron.runNemotron`. Not `private` because that
+    /// extension lives in a separate file. Unlike the CoreML inference it
+    /// carries streaming state and is not thread-safe, so it is only touched
+    /// inside `nemotronRunGate`; `runNemotron` resets it at the start of a run.
+    var nemotronDiarizer: (any NemotronStreamingDiarizing)?
+    /// Serialises Nemotron 3 runs on this instance, so in this mode, unlike
+    /// Offline and Sortformer, `run` is safe to call concurrently.
+    let nemotronRunGate = AsyncSerialGate()
+    /// Loads the Nemotron 3 model for the requested compute units and returns
+    /// a ready streaming diarizer plus the units its loaded model carries.
+    /// Everything that needs the real model sits behind this one seam, so a
+    /// test can supply a stub. Not `private` for the same reason as
+    /// `nemotronDiarizer`.
+    let makeNemotronDiarizer: (MLComputeUnits) async throws -> (any NemotronStreamingDiarizing, MLComputeUnits)
     /// Lazily-loaded WeSpeaker (pyannote `wespeaker_v2`) models, used only by
     /// `FluidDiarizer+SortformerEmbeddings.extractSortformerEmbeddings`. Not
     /// `private` because the extension lives in a separate file (codecov-
     /// ignored — see `.codecov.yml`).
     var sortformerEmbeddingModels: DiarizerModels?
+    /// Loads those WeSpeaker models for the requested compute units.
+    /// Injectable so a test can see which units the post-hoc embeddings ask
+    /// for without loading a model. Not `private` for the same reason as
+    /// `sortformerEmbeddingModels`.
+    let loadEmbeddingModels: (MLComputeUnits) async throws -> DiarizerModels
 
     var isAvailable: Bool {
         true
@@ -76,10 +98,18 @@ final class FluidDiarizer: DiarizationProvider, @unchecked Sendable {
             diarizer.initialize(models: models)
             return (diarizer, models.mainModel.configuration.computeUnits)
         },
+        makeNemotronDiarizer: @escaping (MLComputeUnits) async throws -> (any NemotronStreamingDiarizing, MLComputeUnits) = { computeUnits in
+            try await FluidDiarizer.loadNemotronDiarizer(computeUnits: computeUnits)
+        },
+        loadEmbeddingModels: @escaping (MLComputeUnits) async throws -> DiarizerModels = { computeUnits in
+            try await FluidOfflineProcessor.loadDiarizerModels(computeUnits: computeUnits)
+        },
     ) {
         self.mode = mode
         self.offlineProcessor = offlineProcessor ?? FluidOfflineProcessor(tuning: tuning)
         self.makeSortformerDiarizer = makeSortformerDiarizer
+        self.makeNemotronDiarizer = makeNemotronDiarizer
+        self.loadEmbeddingModels = loadEmbeddingModels
     }
 
     /// Normalize FluidAudio's "Speaker 0" format to "SPEAKER_0".
@@ -98,6 +128,9 @@ final class FluidDiarizer: DiarizationProvider, @unchecked Sendable {
 
         case .sortformer:
             try await runSortformer(audioPath: audioPath)
+
+        case .nemotron:
+            try await runNemotron(audioPath: audioPath, numSpeakers: numSpeakers)
         }
     }
 
@@ -139,9 +172,15 @@ final class FluidDiarizer: DiarizationProvider, @unchecked Sendable {
     /// run after a model or OS update pays a one-time compile for the new
     /// routing. FluidAudio forwards an explicit value to Core ML unchanged;
     /// only `nil` goes through its own `recommendedComputeUnits` choice.
-    /// This is a speed choice, not a crash fix: the WeSpeaker embeddings that
-    /// follow in Sortformer mode keep FluidAudio's default routing.
+    /// This is a speed choice, not a crash fix. The WeSpeaker embeddings that
+    /// follow in Sortformer mode take their units from
+    /// `FluidOfflineProcessor.computeUnits` instead.
     static let sortformerComputeUnits: MLComputeUnits = .cpuAndNeuralEngine
+
+    /// Log label for compute units read back from a loaded model.
+    static func computeUnitsLabel(_ units: MLComputeUnits) -> String {
+        units == .cpuAndNeuralEngine ? "cpuAndNeuralEngine" : "rawValue \(units.rawValue)"
+    }
 
     private func runSortformer(audioPath: URL) async throws -> MeetingTranscriber.DiarizationResult {
         if sortformerDiarizer == nil {
@@ -149,24 +188,12 @@ final class FluidDiarizer: DiarizationProvider, @unchecked Sendable {
             sortformerDiarizer = diarizer
             // `routed` is read back from the loaded model, so the log shows the
             // routing Core ML was given rather than the value this file asked for.
-            let routedLabel = routed == .cpuAndNeuralEngine ? "cpuAndNeuralEngine" : "rawValue \(routed.rawValue)"
-            logger.info("FluidAudio Sortformer models ready (computeUnits: \(routedLabel, privacy: .public))")
+            logger.info("FluidAudio Sortformer models ready (computeUnits: \(Self.computeUnitsLabel(routed), privacy: .public))")
         }
 
         logger.info("Starting Sortformer diarization: \(audioPath.lastPathComponent)")
         // swiftlint:disable:next force_unwrapping
         let timeline = try sortformerDiarizer!.processComplete(audioFileURL: audioPath)
-
-        let segments = timeline.speakers.flatMap { index, speaker in
-            let label = Self.normalizeSpeakerId(speaker.name ?? "Speaker \(index)")
-            return speaker.finalizedSegments.map { seg in
-                MeetingTranscriber.DiarizationResult.Segment(
-                    start: TimeInterval(seg.startTime),
-                    end: TimeInterval(seg.endTime),
-                    speaker: label,
-                )
-            }
-        }
 
         // Phase 1 of issue #165: run WeSpeaker post-hoc on Sortformer's
         // overlap-excluded frames so the naming dialog + SpeakerMatcher
@@ -175,8 +202,61 @@ final class FluidDiarizer: DiarizationProvider, @unchecked Sendable {
         // naming flow (issue #109).
         let embeddings = try await extractSortformerEmbeddings(audioPath: audioPath, timeline: timeline)
 
-        return Self.buildResult(segments: segments, speakerDatabase: embeddings)
+        return Self.buildResult(segments: Self.segments(from: timeline), speakerDatabase: embeddings)
     }
+
+    /// One segment per finalized timeline segment, labelled by speaker slot
+    /// (`SPEAKER_<slot>`, the same key the post-hoc embeddings use). Shared by
+    /// the Sortformer and Nemotron 3 modes, which both end in a
+    /// `DiarizerTimeline`. Pure so unit tests can pin it without a model.
+    static func segments(from timeline: DiarizerTimeline) -> [MeetingTranscriber.DiarizationResult.Segment] {
+        timeline.speakers.flatMap { index, speaker in
+            let label = normalizeSpeakerId(speaker.name ?? "Speaker \(index)")
+            return speaker.finalizedSegments.map { seg in
+                MeetingTranscriber.DiarizationResult.Segment(
+                    start: TimeInterval(seg.startTime),
+                    end: TimeInterval(seg.endTime),
+                    speaker: label,
+                )
+            }
+        }
+    }
+
+    // MARK: - Nemotron 3 Mode (Nemotron3Diarizer)
+
+    /// Nemotron 3 preset: `fast128` feeds the model 10.24 s of audio per call.
+    /// FluidAudio's benchmark (AMI test, 16 meetings) has it at the lowest
+    /// error of the published presets, with the speaker count right in all 16
+    /// meetings; the window length is what buys the counting, and counting
+    /// more than four speakers is the reason to pick this mode at all. Its
+    /// 10.56 s latency does not matter after the meeting. `offline` (30 s
+    /// window) is faster but does not compile for the Neural Engine and got
+    /// the count wrong in two meetings; the 95 MB `c128-split-w8a8` build
+    /// would halve the download for a slightly higher error.
+    static let nemotronConfig = Nemotron3Config.fast128
+
+    /// Compute units for the Nemotron 3 model. `Nemotron3Models.loadFromHuggingFace`
+    /// defaults to `.all`, which lets Core ML put parts of the graph on the
+    /// GPU; this keeps it off that path like the other two modes (see
+    /// `FluidOfflineProcessor.makeModelConfiguration` and
+    /// `sortformerComputeUnits`). The `fast128` preset compiles for the
+    /// Neural Engine. Unlike Sortformer's, this choice has not been
+    /// benchmarked against `.all`.
+    static let nemotronComputeUnits: MLComputeUnits = .cpuAndNeuralEngine
+
+    /// Turns Nemotron 3's frame probabilities into segments: its 10 ms frames,
+    /// the 0.5 activity threshold Sortformer mode uses, and speech shorter
+    /// than 0.2 s dropped, the default of FluidAudio's own
+    /// `Nemotron3Diarizer.segments`. Without that floor a 10 ms frame grid
+    /// turns every flicker around the threshold into a segment of its own.
+    static let nemotronTimelineConfig = DiarizerTimelineConfig(
+        numSpeakers: nemotronConfig.numSpeakers,
+        frameDurationSeconds: nemotronConfig.outputFrameSeconds,
+        onsetPadSeconds: 0,
+        offsetPadSeconds: 0,
+        minDurationOn: 0.2,
+        minDurationOff: 0,
+    )
 
     /// L2-normalised running-mean of per-chunk embeddings → one centroid
     /// per speaker. Pure so unit tests can pin behaviour without CoreML.
@@ -197,21 +277,119 @@ final class FluidDiarizer: DiarizationProvider, @unchecked Sendable {
         return result
     }
 
-    /// Nearest-neighbour resample a per-frame activity mask onto a target
-    /// frame grid. Used to bridge Sortformer's 12.5 Hz output (~125 frames/10s)
-    /// to WeSpeaker's expected segmentation-frame count (typically 589/10s).
-    /// Pure so the unit tests can pin it without loading any model.
-    static func resampleMask(_ mask: [Float], to targetCount: Int) -> [Float] {
-        guard !mask.isEmpty, targetCount > 0 else {
-            return Array(repeating: Float(0.0), count: max(0, targetCount))
+    /// WeSpeaker's waveform input: 10 s at 16 kHz, the shape
+    /// `EmbeddingExtractor.getEmbeddings` feeds the model.
+    static let weSpeakerWindowSamples = 160_000
+
+    /// Hop between post-hoc embedding chunks. Non-overlapping windows today,
+    /// so equal to the model window, but a separate choice from it.
+    static let embeddingChunkStrideSamples = weSpeakerWindowSamples
+
+    /// Minimum active WeSpeaker frames (about 0.17 s) for a slot to be
+    /// embedded in a chunk: `EmbeddingExtractor.getEmbeddings`' default
+    /// `minActivityThreshold`, so full chunks are gated exactly as the
+    /// extractor gates them.
+    static let minActiveWeSpeakerFrames: Float = 10
+
+    /// One WeSpeaker call of the post-hoc embedding walk: which audio it
+    /// covers, which global speaker slots it embeds, and their masks on
+    /// WeSpeaker's frame grid over the full 10 s window.
+    struct EmbeddingChunkPlan: Equatable {
+        let sampleRange: Range<Int>
+        let slots: [Int]
+        let masks: [[Float]]
+    }
+
+    /// Plan the post-hoc embedding walk: 10 s chunks, top-3 active speaker
+    /// slots per chunk (WeSpeaker's mask shape only fits 3), each slot's
+    /// mask mapped by `weSpeakerWindowMask`. Pure so the geometry is pinned
+    /// without loading a model.
+    ///
+    /// A slot is embedded only with at least `minActiveWeSpeakerFrames`
+    /// active frames inside the chunk's own audio; counting the loop-padded
+    /// copies would lower the bar for a short tail by the repeat factor. A
+    /// chunk with no such slot is skipped without a model call; that covers
+    /// a tail too short for one frame, which could otherwise run the model
+    /// on an empty mask.
+    static func planEmbeddingChunks(
+        audioSampleCount: Int,
+        masks: [[Float]],
+        samplesPerMaskFrame: Int,
+        weSpeakerFrameCount: Int,
+    ) -> [EmbeddingChunkPlan] {
+        let maskFrameCount = masks.first?.count ?? 0
+        guard samplesPerMaskFrame > 0, maskFrameCount > 0, weSpeakerFrameCount > 0 else { return [] }
+        var plans: [EmbeddingChunkPlan] = []
+        for sampleStart in stride(from: 0, to: audioSampleCount, by: embeddingChunkStrideSamples) {
+            let sampleEnd = min(sampleStart + weSpeakerWindowSamples, audioSampleCount)
+            let chunkSampleCount = sampleEnd - sampleStart
+            let frameStart = sampleStart / samplesPerMaskFrame
+            // Past the mask's end there is nothing to embed (and nothing to slice).
+            guard frameStart < maskFrameCount else { break }
+            let frameEnd = min(
+                frameStart + (chunkSampleCount + samplesPerMaskFrame - 1) / samplesPerMaskFrame,
+                maskFrameCount,
+            )
+            // WeSpeaker frames starting inside the chunk's audio; the rest
+            // of the window is loop padding.
+            let framesInAudio = (chunkSampleCount * weSpeakerFrameCount + weSpeakerWindowSamples - 1)
+                / weSpeakerWindowSamples
+            let chunkMasks: [[Float]] = masks.map { Array($0[frameStart ..< frameEnd]) }
+            let activity: [(slot: Int, sum: Float)] = chunkMasks.indices.map { ($0, chunkMasks[$0].reduce(0, +)) }
+            var slots: [Int] = []
+            var windowMasks: [[Float]] = []
+            for candidate in activity.sorted(by: { $0.sum > $1.sum }).prefix(3) {
+                let windowMask = weSpeakerWindowMask(
+                    chunkMasks[candidate.slot],
+                    samplesPerMaskFrame: samplesPerMaskFrame,
+                    chunkSampleCount: chunkSampleCount,
+                    frameCount: weSpeakerFrameCount,
+                )
+                let activeInAudio: Float = windowMask[0 ..< framesInAudio].reduce(0, +)
+                guard activeInAudio >= minActiveWeSpeakerFrames else { continue }
+                slots.append(candidate.slot)
+                windowMasks.append(windowMask)
+            }
+            guard !slots.isEmpty else { continue }
+            plans.append(EmbeddingChunkPlan(sampleRange: sampleStart ..< sampleEnd, slots: slots, masks: windowMasks))
         }
-        var out = Array(repeating: Float(0.0), count: targetCount)
-        let srcCount = mask.count
-        for i in 0 ..< targetCount {
-            let srcIdx = min(i * srcCount / targetCount, srcCount - 1)
-            out[i] = mask[srcIdx]
+        return plans
+    }
+
+    /// Map one chunk's diarizer-rate mask onto WeSpeaker's `frameCount`
+    /// frames spanning the full 10 s window, in phase with
+    /// `weSpeakerWindow`'s loop-padded audio: each WeSpeaker frame takes the
+    /// diarizer frame under the audio sample it starts on, after the loop.
+    /// Zero where that frame is missing (the diarizer's frame count need not
+    /// match the audio length exactly).
+    ///
+    /// Stretching a short chunk's mask over the whole window instead put the
+    /// activity of the chunk's first fraction under all of its audio, since
+    /// the extractor reads only the frames its unpadded audio fills.
+    static func weSpeakerWindowMask(
+        _ mask: [Float],
+        samplesPerMaskFrame: Int,
+        chunkSampleCount: Int,
+        frameCount: Int,
+    ) -> [Float] {
+        guard samplesPerMaskFrame > 0, chunkSampleCount > 0, frameCount > 0 else { return [] }
+        return (0 ..< frameCount).map { frame in
+            let sample = (frame * weSpeakerWindowSamples / frameCount) % chunkSampleCount
+            let src = sample / samplesPerMaskFrame
+            return src < mask.count ? mask[src] : 0
         }
-        return out
+    }
+
+    /// The chunk's audio, loop-padded to the full WeSpeaker window, as
+    /// `EmbeddingExtractor` itself pads short audio. Padding here instead
+    /// keeps the mask in phase sample by sample (`weSpeakerWindowMask`)
+    /// and lets the extractor read every frame. Zero padding measurably
+    /// degrades short-tail embeddings: a window that is mostly digital
+    /// silence pulled tail embeddings far from the same speaker's full
+    /// chunks on every fixture tried.
+    static func weSpeakerWindow(_ audio: [Float], range: Range<Int>) -> [Float] {
+        guard !range.isEmpty else { return [Float](repeating: 0, count: weSpeakerWindowSamples) }
+        return (0 ..< weSpeakerWindowSamples).map { audio[range.lowerBound + $0 % range.count] }
     }
 
     /// Pure helper exposed for testability — build per-speaker activity
@@ -322,10 +500,31 @@ struct FluidOfflineProcessor: OfflineDiarizationProcessing {
     /// Neural Engine route retains hardware acceleration without invoking the
     /// crash-prone GPU path. FluidAudio 0.15.5+ reads only `computeUnits` from
     /// this configuration; older releases silently use `.all` instead.
-    static func makeModelConfiguration() -> MLModelConfiguration {
+    /// `LiveSpeakerMatcher` and the Sortformer / Nemotron 3 post-hoc
+    /// embeddings load the same embedding model and read `computeUnits` too,
+    /// so the three paths cannot drift apart.
+    static let computeUnits: MLComputeUnits = .cpuAndNeuralEngine
+
+    static func makeModelConfiguration(
+        computeUnits units: MLComputeUnits = Self.computeUnits,
+    ) -> MLModelConfiguration {
         let configuration = MLModelConfiguration()
-        configuration.computeUnits = .cpuAndNeuralEngine
+        configuration.computeUnits = units
         return configuration
+    }
+
+    /// FluidAudio's segmentation + WeSpeaker embedding models, loaded with
+    /// explicit compute units. Without a configuration FluidAudio picks `.all`
+    /// outside CI and `.cpuAndNeuralEngine` inside it; it reads only
+    /// `computeUnits` from the configuration. `load` is the FluidAudio call,
+    /// injectable so a test can see the configuration it receives.
+    static func loadDiarizerModels(
+        computeUnits units: MLComputeUnits,
+        load: (MLModelConfiguration) async throws -> DiarizerModels = { configuration in
+            try await DiarizerModels.load(configuration: configuration)
+        },
+    ) async throws -> DiarizerModels {
+        try await load(makeModelConfiguration(computeUnits: units))
     }
 
     mutating func prepare(numSpeakers: Int?) async throws {

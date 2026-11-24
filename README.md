@@ -1,9 +1,9 @@
 # Meeting Transcriber
 
-> **The local-first meeting transcriber for macOS.** Records Teams, Zoom, and Webex calls, transcribes them on-device with Whisper / Parakeet, separates speakers, and turns the result into a Markdown protocol using your own Claude CLI or any local LLM. **No cloud. No subscription. No audio ever leaves your Mac.**
+> **The local-first meeting transcriber for macOS.** Records Teams, Zoom, and Webex calls, transcribes them on-device with Whisper / Parakeet, separates speakers, and turns the result into Markdown meeting notes using your own Claude CLI or any local LLM. **No cloud. No subscription. No audio ever leaves your Mac.**
 
 <p align="center">
-  <img src="docs/hero.gif" alt="Meeting Transcriber turning a Teams call into a Markdown protocol on-device" width="860">
+  <img src="docs/hero.gif" alt="Meeting Transcriber turning a Teams call into Markdown meeting notes on-device" width="860">
 </p>
 
 <p align="center">
@@ -55,8 +55,8 @@ flowchart TD
     D1["WhisperKit<br/>99 languages"]
     D2["Parakeet TDT v3<br/>25 EU languages"]
     E["Speaker Diarization<br/>FluidAudio · dual-track + recognition"]
-    F["Protocol Generation<br/>Claude CLI · OpenAI-compatible · none"]
-    G["Markdown Protocol<br/>Summary · Decisions · Tasks · Transcript"]
+    F["Meeting Notes Generation<br/>Claude CLI · OpenAI-compatible · none"]
+    G["Markdown Meeting Notes<br/>Summary · Decisions · Tasks · Transcript"]
 
     A --> B
     A2 --> C
@@ -81,27 +81,30 @@ flowchart TD
 
 ## Features
 
-- **Automatic meeting detection** — Recognizes Teams, Zoom, and Webex meetings via window title polling, opt-in browser meeting detection (Google Meet, Whereby, web Zoom/Teams in any Chromium browser) gated behind a recording-consent prompt (a window-title keyword such as "Jitsi Meet" can answer it for calls that never reach the calendar), and opt-in mic-input detection for call apps without a reliable meeting signal (WeChat, Tencent Meeting, FaceTime, WhatsApp) — per app, off by default, and unlike the browser path it starts recording without a prompt
+- **Automatic meeting detection** — Recognizes Teams, Zoom, and Webex meetings via the power assertions they hold during a call (no window titles, so no Screen Recording needed), opt-in browser meeting detection (Google Meet, Whereby, web Zoom/Teams in any Chromium browser, or in Safari with the Homebrew build) gated behind a recording-consent prompt (a window-title keyword such as "Jitsi Meet" can answer it for calls that never reach the calendar), and opt-in mic-input detection for call apps without a reliable meeting signal (WeChat, Tencent Meeting, FaceTime, WhatsApp, Slack Huddles) — per app, off by default, and unlike the browser path it starts recording without a prompt
 - **Dual audio recording** — App audio ([CATapDescription](https://developer.apple.com/documentation/coreaudio/catap)) + microphone simultaneously
 - **On-device transcription** — Two engines, selectable in Settings:
-  - [WhisperKit](https://github.com/argmaxinc/WhisperKit) — 99+ languages, ~1 GB model
+  - [WhisperKit](https://github.com/argmaxinc/WhisperKit) — 99+ languages, ~1 GB model; besides the stock models, a custom WhisperKit model can be loaded from another Hugging Face repository or a local folder (see [Custom WhisperKit models](#custom-whisperkit-models))
   - [Parakeet TDT v3](https://github.com/FluidInference/FluidAudio) (NVIDIA) — 25 EU languages, ~50 MB model, ~10× faster
 - **Calendar titles** — Opt-in (Settings → General): a recording is named after the calendar event running when it starts, and the event's attendees are handed to the protocol. Reads the calendars already on the Mac via EventKit; a recording that starts after an event ended is never filed under it. A second opt-in under it records a browser meeting without the consent prompt when the call falls into an event with other attendees or a conference link — calls outside the calendar and personal blocks still ask, and "Never for this app" wins. Conference domains the app does not know, such as a self-hosted Jitsi, can be added there too, so an event linking to one counts as a call rather than an in-person meeting. A third opt-in offers to record in-person meetings: when an event with other attendees but no call link begins while watching is on and nothing is recording, a notification asks whether to record the microphone; Record starts a microphone recording named after the event. Watching that was on resumes after any manual recording, from the prompt or the menu
 - **Custom vocabulary & terminology** — One shared vocabulary file boosts recognition of names/jargon on Parakeet (CTC boosting) and, optionally, on WhisperKit (experimental decoder-prompt hint); an independent, opt-in terminology-normalization pass rewrites recognized spelling variants to a canonical form after transcription, regardless of engine
-- **On-device speaker diarization** — [FluidAudio](https://github.com/FluidInference/FluidAudio) via CoreML/ANE — no HuggingFace token needed; two modes: standard (`OfflineDiarizer`) and overlap-aware (`Sortformer`)
+- **On-device speaker diarization** — [FluidAudio](https://github.com/FluidInference/FluidAudio) via CoreML/ANE — no HuggingFace token needed; three modes: standard (`OfflineDiarizer`), overlap-aware (`Sortformer`, up to 4 speakers) and NVIDIA's overlap-aware Nemotron 3 (up to 8 speakers)
 - **Dual-track diarization** — App and mic tracks diarized separately for clean speaker separation without echo interference
 - **Echo bleed handling** — On loudspeaker recordings, remote voices picked up by the microphone are detected automatically and reported. Two optional remedies, both off by default: acoustic echo cancellation removes the bleed from the microphone audio itself, and a transcript dedup leaves the duplicated lines out. The dedup is off because it can mistake a quiet remark made over the far end for echo and drop it
 - **Speaker recognition** — Voice embeddings stored across meetings, matched via cosine similarity
 - **VAD preprocessing** — Optional silence trimming via FluidAudio Silero v6 before transcription, with automatic timestamp remapping
-- **AI protocol generation** — Structured Markdown via [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code), OpenAI-compatible APIs (Ollama, LM Studio, etc.), or disabled (save transcript only)
-- **Configurable protocol prompt** — Custom prompt file support (`~/Library/Application Support/MeetingTranscriber/protocol_prompt.md`) with `{LANGUAGE}`, `{MEETING_DATE}` (`YYYY-MM-DD`), and `{MEETING_TIME}` (`HH:mm`) variables; recordings include authoritative metadata, while imports and recovery jobs resolve time placeholders to `Unknown`
+- **AI meeting notes generation** — Structured Markdown via [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code), OpenAI-compatible APIs (Ollama, LM Studio, etc.), or disabled (save transcript only)
+- **Configurable meeting notes prompt** — Custom prompt file support (`~/Library/Application Support/MeetingTranscriber/protocol_prompt.md`) with `{LANGUAGE}`, `{MEETING_DATE}` (`YYYY-MM-DD`), and `{MEETING_TIME}` (`HH:mm`) variables; recordings include authoritative metadata, while imports and recovery jobs resolve time placeholders to `Unknown`
+- **Meeting notes from a transcript** — *Generate Meeting Notes from Transcript…* in the menu makes notes for one or more saved `.txt` transcripts, without transcribing again (not in the App Store build); transcripts that already have notes are skipped
 - **Manual recording** — Record any app via app picker, not just detected meetings
 - **Multi-format input** — Supports WAV, MP3, M4A, MP4, FLAC, plus the phone and messenger voice formats AMR, 3GP/3G2 and OPUS/OGG; MKV and WebM additionally need ffmpeg
 - **Update checker** — Notifies when a new version is available
-- **Background processing** — PipelineQueue runs transcription and protocol generation independently from recording
+- **Background processing** — PipelineQueue runs transcription and meeting notes generation independently from recording
 - **Record-only mode** — Skip the entire post-recording pipeline and drop dual-source recordings + a metadata sidecar into the output folder, for external/fleet processing (e.g. a separate GPU host)
 - **Local automation API** (Homebrew build): drive the pipeline headlessly over localhost HTTP. POST an audio file, get a diarized transcript back. See [`docs/automation-api.md`](docs/automation-api.md)
 - **Stream Deck and hotkey control** (Homebrew build): start/stop watching from a Stream Deck key, Shortcut, Raycast or any launcher. See [`docs/stream-deck.md`](docs/stream-deck.md)
+- **Mic mute in the recording**: mute and unmute your microphone track from the menu bar or an optional global shortcut, or have recordings start muted. Only the recording is silenced; people on the call still hear you
+- **Notion export**: optionally exports generated meeting notes to a Notion database in the background; re-export after speaker renaming replaces the page's content in place, and a failed export can be retried without re-running transcription or meeting notes generation
 - **Distribution** — Install via Homebrew Cask or build from source
 
 ---
@@ -172,9 +175,9 @@ cd meeting-transcriber
 |------------|-------------|-------|
 | Screen Recording | Optional — sharpens the meeting *title* and acts as a fallback for the audio tap. Detection itself works without it | System Settings → Privacy & Security |
 | Microphone | Mic recording | Prompted on first use |
-| Accessibility | Mute detection, participant reading (Teams) | System Settings → Privacy & Security |
+| Accessibility | Optional — reads Teams participant names. Not used by the App Store build | System Settings → Privacy & Security |
 | Calendars | Optional — calendar titles (Settings → General) | Requested when the setting is switched on |
-| App audio capture | — | No permission needed (purple dot indicator only) |
+| Audio Recording | App audio capture (the meeting app's own audio). Screen Recording is accepted as a fallback; with neither, the app track is silent | System Settings → Privacy & Security |
 
 ---
 
@@ -187,10 +190,10 @@ The app uses an animated waveform icon in the menu bar that reflects the current
 <img src="docs/menu-bar-recording.gif" width="80" alt="Recording">&nbsp;&nbsp;
 <img src="docs/menu-bar-transcribing.gif" width="80" alt="Transcribing">&nbsp;&nbsp;
 <img src="docs/menu-bar-diarizing.gif" width="80" alt="Diarizing">&nbsp;&nbsp;
-<img src="docs/menu-bar-protocol.gif" width="80" alt="Protocol">
+<img src="docs/menu-bar-protocol.gif" width="80" alt="Meeting Notes">
 </p>
 
-**Idle** → **Recording** (bars bounce) → **Transcribing** (bars morph to text) → **Diarizing** (bars split into groups) → **Protocol** (lines appear sequentially)
+**Idle** → **Recording** (bars bounce) → **Transcribing** (bars morph to text) → **Diarizing** (bars split into groups) → **Meeting Notes** (lines appear sequentially)
 
 ### Permission problem badge
 
@@ -202,7 +205,7 @@ A red exclamation mark in the bottom-right corner is overlaid on top of the curr
 
 - **Microphone** — denied, or granted but the capture engine can't open the device
 - **Screen Recording** — denied, or granted but `CGWindowListCopyWindowInfo` returns no window titles (TCC state out of sync)
-- **Accessibility** — denied, or granted but the AX API refuses to read Teams participant/mute info
+- **Accessibility** — denied, or granted but the AX API refuses to read Teams participant info (not checked in the App Store build, which does not use it)
 
 The health check distinguishes *denied* from *broken*. "Broken" usually means the permission is toggled on in System Settings but macOS hasn't actually wired it through — the fix is to toggle the permission off and on again for Meeting Transcriber under **System Settings → Privacy & Security**. Open the menu bar dropdown to see which specific permission is affected; a notification is also posted when the state changes.
 
@@ -212,7 +215,7 @@ The health check distinguishes *denied* from *broken*. "Broken" usually means th
 <img src="docs/menu-bar-record-only.gif" width="80" alt="Record-only mode">
 </p>
 
-A small red dot in the bottom-right corner is overlaid on top of the current icon (idle, recording, transcribing, …) whenever **Record-only mode** is enabled (Settings → General → "Record-only mode"). In this mode the app keeps detecting meetings and producing dual-source recordings, but skips the entire post-recording pipeline (VAD, transcription, diarization, protocol generation). Recordings + a per-meeting `<timestamp>_meta.json` sidecar are dropped into your configured Output Folder for an external pipeline (e.g. a Linux GPU host via Syncthing) to pick up. The dot stays visible across all states so the mode is always clearly indicated; if a permission problem coexists, the red exclamation badge takes precedence.
+A small red dot in the bottom-right corner is overlaid on top of the current icon (idle, recording, transcribing, …) whenever **Record-only mode** is enabled (Settings → General → "Record-only mode"). In this mode the app keeps detecting meetings and producing dual-source recordings, but skips the entire post-recording pipeline (VAD, transcription, diarization, meeting notes generation). Recordings + a per-meeting `<timestamp>_meta.json` sidecar are dropped into your configured Output Folder for an external pipeline (e.g. a Linux GPU host via Syncthing) to pick up. The dot stays visible across all states so the mode is always clearly indicated; if a permission problem coexists, the red exclamation badge takes precedence.
 
 ### Per-channel asymmetric-silence indicator
 
@@ -237,7 +240,7 @@ If a permission problem coexists, the red exclamation badge takes precedence ove
 
 ## Usage
 
-Launch the app — it sits in your menu bar. When a supported meeting is detected, recording starts automatically. When the meeting ends, the pipeline runs in the background: transcription → diarization → protocol generation.
+Launch the app — it sits in your menu bar. When a supported meeting is detected, recording starts automatically. When the meeting ends, the pipeline runs in the background: transcription → diarization → meeting notes generation.
 
 You can also batch-process existing audio and video files via the menu (⌘P) — supported formats: WAV, MP3, M4A, MP4, FLAC, AMR, 3GP/3G2 and OPUS/OGG (and MKV, WebM when ffmpeg is installed). Smartphone call recordings (AMR, 3GP) and voice messages (OPUS) need no extra tools.
 
@@ -251,32 +254,46 @@ Open Settings via the menu bar item or ⌘,.
 
 | Tab | What's in it |
 |---|---|
-| **General** | Record-only mode, apps to watch (Teams/Zoom/Webex/Browser/WeChat/Tencent Meeting/FaceTime/WhatsApp), detection timing, update checks |
-| **Audio** | Microphone device, voice activity detection (VAD), per-channel silence indicator, echo cancellation (off by default) |
-| **Transcribe** | ASR engine (WhisperKit / Parakeet) and per-engine options (model, language, custom vocabulary), terminology normalization rules, live caption overlay (PoC; the menu bar's **Show Captions** item flips the same switch mid-call) |
-| **Speakers** | Diarization, mic speaker name, known voices, recognition stats |
-| **Output** | LLM provider (Claude CLI / OpenAI-compatible / none), transcript-retention options, protocol language, output folder, custom prompt |
-| **Advanced** | Permissions status, diagnostics, version info |
+| **General** | Startup (launch at login, start watching on open), record-only mode, apps to watch (Teams/Zoom/Webex/Browser/WeChat/Tencent Meeting/FaceTime/WhatsApp/Slack), detection timing |
+| **Audio** | Microphone device, voice activity detection (VAD), per-channel silence indicator, echo cancellation (off by default), start recordings muted, mute mic shortcut |
+| **Transcription** | ASR engine (WhisperKit / Parakeet) and per-engine options (model incl. a custom WhisperKit model, language, custom vocabulary), terminology normalization rules, live caption overlay (PoC; the menu bar's **Show Captions** item flips the same switch mid-call) |
+| **Speakers** | Diarization, whether the naming window opens by itself, how long unnamed meetings wait before they get the automatic names, mic speaker name, known voices, recognition stats |
+| **Output** | LLM provider (Claude CLI / OpenAI-compatible / none), saved OpenAI-compatible connections (each with its own endpoint, model and API key), transcript-retention options, notes language, a notification when meeting notes fail (on by default; the menu then offers Retry Meeting Notes), output folder, custom prompt, Notion export |
+| **Advanced** | Permissions status, diagnostics, Local Automation API |
+| **About** | Version and build info, ffmpeg status, update checks |
+
+### Start at login
+
+Settings → General → Startup has two independent switches:
+
+- **Launch at login** registers the app as a macOS login item. The switch shows what macOS reports, read again whenever the app comes to the front. While macOS reports the item as waiting for your approval, which can also be what it reports after you switch the app off under System Settings → General → Login Items, the switch stays on and points you to Login Items. Turning it off here removes the item.
+- **Start watching when the app opens** begins meeting detection a few seconds after launch, the same as pressing Start in the menu. It is only read when the app launches, so switching it in a running app changes nothing until the next launch.
+
+With both on, the app starts when you log in and watches for meetings without a click. It only starts silently once its permissions are granted: on a fresh install, macOS asks for microphone and Screen Recording access when watching starts, a few seconds after that first launch.
+
+### Custom WhisperKit models
+
+Settings → Transcription → Model → **Custom model…** loads a fine-tuned WhisperKit model instead of a stock one, for example a Swiss German fine-tune. Enter a Hugging Face repository laid out like [`argmaxinc/whisperkit-coreml`](https://huggingface.co/argmaxinc/whisperkit-coreml) (one folder per variant) plus the exact variant folder name, e.g. `spert/flix-swissgerman-whisperkit` and `flix-swissgerman-large-v3_8bit`; it downloads on first use and loads offline afterwards. A variant that is only the tail of the real folder name is refused with the real name, because it would load once and then never offline. Alternatively choose a model folder on disk with **Choose…** (in the App Store build only a chosen folder is accessible; a typed path works outside the sandbox). It must contain `AudioEncoder.mlmodelc`, `TextDecoder.mlmodelc`, `MelSpectrogram.mlmodelc`, `tokenizer.json` and `tokenizer_config.json`. The folder itself is never downloaded; for the tokenizer, WhisperKit prefers a stock tokenizer it has already cached and reads the folder's own tokenizer otherwise, so a folder that carries one loads without a network. Each field takes effect on Return, when you leave it or when you close the Settings window, so while you change the repository and then the variant, the new repository is briefly paired with the old variant; until a custom model is filled in, the previously selected stock model is used, and a load that fails says why under the model status.
 
 ---
 
 ## Output
 
-Files are saved to `~/Library/Application Support/MeetingTranscriber/protocols/`:
+Files are saved to `~/Downloads/MeetingTranscriber/`, or to the folder chosen under Settings → Output → Output Folder:
 
 | File | Content |
 |------|---------|
 | `20260225_1400_meeting.txt` | Raw transcript (when enabled) |
-| `20260225_1400_meeting.md` | Structured protocol (when an LLM provider is configured) |
+| `20260225_1400_meeting.md` | Structured meeting notes (when an LLM provider is configured) |
 
 In **Settings → Output**, both transcript options default to enabled for backward compatibility:
 
-- **Include full transcript in protocol** appends the verbatim transcript to generated Markdown.
+- **Include full transcript** appends the verbatim transcript to generated Markdown.
 - **Save raw transcript separately** retains the standalone `.txt` file.
 
-Disable both to retain only the generated meeting minutes. The recording follows its own retention policy and is not deleted by either setting. To avoid data loss, a raw transcript is retained if protocol generation is disabled, fails, or the job ends with an error.
+Disable both to retain only the generated meeting notes. The recording follows its own retention policy and is not deleted by either setting. To avoid data loss, a raw transcript is retained if meeting notes generation is disabled, fails, or the job ends with an error.
 
-**Protocol structure:** Summary, Participants, Topics Discussed, Decisions, Tasks (with responsible person, deadline, priority), Open Questions, and optionally the Full Transcript.
+**Meeting notes structure:** Summary, Participants, Topics Discussed, Decisions, Tasks (with responsible person, deadline, priority), Open Questions, and optionally the Full Transcript.
 
 ---
 
@@ -295,7 +312,7 @@ Disable both to retain only the generated meeting minutes. The recording follows
 
 If a recording's `_app.wav` is silent or unexpectedly quiet, enable verbose audio logging to capture forensic detail during the next attempt:
 
-1. Open **Settings → Diagnostics** and turn on **Verbose Audio Logging**.
+1. Open **Settings → Advanced → Diagnostics** and turn on **Verbose Diagnostic Logging**.
 2. Reproduce the failing recording.
 3. Open **Console.app**, filter by subsystem `com.meetingtranscriber.audiotap`, and look for `[debug]` lines:
    - `[debug] Tap target: pid=… exe=… bundle=… audioObjectID=…` — which process the tap targeted
@@ -319,7 +336,34 @@ The toggle persists in `UserDefaults` and takes effect on the next recording wit
 [![App Store Smoke](https://github.com/pasrom/meeting-transcriber/actions/workflows/appstore.yml/badge.svg)](https://github.com/pasrom/meeting-transcriber/actions/workflows/appstore.yml)
 [![codecov](https://codecov.io/gh/pasrom/meeting-transcriber/branch/main/graph/badge.svg)](https://codecov.io/gh/pasrom/meeting-transcriber)
 
-Pull requests run unit tests, lint, and analyzer in [`ci.yml`](.github/workflows/ci.yml). Two complementary E2E layers run on a self-hosted Apple Silicon Mac mini against the real production models (no mocks): [`e2e.yml`](.github/workflows/e2e.yml) feeds fixture audio through each ASR engine + the WatchLoop pipeline, and [`e2e-app.yml`](.github/workflows/e2e-app.yml) builds and signs the actual `.app`, drives a simulated meeting via [`tools/meeting-simulator`](tools/meeting-simulator), and asserts on the resulting transcript over the embedded debug RPC server.
+Pull requests run unit tests, lint, and analyzer in [`ci.yml`](.github/workflows/ci.yml). E2E lanes run on a self-hosted Apple Silicon Mac mini, apart from a UI-harness smoke test on a GitHub-hosted runner. [`e2e.yml`](.github/workflows/e2e.yml) and [`e2e-app.yml`](.github/workflows/e2e-app.yml) run the real production models (no mocks): the first feeds fixture audio through each ASR engine + the WatchLoop pipeline, the second builds and signs the actual `.app`, drives a simulated meeting via [`tools/meeting-simulator`](tools/meeting-simulator), and asserts on the resulting transcript over the embedded debug RPC server. [`e2e-browser.yml`](.github/workflows/e2e-browser.yml) loads no model: it drives a Chromium browser with a local WebRTC tone page through meeting detection and the consent prompt (answered over the debug RPC) in record-only mode and asserts that the recorded app track is not silent; a best-effort nightly step repeats this in a real public Jitsi room. Further `e2e-*.yml` workflows cover narrower cases such as crash recovery, capture faults and a long-session soak.
+
+---
+
+## Contributors
+
+Meeting Transcriber is built with help from many people: code, bug reports, testing, ideas and documentation. Some of the most active so far:
+
+<!-- CONTRIBUTORS-PREVIEW:START count=14 - generated from .all-contributorsrc by scripts/update-contributors.sh --render -->
+<a href="https://github.com/pasrom"><img src="https://avatars.githubusercontent.com/u/32713472?v=4&amp;s=80" width="40" height="40" alt="pasrom" title="pasrom"/></a>
+<a href="https://github.com/TrigrD3"><img src="https://avatars.githubusercontent.com/u/55515446?v=4&amp;s=80" width="40" height="40" alt="Muhammad Jatmika Aryaputra" title="Muhammad Jatmika Aryaputra"/></a>
+<a href="https://github.com/alexpfau"><img src="https://avatars.githubusercontent.com/u/77438832?v=4&amp;s=80" width="40" height="40" alt="Alex Pfau" title="Alex Pfau"/></a>
+<a href="https://github.com/execsumo"><img src="https://avatars.githubusercontent.com/u/168054536?v=4&amp;s=80" width="40" height="40" alt="Herwin" title="Herwin"/></a>
+<a href="https://github.com/iHateCode"><img src="https://avatars.githubusercontent.com/u/6393143?v=4&amp;s=80" width="40" height="40" alt="iHateCode" title="iHateCode"/></a>
+<a href="https://github.com/GB-D"><img src="https://avatars.githubusercontent.com/u/277263165?v=4&amp;s=80" width="40" height="40" alt="GB-D" title="GB-D"/></a>
+<a href="https://github.com/jhavez"><img src="https://avatars.githubusercontent.com/u/213444590?v=4&amp;s=80" width="40" height="40" alt="Julien" title="Julien"/></a>
+<a href="https://github.com/jianjettfu-oss"><img src="https://avatars.githubusercontent.com/u/229418358?v=4&amp;s=80" width="40" height="40" alt="jianjettfu-oss" title="jianjettfu-oss"/></a>
+<a href="https://danielsogl.de/"><img src="https://avatars.githubusercontent.com/u/15234844?v=4&amp;s=80" width="40" height="40" alt="Daniel Sogl" title="Daniel Sogl"/></a>
+<a href="https://github.com/duncanwood"><img src="https://avatars.githubusercontent.com/u/7288228?v=4&amp;s=80" width="40" height="40" alt="Duncan Wood" title="Duncan Wood"/></a>
+<a href="https://github.com/niftan5"><img src="https://avatars.githubusercontent.com/u/57637411?v=4&amp;s=80" width="40" height="40" alt="Steffen" title="Steffen"/></a>
+<a href="https://github.com/zunami"><img src="https://avatars.githubusercontent.com/u/4697822?v=4&amp;s=80" width="40" height="40" alt="zunami" title="zunami"/></a>
+<a href="https://github.com/DevUrandomFoo"><img src="https://avatars.githubusercontent.com/u/15967780?v=4&amp;s=80" width="40" height="40" alt="Manuel J." title="Manuel J."/></a>
+<a href="https://github.com/nsanitas"><img src="https://avatars.githubusercontent.com/u/909637?v=4&amp;s=80" width="40" height="40" alt="Nicolas Sanitas" title="Nicolas Sanitas"/></a>
+
+And [38 more](<CONTRIBUTORS.md>), credited in full there.
+<!-- CONTRIBUTORS-PREVIEW:END -->
+
+[CONTRIBUTING.md](CONTRIBUTING.md) explains how to join them.
 
 ---
 

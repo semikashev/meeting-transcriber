@@ -8,9 +8,13 @@ import Foundation
 extension PipelineController.QueueEnvironment {
     static var production: Self {
         Self(
-            logDir: nil,
+            logDir: AppPaths.ipcDir,
             stagingDir: AppPaths.recordingsDir,
+            speakersDB: AppPaths.speakersDB,
+            recognitionStatsLog: RecognitionStatsLog.defaultPath,
+            stageTimingLog: StageTimingLog.defaultPath,
             recoverStagedRecordings: PipelineController.recoverStagedRecordings(into:),
+            deliverProtocol: ProtocolWebhook.deliverIfConfigured(job:protocolPath:warn:),
         )
     }
 }
@@ -38,7 +42,7 @@ extension PipelineController {
             // real one, which is exactly what injecting the folder was meant to
             // prevent.
             await StagingRecoveryGate.recover(in: q.stagingDir, requestedAt: requestedAt)
-            await q.recoverOrphanedRecordings()
+            await q.recoverOrphanedRecordings(recordingsDir: q.stagingDir)
         }
     }
 }

@@ -100,10 +100,10 @@ final class LegacyDefaultsMigrationTests: XCTestCase {
     // MARK: - end to end against real defaults domains
 
     func testRunCopiesAcrossDomainsAndIsIdempotent() throws {
-        let legacyName = "app.meetingtranscriber.test.legacy.\(UUID().uuidString)"
-        let currentName = "app.meetingtranscriber.test.current.\(UUID().uuidString)"
-        let legacy = try XCTUnwrap(UserDefaults(suiteName: legacyName))
-        let current = try XCTUnwrap(UserDefaults(suiteName: currentName))
+        let legacyName = "LegacyDefaultsMigrationTests-legacy-\(UUID().uuidString)"
+        let currentName = "LegacyDefaultsMigrationTests-current-\(UUID().uuidString)"
+        let legacy = try XCTUnwrap(DefaultsSuite.open(legacyName))
+        let current = try XCTUnwrap(DefaultsSuite.open(currentName))
         defer {
             DefaultsSuite.remove(legacyName)
             DefaultsSuite.remove(currentName)
@@ -111,7 +111,7 @@ final class LegacyDefaultsMigrationTests: XCTestCase {
         legacy.set("de", forKey: "whisperLanguage")
         legacy.set(true, forKey: "autoWatch")
 
-        LegacyDefaultsMigration.run(into: current, legacyDomain: legacyName)
+        LegacyDefaultsMigration.run(into: current, legacyDomain: DefaultsSuite.domain(legacyName))
         XCTAssertEqual(current.string(forKey: "whisperLanguage"), "de")
         XCTAssertTrue(current.bool(forKey: "autoWatch"))
         XCTAssertTrue(current.bool(forKey: LegacyDefaultsMigration.markerKey))
@@ -119,7 +119,7 @@ final class LegacyDefaultsMigrationTests: XCTestCase {
         // Second run must be inert even though the legacy domain still exists:
         // the user's later choice under the new identifier has to survive.
         current.set("en", forKey: "whisperLanguage")
-        LegacyDefaultsMigration.run(into: current, legacyDomain: legacyName)
+        LegacyDefaultsMigration.run(into: current, legacyDomain: DefaultsSuite.domain(legacyName))
         XCTAssertEqual(current.string(forKey: "whisperLanguage"), "en")
     }
 }

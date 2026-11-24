@@ -28,6 +28,11 @@ class PowerAssertionDetector: MeetingDetecting {
         /// `processNames`: a pattern can accept a fixed list of processes and
         /// still identify each of them separately.
         let identity: Identity
+        /// Whether each call gets assertions with fresh IDs, so an unseen ID
+        /// means a new call (issue #765). On only where measured (Teams):
+        /// Zoom also matches by type, and an unrelated assertion recreated
+        /// mid-call would split one call in two.
+        let assertionIdentifiesCall: Bool
 
         /// `.shared`: every process in `processNames` is the same app, so the
         /// pattern's own `appName` is the identity (Teams is one app whether it
@@ -52,6 +57,7 @@ class PowerAssertionDetector: MeetingDetecting {
             keywords: [String],
             assertionTypes: [String] = [],
             identity: Identity = .shared,
+            assertionIdentifiesCall: Bool = false,
         ) {
             // A process-open pattern MUST identify per process. Shared identity
             // would file every unclaimed process on the machine into one
@@ -70,6 +76,7 @@ class PowerAssertionDetector: MeetingDetecting {
             self.keywords = keywords
             self.assertionTypes = assertionTypes
             self.identity = processNames.isEmpty ? .perProcess : identity
+            self.assertionIdentifiesCall = assertionIdentifiesCall
             loweredKeywords = keywords.map { $0.lowercased() }
         }
 
@@ -121,6 +128,7 @@ class PowerAssertionDetector: MeetingDetecting {
             appName: "Microsoft Teams",
             processNames: ["MSTeams", "Microsoft Teams", "Microsoft Teams WebView", "Microsoft Teams (work or school)"],
             keywords: ["call in progress"],
+            assertionIdentifiesCall: true,
         ),
         AssertionPattern(
             appName: "Zoom",
@@ -188,6 +196,9 @@ class PowerAssertionDetector: MeetingDetecting {
     /// Diagnostic dedup: (process|name|type) keys already logged as unmatched,
     /// so a persistently-running unmatched meeting app logs once per session.
     private var loggedMissKeys: Set<String> = []
+    /// The keys the last poll reported as "did not match". Read by tests; the
+    /// log line is emitted from the same list.
+    private(set) var lastUnmatchedKeys: [String] = []
 
     /// Closure that provides assertion data. Defaults to IOPMCopyAssertionsByProcess.
     /// Override in tests to inject mock data.
@@ -242,7 +253,12 @@ class PowerAssertionDetector: MeetingDetecting {
     func checkOnce() -> DetectedMeeting? {
         let assertions = assertionProvider()
         var hitsThisRound: Set<String> = []
-        var firstMatch: [String: (pid: Int32, processName: String, pattern: AssertionPattern)] = [:]
+        // Every identity whose assertion matched, including the ones skipped
+        // on purpose below (denied, or cooling down after a reset). Those are
+        // not misses, and the diagnostic must not call them "did not match"
+        // (issue #814); it reads this set, not `hitsThisRound`.
+        var matchedThisRound: Set<String> = []
+        var firstMatch: [String: Hit] = [:]
 
         for (pid, pidAssertions) in assertions {
             for assertion in pidAssertions {
@@ -258,51 +274,64 @@ class PowerAssertionDetector: MeetingDetecting {
                     // sharing the browser pattern never share a slot.
                     let key = pattern.identityKey(processName: processName)
 
+                    // Only count each identity once per poll
+                    guard !matchedThisRound.contains(key),
+                          matchAssertion(
+                              processName: processName, assertName: assertName, assertType: assertType, pattern: pattern,
+                          ) else { continue }
+                    matchedThisRound.insert(key)
+
                     // Permanently refused: never confirm, so it cannot shadow
                     // another meeting or force a counter-wiping reset.
-                    if isIdentityDenied(key) { continue }
+                    if isIdentityDenied(key) {
+                        logDeniedOnce(key)
+                        continue
+                    }
 
                     // Skip apps in cooldown
                     if let until = cooldownUntil[key], Date() < until {
                         continue
                     }
 
-                    // Only count each identity once per poll
-                    guard !hitsThisRound.contains(key) else { continue }
-
-                    if matchAssertion(processName: processName, assertName: assertName, assertType: assertType, pattern: pattern) {
-                        hitsThisRound.insert(key)
-                        firstMatch[key] = (pid, processName, pattern)
-                        consecutiveHits[key, default: 0] += 1
-                    }
+                    hitsThisRound.insert(key)
+                    firstMatch[key] = (pid, processName, pattern)
+                    consecutiveHits[key, default: 0] += 1
                 }
             }
         }
 
-        logUnmatchedWatchedAssertions(assertions, hits: hitsThisRound)
+        logUnmatchedWatchedAssertions(assertions, matched: matchedThisRound)
 
-        // Check confirmation threshold
-        for (key, hits) in consecutiveHits {
-            if hits >= confirmationCount, let match = firstMatch[key] {
-                let meetingPattern = Self.meetingIdentity(
-                    pattern: match.pattern, processName: match.processName,
-                )
-                let title = lookupWindowTitle(for: meetingPattern, pattern: match.pattern)
-                    ?? Self.placeholderTitle(appName: meetingPattern.appName)
-                return DetectedMeeting(
-                    pattern: meetingPattern,
-                    windowTitle: title,
-                    ownerName: match.processName,
-                    windowPID: match.pid,
-                )
-            }
-        }
-
-        // Reset counters for identities with no hit this round
+        // Reset counters for identities with no hit this round. Before the
+        // pick, not after: returning a meeting used to skip this, and the
+        // parked browser call is returned on every poll, so a stale single
+        // hit survived for minutes and the next hit confirmed in one poll
+        // instead of `confirmationCount` consecutive ones.
         for key in consecutiveHits.keys where !hitsThisRound.contains(key) {
             consecutiveHits[key] = 0
         }
 
+        // Check confirmation threshold. One meeting per poll, and not in
+        // dictionary order: a browser call whose consent prompt is parked
+        // re-confirms on every poll and is skipped by the loop each time, so
+        // the slot must go to a meeting that can start now (issue #814). The
+        // `firstMatch` entries are this round's hits, so they are the
+        // candidates.
+        let confirmed = firstMatch.compactMap { key, match -> Candidate? in
+            guard consecutiveHits[key, default: 0] >= confirmationCount else { return nil }
+            let identity = Self.meetingIdentity(pattern: match.pattern, processName: match.processName)
+            return Candidate(key: key, match: match, identity: identity)
+        }
+        if let pick = confirmed.min(by: { Self.startRank($0) < Self.startRank($1) }) {
+            let title = lookupWindowTitle(for: pick.identity, pattern: pick.match.pattern)
+                ?? Self.placeholderTitle(appName: pick.identity.appName)
+            return DetectedMeeting(
+                pattern: pick.identity,
+                windowTitle: title,
+                ownerName: pick.match.processName,
+                windowPID: pick.match.pid,
+            )
+        }
         return nil
     }
 
@@ -346,29 +375,62 @@ class PowerAssertionDetector: MeetingDetecting {
         }
     }
 
+    /// What one poll recorded for an identity's first matching assertion.
+    private typealias Hit = (pid: Int32, processName: String, pattern: AssertionPattern)
+
+    /// An identity over the confirmation threshold in one poll.
+    private struct Candidate {
+        let key: String
+        let match: Hit
+        let identity: AppMeetingPattern
+    }
+
+    /// Order among the candidates of one poll: a meeting that records without
+    /// asking before one that waits for consent, then by identity key, so the
+    /// pick is the same from one poll to the next.
+    private static func startRank(_ candidate: Candidate) -> (Int, String) {
+        (candidate.identity.requiresRecordingConsent ? 1 : 0, candidate.key)
+    }
+
     func isMeetingActive(_ meeting: DetectedMeeting) -> Bool {
-        let assertions = assertionProvider()
-        for (_, pidAssertions) in assertions {
-            for assertion in pidAssertions {
-                guard let processName = assertion["Process Name"] as? String,
-                      let assertName = assertion["AssertName"] as? String else {
-                    continue
-                }
-                let assertType = assertion["AssertType"] as? String ?? ""
-                // Same rule as `checkOnce`: an assertion keeps this meeting
-                // alive only when it resolves to the SAME identity. Comparing
-                // `pattern.appName` would compare a category token against a
-                // process name for `.perProcess` patterns, so nothing would ever
-                // match and every browser recording would stop at the end grace.
-                for pattern in patterns
-                    where pattern.identifies(meetingAppName: meeting.pattern.appName, processName: processName) {
-                    if matchAssertion(processName: processName, assertName: assertName, assertType: assertType, pattern: pattern) {
-                        return true
-                    }
-                }
-            }
+        assertionProvider().values.joined().contains { matchingPattern(of: $0, for: meeting) != nil }
+    }
+
+    func activeCalls(_ meeting: DetectedMeeting) -> ActiveCalls {
+        let identifiesCall = patterns.contains { pattern in
+            pattern.assertionIdentifiesCall
+                && pattern.identifies(meetingAppName: meeting.pattern.appName, processName: meeting.ownerName)
         }
-        return false
+        guard identifiesCall else { return .unidentified }
+        var ids: Set<String> = []
+        for assertion in assertionProvider().values.joined() {
+            guard let pattern = matchingPattern(of: assertion, for: meeting) else { continue }
+            // An assertion without an ID, or from a pattern whose IDs do not
+            // track calls, cannot be told apart from the next call's.
+            guard pattern.assertionIdentifiesCall, let id = assertion["AssertionId"] as? Int else {
+                return .unidentified
+            }
+            ids.insert(String(id))
+        }
+        return .ids(ids)
+    }
+
+    /// The pattern through which `assertion` keeps `meeting` alive, if any.
+    private func matchingPattern(of assertion: [String: Any], for meeting: DetectedMeeting) -> AssertionPattern? {
+        guard let processName = assertion["Process Name"] as? String,
+              let assertName = assertion["AssertName"] as? String else {
+            return nil
+        }
+        let assertType = assertion["AssertType"] as? String ?? ""
+        // Same rule as `checkOnce`: an assertion keeps this meeting
+        // alive only when it resolves to the SAME identity. Comparing
+        // `pattern.appName` would compare a category token against a
+        // process name for `.perProcess` patterns, so nothing would ever
+        // match and every browser recording would stop at the end grace.
+        return patterns.first { pattern in
+            pattern.identifies(meetingAppName: meeting.pattern.appName, processName: processName)
+                && matchAssertion(processName: processName, assertName: assertName, assertType: assertType, pattern: pattern)
+        }
     }
 
     func reset(appName: String? = nil) {
@@ -420,7 +482,7 @@ class PowerAssertionDetector: MeetingDetecting {
     /// Two sources, because an app can be known to this detector, to
     /// `MicInputDetector`, or to both: the bound assertion patterns here, plus
     /// every `AppMeetingPattern.ownerNames`, which is where the mic-detected
-    /// call apps (WeChat, WhatsApp, FaceTime, Tencent Meeting) are declared.
+    /// call apps (WeChat, WhatsApp, FaceTime, Tencent Meeting, Slack) are declared.
     /// WhatsApp in particular is Electron and so a plausible holder of the very
     /// assertion the open pattern keys on.
     ///
@@ -470,10 +532,21 @@ class PowerAssertionDetector: MeetingDetecting {
         Self.matches(pattern: pattern, processName: processName, assertName: assertName, assertType: assertType)
     }
 
-    private func logUnmatchedWatchedAssertions(_ assertions: [Int32: [[String: Any]]], hits: Set<String>) {
-        for key in Self.unmatchedWatchedAssertionKeys(
-            assertions: assertions, patterns: patterns, hits: hits,
-        ) {
+    /// One line per denied identity per session, naming the list that holds
+    /// it, so a refused app is not mistaken for one the detector cannot see.
+    private func logDeniedOnce(_ identity: String) {
+        guard loggedMissKeys.insert("denied|\(identity)").inserted else { return }
+        logger.info("""
+        Meeting assertion from \(identity, privacy: .public) matched but is ignored: \
+        the app is on the "Never for this app" list (Settings → General).
+        """)
+    }
+
+    private func logUnmatchedWatchedAssertions(_ assertions: [Int32: [[String: Any]]], matched: Set<String>) {
+        lastUnmatchedKeys = Self.unmatchedWatchedAssertionKeys(
+            assertions: assertions, patterns: patterns, hits: matched,
+        )
+        for key in lastUnmatchedKeys {
             guard loggedMissKeys.insert(key).inserted else { continue }
             logger.info("""
             Watched meeting app is running but its power assertion did not match \

@@ -78,6 +78,13 @@ public class AppAudioCapture: @unchecked Sendable {
     var debugRMS = DebugRMSReporter()
     var debugTotalBytes: UInt64 = 0
     let levelPublisher = LevelPublisher()
+    /// Fed from the IOProc path (`writeQueue`), read from the main thread's
+    /// poll, hence lock-backed. See `AppNoiseFloorSensor`.
+    let noiseFloorSensor = OSAllocatedUnfairLock(initialState: AppNoiseFloorSensor())
+
+    var carriesOnlyNoiseFloor: Bool {
+        noiseFloorSensor.withLock { $0.isFloorOnly }
+    }
 
     /// Returns the instantaneous app-audio level in dBFS, decayed to -120 if
     /// no buffer arrived in the last 0.5 seconds (e.g. tap died, device
@@ -153,9 +160,17 @@ public class AppAudioCapture: @unchecked Sendable {
     /// nil for the level publisher. Test seam beside `attemptBody`: a minute
     /// of zeros cannot be produced through the real publisher in a unit test.
     let signalAgesOverride: (@Sendable () -> ChannelSignalAges)?
-    /// The watchdog's clock in monotonic seconds, nil for the mach clock. Same
-    /// seam, so a test drives the tick and the rebuild start on one clock.
+    /// The watchdog's and the noise-floor sensor's clock in monotonic seconds,
+    /// nil for the mach clock. Same seam, so a test drives the tick, the
+    /// rebuild start and the sensor's window on one clock.
     let clockOverride: (@Sendable () -> TimeInterval)?
+    /// Whether `start()` subscribes to the system's default-output-device
+    /// changes: only when the attempt is the real one. A capture whose
+    /// hardware a test stands in for must not hear the host's real device
+    /// changes either, or one would restart it under the test's feet.
+    var listensForOutputDeviceChanges: Bool {
+        attemptBody == nil
+    }
 
     /// - Parameters:
     ///   - pids: Process IDs to capture audio from. Pass the meeting app's
@@ -245,7 +260,7 @@ public class AppAudioCapture: @unchecked Sendable {
         tapSession = session
         silentTrackDiagnostics.remember(session.tappedProcesses, aggregateID: session.aggregateID)
         actualSampleRate = session.resolvedSampleRate
-        armRebuiltTapDeadline()
+        noteTapInstalledForWatchdog()
     }
 
     /// Follow a device that renegotiated its sample rate without the default
@@ -299,9 +314,8 @@ public class AppAudioCapture: @unchecked Sendable {
         // report can be triaged without the user toggling Verbose Audio
         // Logging first — process names like "MSTeams Helper (Renderer)"
         // make issue-#84-style failures actionable.
-        let tapSummary = translated.map { "\(getExecutableName(pid: $0.pid))(\($0.pid))" }.joined(separator: ", ")
         logger.info(
-            "App audio tap: \(translated.count) PID(s) [\(tapSummary, privacy: .public)]",
+            "App audio tap: \(translated.count) PID(s) [\(pidSummary(translated.map(\.pid)), privacy: .public)]",
         )
 
         if debugLogging {
@@ -402,6 +416,7 @@ public class AppAudioCapture: @unchecked Sendable {
         logger.info(
             "Created aggregate device: \(newAggregateID), rate \(resolved.rate) Hz (\(rung, privacy: .public)), default \(self.sampleRate) Hz",
         )
+        Self.logTapLayout(aggregateID: newAggregateID, anchorUID: systemOutputUID)
 
         // Set up IOProc to read audio data and write to file descriptor
         let fd = outputFileDescriptor
@@ -415,7 +430,9 @@ public class AppAudioCapture: @unchecked Sendable {
             &newProcID, newAggregateID, writeQueue,
         ) { [weak self, session] _, inInputData, inInputTime, _, _ in
             guard let self, self.isRunning else { return }
-            let abl = inInputData.pointee
+            // Not `inInputData.pointee.mBuffers`: on an output device with
+            // inputs that is the device's microphone, not the tap (#803).
+            guard let tapBuffer = Self.tapBuffer(in: inInputData) else { return }
 
             // Log format on first callback
             if !self.didLogFormat {
@@ -433,7 +450,7 @@ public class AppAudioCapture: @unchecked Sendable {
                 if self.appFirstFrameTime == 0 {
                     self.appFirstFrameTime = mach_absolute_time()
                 }
-                self.actualChannels = Int(abl.mBuffers.mNumberChannels)
+                self.actualChannels = Int(tapBuffer.mNumberChannels)
 
                 // Device is running — query the measured actual rate
                 let measuredRate = Self.queryActualSampleRate(deviceID: session.aggregateID)
@@ -445,9 +462,10 @@ public class AppAudioCapture: @unchecked Sendable {
                 }
 
                 let ch = max(self.actualChannels, 1)
-                let frames = Int(abl.mBuffers.mDataByteSize) / (MemoryLayout<Float>.size * ch)
+                let frames = Int(tapBuffer.mDataByteSize) / (MemoryLayout<Float>.size * ch)
+                // More than one buffer means the output device has inputs (#803).
                 logger.info(
-                    "Audio format: \(self.actualSampleRate) Hz, \(self.actualChannels)ch, \(abl.mNumberBuffers) buffers, \(frames) frames/buffer",
+                    "Audio format: \(self.actualSampleRate) Hz, \(self.actualChannels)ch, \(inInputData.pointee.mNumberBuffers) buffers (tap is the last), \(frames) frames/buffer",
                 )
             }
 
@@ -459,8 +477,8 @@ public class AppAudioCapture: @unchecked Sendable {
             // resampled 16 kHz mono buffer from inside writeCapturedBuffer, so
             // the app doesn't resample a second time. RMS/level still read the
             // raw buffer below.
-            guard let data = abl.mBuffers.mData else { return }
-            let byteCount = Int(abl.mBuffers.mDataByteSize)
+            guard let data = tapBuffer.mData else { return }
+            let byteCount = Int(tapBuffer.mDataByteSize)
             let hostTicks = Self.hostTicks(from: inInputTime)
             self.writeCapturedBuffer(fd: fd, data: data, byteCount: byteCount, hostTicks: hostTicks)
 
@@ -514,10 +532,9 @@ public class AppAudioCapture: @unchecked Sendable {
         // exists; the triggers land after it (the meeting app opening its own
         // input, a route change mid-call). These are taken while the recording
         // is running and are disarmed by the first buffer, so a healthy capture
-        // emits none of them (issue #693).
-        silentTrackDiagnostics.scheduleNoBufferProbes(
-            session.tappedProcesses, aggregateID: session.aggregateID,
-        )
+        // emits none of them (issue #693). With the watchdog on, a reading that
+        // finds a process rendering also opens a check; see the extension.
+        armNoBufferProbes(session.tappedProcesses, aggregateID: session.aggregateID)
         return session
     }
 

@@ -40,7 +40,7 @@ final class WatchLoopCalendarTitleTests: XCTestCase {
             pollInterval: 0.01,
             endGracePeriod: 0.01,
             maxDuration: 10,
-            noMic: true,
+            noMic: { true },
             calendarLookup: lookup,
         )
         loop.permissionChecker = {
@@ -60,7 +60,7 @@ final class WatchLoopCalendarTitleTests: XCTestCase {
 
     func testDetectedMeetingTakesTitleAndAttendeesFromTheCalendar() async throws {
         let lookup = StubCalendarLookup(answer: CalendarMeeting(title: "Weekly sync", attendees: ["Anna", "Ben"]))
-        let queue = PipelineQueue()
+        let queue = try makeIsolatedQueue()
         let (loop, _) = makeLoop(lookup: lookup, queue: queue)
 
         try await loop.handleMeeting(teamsMeeting)
@@ -75,7 +75,7 @@ final class WatchLoopCalendarTitleTests: XCTestCase {
     func testCalendarAddressesReachTheJobEvenWhenTheAppReadNames() async throws {
         var meeting = CalendarMeeting(title: "Weekly sync", attendees: ["Anna", "Ben"])
         meeting.attendeeEmails = ["anna@example.com", "ben@example.org"]
-        let queue = PipelineQueue()
+        let queue = try makeIsolatedQueue()
         let (loop, _) = makeLoop(lookup: StubCalendarLookup(answer: meeting), queue: queue)
 
         try await loop.handleMeeting(teamsMeeting)
@@ -85,7 +85,7 @@ final class WatchLoopCalendarTitleTests: XCTestCase {
     }
 
     func testNoCalendarMatchLeavesNoAddresses() async throws {
-        let queue = PipelineQueue()
+        let queue = try makeIsolatedQueue()
         let (loop, _) = makeLoop(lookup: StubCalendarLookup(answer: nil), queue: queue)
 
         try await loop.handleMeeting(teamsMeeting)
@@ -94,7 +94,7 @@ final class WatchLoopCalendarTitleTests: XCTestCase {
     }
 
     func testWithoutACalendarMatchTheWindowTitleStays() async throws {
-        let queue = PipelineQueue()
+        let queue = try makeIsolatedQueue()
         let (loop, _) = makeLoop(lookup: StubCalendarLookup(answer: nil), queue: queue)
 
         try await loop.handleMeeting(teamsMeeting)
@@ -104,13 +104,13 @@ final class WatchLoopCalendarTitleTests: XCTestCase {
     }
 
     func testManualRecordingWithTheDefaultTitleIsNamedFromTheCalendar() async throws {
-        let queue = PipelineQueue()
+        let queue = try makeIsolatedQueue()
         let lookup = StubCalendarLookup(answer: CalendarMeeting(title: "Design review", attendees: []))
         let (loop, _) = makeLoop(lookup: lookup, queue: queue, detector: MeetingDetector(patterns: AppMeetingPattern.all))
         // The app picker passes the app name as the title when the field is left blank.
         try await loop.startManualRecording(pid: 1234, appName: "Chrome", title: "Chrome")
 
-        loop.stopManualRecording()
+        await loop.stopManualRecording()
 
         XCTAssertEqual(queue.jobs.first?.meetingTitle, "Design review")
         XCTAssertEqual(lookup.askedAppName, "Chrome")
@@ -118,23 +118,23 @@ final class WatchLoopCalendarTitleTests: XCTestCase {
 
     /// A title the user typed is a decision, not a fallback.
     func testManualRecordingKeepsATitleTheUserTyped() async throws {
-        let queue = PipelineQueue()
+        let queue = try makeIsolatedQueue()
         let lookup = StubCalendarLookup(answer: CalendarMeeting(title: "Design review", attendees: []))
         let (loop, _) = makeLoop(lookup: lookup, queue: queue, detector: MeetingDetector(patterns: AppMeetingPattern.all))
         try await loop.startManualRecording(pid: 1234, appName: "Chrome", title: "Notes for the offsite")
 
-        loop.stopManualRecording()
+        await loop.stopManualRecording()
 
         XCTAssertEqual(queue.jobs.first?.meetingTitle, "Notes for the offsite")
     }
 
     func testMicrophoneRecordingIsNamedFromTheCalendar() async throws {
-        let queue = PipelineQueue()
+        let queue = try makeIsolatedQueue()
         let lookup = StubCalendarLookup(answer: CalendarMeeting(title: "Team planning", attendees: ["Cara"]))
         let (loop, _) = makeLoop(lookup: lookup, queue: queue, detector: MeetingDetector(patterns: AppMeetingPattern.all))
         try await loop.startMicrophoneRecording()
 
-        loop.stopManualRecording()
+        await loop.stopManualRecording()
 
         XCTAssertEqual(queue.jobs.first?.meetingTitle, "Team planning")
         XCTAssertEqual(queue.jobs.first?.participants, ["Cara"])

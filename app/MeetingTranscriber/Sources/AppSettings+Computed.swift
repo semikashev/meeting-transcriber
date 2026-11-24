@@ -10,6 +10,12 @@ extension AppSettings {
         whisperLanguage.isEmpty ? nil : whisperLanguage
     }
 
+    /// Pinned microphone as an optional value. Empty string means the system
+    /// default input device.
+    var micDeviceUIDOrNil: String? {
+        micDeviceUID.isEmpty ? nil : micDeviceUID
+    }
+
     /// Parakeet language hint as an optional value. Empty string means the
     /// engine should auto-detect the language.
     var parakeetLanguageOrNil: String? {
@@ -18,8 +24,9 @@ extension AppSettings {
 
     /// The active transcription engine's EXPLICITLY configured language
     /// (ISO 639-1), or nil for auto-detect. Drives the live-caption streaming
-    /// backend (`LiveCaptionsGate`): `de` → Nemotron German streaming, `en` →
-    /// Parakeet EOU streaming, else → engine-driven re-transcribe.
+    /// backend (`LiveCaptionsGate`): `en` → Parakeet EOU streaming, a language
+    /// Nemotron was trained on → Nemotron multilingual streaming, nil (auto-detect)
+    /// or any other language → engine-driven re-transcribe.
     var activeEngineLanguageOrNil: String? {
         switch transcriptionEngine {
         case .whisperKit: whisperLanguageOrNil
@@ -41,6 +48,7 @@ extension AppSettings {
         if watchTencentMeeting { apps.append(AppMeetingPattern.tencentMeeting.appName) }
         if watchFaceTime { apps.append(AppMeetingPattern.faceTime.appName) }
         if watchWhatsApp { apps.append(AppMeetingPattern.whatsApp.appName) }
+        if watchSlack { apps.append(AppMeetingPattern.slack.appName) }
         return apps
     }
 }

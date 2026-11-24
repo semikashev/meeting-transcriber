@@ -11,9 +11,54 @@ private let logger = Logger(subsystem: AppPaths.logSubsystem, category: "LiveSpe
 protocol LiveSpeakerMatching: Sendable {
     /// Pre-warm any backing model state. Idempotent.
     func prepare() async throws
-    /// Returns a matched speaker name, or `nil` if no enrolled voice
-    /// passes the matcher's threshold + confidence margin.
-    func match(audio: [Float]) async -> String?
+    /// The matched speaker, or none if no enrolled voice passes the matcher's
+    /// threshold + confidence margin.
+    func match(audio: [Float]) async -> LiveSpeakerMatch
+    /// The closest enrolled voice of a short window, for `VoiceChangeDetector`; `.unknown` unless
+    /// the model is already loaded and two or more voices are enrolled. Never loads the model.
+    func probe(audio: [Float]) async -> LiveSpeakerMatch
+}
+
+struct LiveSpeakerMatch: Equatable, Sendable {
+    /// Set when an enrolled voice passes threshold and margin.
+    var name: String?
+    /// The closest enrolled voice, when it lies within `nearestSlack` of the match threshold.
+    var nearest: String?
+    /// Set by `probe` only: the closest enrolled voice at any distance, for `VoiceChangeDetector`,
+    /// which applies its own bound.
+    var closest: String?
+    /// Distance to `closest`.
+    var distance: Float?
+    /// How much farther the runner-up is; nil with a single enrolled voice.
+    var margin: Float?
+
+    static let unknown = Self()
+
+    /// Farther than this past the threshold, the line may be a voice nobody enrolled, so no voice is
+    /// nearest; unbounded, a guest took the only enrolled speaker's name.
+    static let nearestSlack: Float = 0.05
+}
+
+extension LiveSpeakerMatch {
+    /// `sentinel` is the label the match was run under; the matcher echoes it back when no voice passes.
+    init(_ result: SpeakerMatcher.VerboseMatch, sentinel: String, threshold: Float) {
+        let candidates = result.topCandidates
+        self.init(
+            name: result.assignedName == sentinel ? nil : result.assignedName,
+            nearest: candidates.first.flatMap { $0.hybrid < threshold + Self.nearestSlack ? $0.name : nil },
+        )
+    }
+
+    /// A probe's result from each enrolled voice's distance: the closest and its lead over the
+    /// runner-up; `.unknown` with fewer than two voices.
+    init(probing distances: [(name: String, distance: Float)]) {
+        let scored = distances.sorted { $0.distance < $1.distance }
+        guard scored.count >= 2 else {
+            self = .unknown
+            return
+        }
+        self.init(closest: scored[0].name, distance: scored[0].distance, margin: scored[1].distance - scored[0].distance)
+    }
 }
 
 /// Live speaker matching for the caption overlay. Given the speech samples
@@ -30,7 +75,8 @@ protocol LiveSpeakerMatching: Sendable {
 ///
 /// **Vector-space note:** Both the batch path
 /// (`FluidDiarizer.extractSortformerEmbeddings`) and this live path load
-/// the same `wespeaker_v2` CoreML model via `DiarizerModels.load()`. The
+/// the same `wespeaker_v2` CoreML model via
+/// `FluidOfflineProcessor.loadDiarizerModels(computeUnits:)`. The
 /// embeddings are byte-for-byte compatible with anything already in
 /// `speakers.json` — no re-enrollment needed when this ships.
 ///
@@ -55,6 +101,13 @@ actor LiveSpeakerMatcher: LiveSpeakerMatching {
     private static let cachedFrameCountKey =
         "LiveSpeakerMatcher.weSpeakerFrameCount.\(ModelNames.Diarizer.segmentationFile)"
 
+    /// Compute units for the WeSpeaker embedding model. Shared with the
+    /// offline pipeline, which keeps this model off the GPU because Core ML's
+    /// `.all` routing can abort the process inside MPSGraph (see
+    /// `FluidOfflineProcessor.computeUnits`). Not conditional on CI, so the
+    /// test suite exercises the configuration that ships.
+    static let embeddingComputeUnits = FluidOfflineProcessor.computeUnits
+
     /// SpeakerMatcher is a class with internal NSLock-based DB
     /// serialization — safe to call from any thread. Held by reference so
     /// rename / delete operations made via the existing UI (KnownVoices)
@@ -69,12 +122,47 @@ actor LiveSpeakerMatcher: LiveSpeakerMatching {
     private let readCachedFrameCount: @Sendable () -> Int?
     private let writeCachedFrameCount: @Sendable (Int) -> Void
 
+    /// The two FluidAudio load calls, one per launch path, each handed the
+    /// compute units to load with. Injectable so tests can see which units
+    /// each path asks for without loading a model.
+    struct ModelLoaders: Sendable {
+        /// Cache hit: the embedding model alone.
+        var embeddingModel: @Sendable (MLComputeUnits) async throws -> MLModel
+        /// Cache miss: segmentation + embedding, to derive the frame count.
+        var diarizerModels: @Sendable (MLComputeUnits) async throws -> DiarizerModels
+
+        static let fluidAudio = ModelLoaders(
+            embeddingModel: { computeUnits in
+                // `DiarizerModels.defaultModelsDirectory()` returns the
+                // model-bundle dir (`…/Models/diarizer-coreml`); `ModelHub`
+                // appends `repo.folderName` itself, so we strip the trailing
+                // component to give it the parent (`…/Models`).
+                let modelsByName = try await ModelHub.loadModels(
+                    .diarizer,
+                    modelNames: [ModelNames.Diarizer.embeddingFile],
+                    directory: DiarizerModels.defaultModelsDirectory().deletingLastPathComponent(),
+                    computeUnits: computeUnits,
+                )
+                guard let model = modelsByName[ModelNames.Diarizer.embeddingFile] else {
+                    throw LiveSpeakerMatcherError.modelLoadFailed
+                }
+                return model
+            },
+            diarizerModels: { computeUnits in
+                try await FluidOfflineProcessor.loadDiarizerModels(computeUnits: computeUnits)
+            },
+        )
+    }
+
+    private let modelLoaders: ModelLoaders
+
     /// Loaded lazily on first `prepare()`. Subsequent calls await the same
     /// task. Cleared on failure so a transient model-download error doesn't
-    /// latch every future caller (mirrors
-    /// [[feedback-single-flight-clear-loadingtask-on-failure]]).
+    /// latch every future caller.
     private var loadedModels: LoadedModels?
     private var loadingTask: Task<LoadedModels, any Error>?
+    /// Enrolled voices as of the last load or line match; probes read this instead of `speakers.json`.
+    private var probeVoices: [StoredSpeaker] = []
 
     /// `EmbeddingExtractor` is a FluidAudio reference type without declared
     /// `Sendable` conformance. The loader Task constructs it once and hands
@@ -94,10 +182,12 @@ actor LiveSpeakerMatcher: LiveSpeakerMatching {
         speakerMatcher: SpeakerMatcher = SpeakerMatcher(),
         readCachedFrameCount: @escaping @Sendable () -> Int? = LiveSpeakerMatcher.defaultReadCachedFrameCount,
         writeCachedFrameCount: @escaping @Sendable (Int) -> Void = LiveSpeakerMatcher.defaultWriteCachedFrameCount,
+        modelLoaders: ModelLoaders = .fluidAudio,
     ) {
         self.speakerMatcher = speakerMatcher
         self.readCachedFrameCount = readCachedFrameCount
         self.writeCachedFrameCount = writeCachedFrameCount
+        self.modelLoaders = modelLoaders
     }
 
     /// Production reader: `UserDefaults.standard.integer(forKey:)` returns
@@ -132,26 +222,26 @@ actor LiveSpeakerMatcher: LiveSpeakerMatching {
         do {
             loadedModels = try await task.value
             loadingTask = nil
+            probeVoices = speakerMatcher.matchableSpeakers()
         } catch {
             loadingTask = nil
             throw error
         }
     }
 
-    /// Match `audio` against the enrolled speaker DB. Returns the matched
-    /// speaker name when the embedding passes the threshold + confidence
-    /// margin, or `nil` when it doesn't (caller falls back to a channel
-    /// default). Errors during embedding extraction also return `nil` so
-    /// a transient inference failure degrades to "unknown speaker" rather
-    /// than blocking the caption.
-    func match(audio: [Float]) async -> String? {
+    /// Match `audio` against the enrolled speaker DB. The result names the
+    /// speaker when the embedding passes the threshold + confidence margin
+    /// (caller falls back to a channel default otherwise). Errors during
+    /// embedding extraction also return `.unknown` so a transient inference
+    /// failure degrades to "unknown speaker" rather than blocking the caption.
+    func match(audio: [Float]) async -> LiveSpeakerMatch {
         do {
             try await prepare()
         } catch {
             logger.warning("model load failed, falling back to channel default: \(error.localizedDescription, privacy: .public)")
-            return nil
+            return .unknown
         }
-        guard let models = loadedModels else { return nil }
+        guard let models = loadedModels else { return .unknown }
 
         // Extractor pads / loops the audio internally to its 160 000-sample
         // window — short utterances are stretched, not truncated.
@@ -162,12 +252,12 @@ actor LiveSpeakerMatcher: LiveSpeakerMatching {
                 // Extractor returns a zero vector for inactive speakers (mask
                 // activity below threshold). Shouldn't happen for an all-ones
                 // mask on real speech, but degrade gracefully if it does.
-                return nil
+                return .unknown
             }
             embedding = first
         } catch {
             logger.warning("embedding extraction failed: \(error.localizedDescription, privacy: .public)")
-            return nil
+            return .unknown
         }
 
         // `SpeakerMatcher` returns the input label verbatim when no
@@ -176,38 +266,30 @@ actor LiveSpeakerMatcher: LiveSpeakerMatching {
         // the same name. Per-call UUID guarantees no collision with any
         // user-chosen name in `speakers.json`.
         let sentinel = UUID().uuidString
-        let result = speakerMatcher.match(embeddings: [sentinel: embedding])
-        guard let name = result[sentinel], name != sentinel else { return nil }
-        return name
+        probeVoices = speakerMatcher.matchableSpeakers()
+        guard let result = speakerMatcher.matchVerbose(embeddings: [sentinel: embedding], against: probeVoices)[sentinel]
+        else { return .unknown }
+        return LiveSpeakerMatch(result, sentinel: sentinel, threshold: speakerMatcher.threshold)
+    }
+
+    /// With fewer than two voices the closest is always the same one, so no change can be found.
+    func probe(audio: [Float]) -> LiveSpeakerMatch {
+        guard probeVoices.count >= 2, let models = loadedModels,
+              let embedding = try? models.extractor.getEmbeddings(audio: audio, masks: models.allOnesMask).first,
+              !embedding.allSatisfy({ $0 == 0 })
+        else { return .unknown }
+        return LiveSpeakerMatch(probing: probeVoices.map { voice in
+            (name: voice.name, distance: SpeakerMatcher.distance(query: embedding, speaker: voice))
+        })
     }
 
     private func loadModels() async throws -> LoadedModels {
-        // `DiarizerModels.defaultModelsDirectory()` returns the model-bundle
-        // dir (`…/Models/diarizer-coreml`); `ModelHub` appends
-        // `repo.folderName` itself, so we strip the trailing component to
-        // give it the parent (`…/Models`).
-        let directory = DiarizerModels.defaultModelsDirectory()
-            .deletingLastPathComponent()
-        // Mirror `DiarizerModels.defaultConfiguration`'s CI vs. local
-        // compute-unit choice (that function is internal to FluidAudio
-        // so we can't call it directly) — keeps the live matcher's
-        // CoreML execution path identical to the batch loader on the
-        // same hardware.
-        let computeUnits: MLComputeUnits = ProcessInfo.processInfo
-            .environment["CI"] != nil ? .cpuAndNeuralEngine : .all
+        let computeUnits = Self.embeddingComputeUnits
 
         if let cachedFrameCount = readCachedFrameCount() {
             // Cache hit: load only the embedding model. The savings vs.
             // the first-launch path are documented in the type docstring.
-            let modelsByName = try await ModelHub.loadModels(
-                .diarizer,
-                modelNames: [ModelNames.Diarizer.embeddingFile],
-                directory: directory,
-                computeUnits: computeUnits,
-            )
-            guard let embeddingModel = modelsByName[ModelNames.Diarizer.embeddingFile] else {
-                throw LiveSpeakerMatcherError.modelLoadFailed
-            }
+            let embeddingModel = try await modelLoaders.embeddingModel(computeUnits)
             logger.info("WeSpeaker loaded for live matching (cached frameCount=\(cachedFrameCount, privacy: .public), segmentation skipped)")
             return makeLoadedModels(embeddingModel: embeddingModel, frameCount: cachedFrameCount)
         }
@@ -217,10 +299,10 @@ actor LiveSpeakerMatcher: LiveSpeakerMatching {
         // model's `segments` output shape — `segShape[1]` is the WeSpeaker
         // mask frame count. Persist it so future launches take the
         // embedding-only fast path above.
-        let full = try await DiarizerModels.load()
+        let full = try await modelLoaders.diarizerModels(computeUnits)
         guard
             let segShape = full.segmentationModel.modelDescription
-            .outputDescriptionsByName["segments"]?.multiArrayConstraint?.shape,
+                .outputDescriptionsByName["segments"]?.multiArrayConstraint?.shape,
             segShape.count >= 2
         else {
             throw LiveSpeakerMatcherError.modelShapeUnavailable

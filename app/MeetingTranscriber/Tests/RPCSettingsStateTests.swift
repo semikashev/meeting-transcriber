@@ -19,7 +19,7 @@
         override func setUp() async throws {
             try await super.setUp()
             testSuiteName = "RPCSettingsStateTests-\(getpid())-\(UUID().uuidString)"
-            guard let suite = UserDefaults(suiteName: testSuiteName) else {
+            guard let suite = DefaultsSuite.open(testSuiteName) else {
                 XCTFail("Could not create test UserDefaults suite")
                 return
             }
@@ -54,6 +54,7 @@
             XCTAssertEqual(s.recording.asymmetricSilenceWarningSeconds, 90.0)
             XCTAssertEqual(s.transcription.engine, "whisperKit")
             XCTAssertEqual(s.transcription.whisperLanguage, "de")
+            XCTAssertFalse(s.transcription.customVocabularyEnabled)
             XCTAssertTrue(s.diarization.diarize)
             XCTAssertEqual(s.diarization.mode, "offline")
             XCTAssertEqual(s.diarization.numSpeakers, 0)
@@ -82,6 +83,8 @@
             settings.diarize = false
             settings.verboseDiagnostics = true
             settings.includePreReleases = true
+            settings.customVocabularyEnabled = true
+            settings.unloadModelsWhenIdle = false
 
             let s = settings.rpcSettingsSnapshot()
 
@@ -100,6 +103,8 @@
             XCTAssertFalse(s.diarization.diarize)
             XCTAssertTrue(s.diagnostics.verboseDiagnostics)
             XCTAssertTrue(s.updates.includePreReleases)
+            XCTAssertTrue(s.transcription.customVocabularyEnabled)
+            XCTAssertFalse(s.transcription.unloadModelsWhenIdle)
         }
 
         // MARK: - Enum raw-value mapping is pinned
@@ -122,6 +127,17 @@
             XCTAssertEqual(s.diarization.mode, DiarizerMode.sortformer.rawValue)
             XCTAssertEqual(s.protocolGeneration.provider, "openAICompatible")
             XCTAssertEqual(s.protocolGeneration.provider, ProtocolProvider.openAICompatible.rawValue)
+        }
+
+        func test_snapshot_openAISamplingOverrides() {
+            XCTAssertNil(settings.rpcSettingsSnapshot().protocolGeneration.openAITemperature)
+            XCTAssertNil(settings.rpcSettingsSnapshot().protocolGeneration.openAITopP)
+
+            settings.openAITemperature = 0.3
+            settings.openAITopP = 0.9
+            let s = settings.rpcSettingsSnapshot()
+            XCTAssertEqual(s.protocolGeneration.openAITemperature, 0.3)
+            XCTAssertEqual(s.protocolGeneration.openAITopP, 0.9)
         }
 
         func test_snapshot_protocolProviderNone_mapsToNoneRawValue() {
@@ -215,6 +231,9 @@
         /// under ANY name fails this test, which generic substring scans can't
         /// guarantee.
         func test_snapshot_settingsKeysAreExactlyTheAllowlist() throws {
+            // Optional fields are omitted while nil; set them so they are counted.
+            settings.openAITemperature = 0.5
+            settings.openAITopP = 0.5
             let data = try JSONEncoder().encode(settings.rpcSettingsSnapshot())
             let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
 
@@ -241,7 +260,8 @@
                 "recording.asymmetricSilenceWarningSeconds",
                 "transcription.engine", "transcription.whisperKitModel",
                 "transcription.whisperLanguage", "transcription.parakeetLanguage",
-                "transcription.customVocabularyPath",
+                "transcription.customVocabularyEnabled", "transcription.customVocabularyPath",
+                "transcription.unloadModelsWhenIdle",
                 "diarization.diarize", "diarization.mode", "diarization.numSpeakers",
                 "diarization.vadEnabled", "diarization.vadThreshold",
                 "diarization.clusterThreshold", "diarization.warmStartFa",
@@ -249,6 +269,7 @@
                 "diarization.excludeOverlap",
                 "protocolGeneration.provider", "protocolGeneration.language",
                 "protocolGeneration.openAIEndpoint", "protocolGeneration.openAIModel",
+                "protocolGeneration.openAITemperature", "protocolGeneration.openAITopP",
                 "protocolGeneration.claudeBin",
                 "output.directory", "output.hasCustomDirectory", "output.hasCustomPrompt",
                 "output.includeFullTranscriptInProtocol", "output.saveRawTranscriptSeparately",
@@ -291,10 +312,10 @@
         /// End-to-end within the process: the snapshot AppState hands the RPC
         /// server carries the live settings, so `mt-cli state | jq .settings`
         /// against the running app reflects a runtime change.
-        func test_appStateSnapshot_carriesLiveSettings() {
+        func test_appStateSnapshot_carriesLiveSettings() throws {
             settings.recordOnly = true
             settings.transcriptionEngine = .parakeet
-            let state = AppState(settings: settings)
+            let state = try AppState(pipelineEnvironment: makeIsolatedPipelineEnvironment(), settings: settings)
 
             let s = state.rpcStateSnapshot().settings
 

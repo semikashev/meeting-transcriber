@@ -1,10 +1,21 @@
 import AppKit
+import OSLog
 import SwiftUI
 import UniformTypeIdentifiers
+
+private let logger = Logger(subsystem: AppPaths.logSubsystem, category: "OutputSettingsView")
 
 /// Pure derivations used by `OutputSettingsView`. Extracted so the wrapping
 /// logic can be unit-tested without instantiating a SwiftUI host.
 enum OutputSettingsLogic {
+    /// Install `source` as the custom prompt at `dest`, replacing any prompt
+    /// already there. The picked file is the user's and must survive.
+    static func importPrompt(from source: URL, to dest: URL) throws {
+        // Read and write rather than `replaceItemAt`, which moves the
+        // replacement into place and so removed the file the user picked.
+        try Data(contentsOf: source).write(to: dest, options: .atomic)
+    }
+
     /// Abbreviate `url` for display by replacing the home-directory prefix
     /// with `~` so paths inside the user's home stay compact. Falls back to
     /// the full path when `url` is outside `home`. Matches at the path-
@@ -29,6 +40,21 @@ enum OutputSettingsLogic {
         guard !selected.isEmpty, !available.contains(selected) else { return available }
         return [selected] + available
     }
+
+    /// The retention period as the Settings row shows it. Zero is spelled out,
+    /// since "0 days" alone reads like "never".
+    static func retentionDaysLabel(_ days: Int) -> String {
+        switch days {
+        case ...0: "0 days (right away)"
+        case 1: "1 day"
+        default: "\(days) days"
+        }
+    }
+}
+
+enum ConnectionTestResult {
+    case success(String)
+    case failure(String)
 }
 
 struct OutputSettingsView: View {
@@ -43,95 +69,42 @@ struct OutputSettingsView: View {
     @State private var didAttemptConnectionTest = false
     @State private var showResetPromptConfirmation = false
     @State private var hasCustomPrompt = false
+    static let fieldWidth: CGFloat = 260
+    /// The API key fields type into these, not into the Keychain.
+    @StateObject private var apiKeyDrafts: ProtocolAPIKeyDrafts
+
     @State private var webhookDraft = ""
     @State private var webhookStatus: String?
 
-    private func refreshWebhookStatus() {
-        webhookStatus = ProtocolWebhook.configuredURL().map(ProtocolWebhook.fingerprint(of:))
-    }
-
-    enum ConnectionTestResult {
-        case success(String)
-        case failure(String)
+    // swiftlint:disable:next unneeded_escaping
+    init(settings: AppSettings, apiKeyDrafts: @autoclosure @escaping () -> ProtocolAPIKeyDrafts? = nil) {
+        self.settings = settings
+        _apiKeyDrafts = StateObject(wrappedValue: apiKeyDrafts() ?? ProtocolAPIKeyDrafts(settings: settings))
     }
 
     var body: some View {
-        // swiftlint:disable:next closure_body_length
         Form {
             // Output folder applies to record-only AND protocol mode, so this
             // section deliberately sits outside the .recordOnlyDisabled block.
-            Section("Output Folder") {
-                HStack {
-                    Text("Output Folder")
-                    Spacer()
-                    Text(outputDirDisplay)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                }
+            outputFolderSection
 
-                HStack {
-                    Button("Choose\u{2026}") {
-                        chooseOutputFolder()
-                    }
+            webhookSection
 
-                    Button("Reset") {
-                        settings.clearCustomOutputDir()
-                    }
-                    .disabled(settings.customOutputDirBookmark == nil)
+            NotionExportSettingsView(settings: settings)
 
-                    Spacer()
-                }
+            // Outside the record-only block as well: entries recorded before
+            // record-only was switched on are still swept, and record-only
+            // output itself is never recorded, so the setting cannot reach it.
+            recordingRetentionSection
+
+            meetingNotesSection
+            providerSection
+
+            if settings.protocolProvider == .openAICompatible {
+                OpenAIConnectionSection(settings: settings, apiKeyDrafts: apiKeyDrafts)
+                    .accessibilityIdentifier(A11yID.openAIConnectionSection)
+                    .recordOnlyDisabled(settings.recordOnly)
             }
-            .accessibilityIdentifier(A11yID.outputFolderSection)
-
-            Section("Protocol Webhook") {
-                HStack {
-                    SecureField("https://… (stored in Keychain)", text: $webhookDraft)
-                    Button("Save") {
-                        KeychainHelper.save(key: ProtocolWebhook.keychainKey, value: webhookDraft)
-                        webhookDraft = ""
-                        refreshWebhookStatus()
-                    }
-                    .disabled(webhookDraft.isEmpty)
-                    Button("Clear") {
-                        KeychainHelper.delete(key: ProtocolWebhook.keychainKey)
-                        refreshWebhookStatus()
-                    }
-                    .disabled(webhookStatus == nil)
-                }
-                Text(webhookStatus.map { "POST each saved protocol to \($0)" } ?? "Off — no URL saved")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            .onAppear(perform: refreshWebhookStatus)
-
-            Section("Protocol Generation") {
-                Toggle("Include full transcript in protocol", isOn: $settings.includeFullTranscriptInProtocol)
-                    .accessibilityIdentifier(A11yID.includeFullTranscriptToggle)
-                Toggle("Save raw transcript separately", isOn: $settings.saveRawTranscriptSeparately)
-                    .accessibilityIdentifier(A11yID.saveRawTranscriptToggle)
-                Toggle("Use AI meeting title for filenames", isOn: $settings.useAITitleForFilenames)
-                    .accessibilityIdentifier(A11yID.useAITitleForFilenamesToggle)
-
-                Picker("LLM Provider", selection: $settings.protocolProvider) {
-                    ForEach(ProtocolProvider.allCases, id: \.self) { provider in
-                        Text(provider.label).tag(provider)
-                    }
-                }
-
-                providerConfigView
-
-                Picker("Protocol Language", selection: $settings.protocolLanguage) {
-                    ForEach(languagePickerOptions, id: \.self) { lang in
-                        Text(lang).tag(lang)
-                    }
-                }
-
-                promptControls
-            }
-            .accessibilityIdentifier(A11yID.protocolSection)
-            .recordOnlyDisabled(settings.recordOnly)
         }
         .formStyle(.grouped)
         .onAppear {
@@ -139,6 +112,141 @@ struct OutputSettingsView: View {
                 claudeBinaries = ClaudeCLIProtocolGenerator.availableClaudeBinaries()
             #endif
             refreshCustomPromptState()
+        }
+        // A hidden Settings window and a quit reach neither a focus change nor
+        // `onDisappear`, so an edited key is handed over here as well.
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.willCloseNotification)) { notification in
+            apiKeyDrafts.settingsWindowWillClose(notification, settings: settings)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
+            apiKeyDrafts.commitPending(to: settings)
+        }
+    }
+
+    private var outputFolderSection: some View {
+        Section("Output Folder") {
+            HStack {
+                Text("Output Folder")
+                Spacer()
+                Text(outputDirDisplay)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+
+            HStack {
+                Button("Choose\u{2026}") {
+                    chooseOutputFolder()
+                }
+
+                Button("Reset") {
+                    settings.clearCustomOutputDir()
+                }
+                .disabled(settings.customOutputDirBookmark == nil)
+
+                Spacer()
+            }
+        }
+        .accessibilityIdentifier(A11yID.outputFolderSection)
+    }
+
+    private var webhookSection: some View {
+        Section("Protocol Webhook") {
+            HStack {
+                SecureField("https://… (stored in Keychain)", text: $webhookDraft)
+                Button("Save") {
+                    KeychainHelper.save(key: ProtocolWebhook.keychainKey, value: webhookDraft)
+                    webhookDraft = ""
+                    refreshWebhookStatus()
+                }
+                .disabled(webhookDraft.isEmpty)
+                Button("Clear") {
+                    KeychainHelper.delete(key: ProtocolWebhook.keychainKey)
+                    refreshWebhookStatus()
+                }
+                .disabled(webhookStatus == nil)
+            }
+            Text(webhookStatus.map { "POST each saved protocol to \($0)" } ?? "Off — no URL saved")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .onAppear(perform: refreshWebhookStatus)
+    }
+
+    private func refreshWebhookStatus() {
+        webhookStatus = ProtocolWebhook.configuredURL().map(ProtocolWebhook.fingerprint(of:))
+    }
+
+    private var meetingNotesSection: some View {
+        Section("Meeting Notes") {
+            Picker("Notes Language", selection: $settings.protocolLanguage) {
+                ForEach(languagePickerOptions, id: \.self) { lang in
+                    Text(lang).tag(lang)
+                }
+            }
+
+            if settings.protocolProvider != .none {
+                promptControls
+            }
+
+            Toggle("Include full transcript", isOn: $settings.includeFullTranscriptInProtocol)
+                .accessibilityIdentifier(A11yID.includeFullTranscriptToggle)
+            Toggle("Save raw transcript separately", isOn: $settings.saveRawTranscriptSeparately)
+                .accessibilityIdentifier(A11yID.saveRawTranscriptToggle)
+            Toggle("Name files with AI meeting title", isOn: $settings.useAITitleForFilenames)
+                .accessibilityIdentifier(A11yID.useAITitleForFilenamesToggle)
+            Toggle("Notify when meeting notes fail", isOn: $settings.notifyOnMeetingNotesFailure)
+                .accessibilityIdentifier(A11yID.notifyOnMeetingNotesFailureToggle)
+        }
+        .accessibilityIdentifier(A11yID.protocolSection)
+        .recordOnlyDisabled(settings.recordOnly)
+    }
+
+    private var providerSection: some View {
+        Section {
+            Picker("Provider", selection: $settings.protocolProvider) {
+                ForEach(ProtocolProvider.allCases, id: \.self) { provider in
+                    Text(provider.label).tag(provider)
+                }
+            }
+
+            providerConfigView
+        } header: {
+            HStack(spacing: 4) {
+                Text("AI Provider")
+                HelpBadge(text: providerHelp, systemImage: "questionmark.circle")
+            }
+        }
+        .accessibilityIdentifier(A11yID.protocolProviderSection)
+        .recordOnlyDisabled(settings.recordOnly)
+    }
+
+    private var recordingRetentionSection: some View {
+        Section("Recording Retention") {
+            Toggle("Delete recordings after processing", isOn: $settings.recordingRetentionEnabled)
+                .accessibilityIdentifier(A11yID.recordingRetentionToggle)
+
+            HStack {
+                Text("Keep recordings for")
+                Spacer()
+                Text(OutputSettingsLogic.retentionDaysLabel(settings.recordingRetentionDays))
+                    .foregroundStyle(.secondary)
+                Stepper("", value: $settings.recordingRetentionDays, in: 0 ... 3650)
+                    .labelsHidden()
+            }
+            .disabled(!settings.recordingRetentionEnabled)
+
+            Text(
+                "Counted from the recording date. A recording is deleted only after its meeting notes were saved, "
+                    + "or its transcript when no LLM provider is set. A recording waiting for speaker names is kept "
+                    + "until they are given or skipped, or the naming wait set under Speakers runs out. "
+                    + "Only audio this app recorded and moved into "
+                    + "the output folder is affected: imported files, record-only recordings and recordings "
+                    + "processed by earlier versions are never deleted. Switching this on, or shortening the "
+                    + "period, deletes the recordings already past it.",
+            )
+            .font(.caption)
+            .foregroundStyle(.secondary)
         }
     }
 
@@ -152,98 +260,77 @@ struct OutputSettingsView: View {
                         Text(bin).tag(bin)
                     }
                 }
-                Text("Binary used for protocol generation")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
 
                 HStack {
                     Text("API Key")
                     Spacer()
-                    SecureField("", text: $settings.claudeAPIKey)
-                        .frame(width: 200)
+                    DraftTextField("", value: apiKeyDrafts.savedClaude, draft: $apiKeyDrafts.claude, secure: true) { key in
+                        apiKeyDrafts.commitClaude(key, to: settings)
+                    }
+                    .frame(width: Self.fieldWidth)
+                    .accessibilityIdentifier(A11yID.claudeAPIKeyField)
                 }
-                Text("Optional. Leave empty to use your \"claude login\" session.")
+
+                // In view rather than in the help popover: it is what saves a surprise bill.
+                Text("A key set here is billed separately from your subscription.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                Text("Only set this if that session can't stay signed in. An explicit key here is billed separately from your subscription.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .accessibilityIdentifier(A11yID.claudeAPIKeyBillingNote)
         #endif
 
         case .openAICompatible:
-            openAIConfigView
+            OpenAIConnectionControls(settings: settings, switchConnection: switchConnection)
+            modelRow
 
         case .none:
-            Text("No LLM summarization will be generated. Raw transcripts are retained if no protocol is saved.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            EmptyView()
         }
     }
 
-    @ViewBuilder
-    private var openAIConfigView: some View { // swiftlint:disable:this attributes
-        VStack(alignment: .leading, spacing: 4) {
-            Text("Endpoint")
-            TextField("http://localhost:1234/v1", text: $settings.openAIEndpoint)
-                .textFieldStyle(.roundedBorder)
-            Text("Base URL (e.g. http://localhost:1234/v1) or full chat-completions URL — both work.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        }
+    private var providerHelp: String {
+        switch settings.protocolProvider {
+        #if !APPSTORE
+            case .claudeCLI: SettingsHelp.claudeCLIProvider
+        #endif
 
-        if !availableModels.isEmpty {
-            Picker("Model", selection: $settings.openAIModel) {
-                ForEach(modelPickerOptions, id: \.self) { model in
-                    Text(model).tag(model)
+        case .openAICompatible: SettingsHelp.openAIProvider
+
+        case .none: SettingsHelp.noProvider
+        }
+    }
+
+    private var modelRow: some View {
+        HStack {
+            if !availableModels.isEmpty {
+                Picker(selection: $settings.openAIModel) {
+                    ForEach(modelPickerOptions, id: \.self) { model in
+                        Text(model).tag(model)
+                    }
+                } label: {
+                    modelLabel
                 }
-            }
-        } else {
-            HStack {
-                Text("Model")
+            } else {
+                modelLabel
                 Spacer()
                 TextField("", text: $settings.openAIModel)
-                    .frame(width: 200)
+                    .frame(width: Self.fieldWidth)
                     .multilineTextAlignment(.trailing)
+                    .accessibilityIdentifier(A11yID.openAIModelField)
             }
-        }
 
-        HStack {
-            Text("API Key")
-            Spacer()
-            SecureField("", text: $settings.openAIAPIKey)
-                .frame(width: 200)
-        }
-        Text("Leave empty if your local server doesn't require authentication")
-            .font(.caption)
-            .foregroundStyle(.secondary)
-
-        HStack {
+            let fetchTitle = availableModels.isEmpty ? "Fetch Models" : "Refresh Models"
             Button {
                 testConnection()
             } label: {
-                HStack(spacing: 4) {
-                    if testingConnection {
-                        ProgressView()
-                            .controlSize(.small)
-                    }
-                    Text(availableModels.isEmpty ? "Fetch Models" : "Refresh Models")
-                }
+                Image(systemName: "arrow.clockwise")
+                    .frame(width: 14, height: 14)
             }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
             .disabled(testingConnection)
-
-            if let result = connectionTestResult {
-                switch result {
-                case let .success(msg):
-                    Label(msg, systemImage: "checkmark.circle.fill")
-                        .foregroundStyle(.green)
-                        .font(.caption)
-
-                case let .failure(msg):
-                    Label(msg, systemImage: "xmark.circle.fill")
-                        .foregroundStyle(.red)
-                        .font(.caption)
-                }
-            }
+            .help(fetchTitle)
+            .accessibilityLabel(fetchTitle)
+            .accessibilityIdentifier(A11yID.openAIRefreshModelsButton)
         }
         .onAppear {
             if availableModels.isEmpty && !didAttemptConnectionTest {
@@ -252,49 +339,87 @@ struct OutputSettingsView: View {
         }
     }
 
-    private var promptControls: some View {
-        // swiftlint:disable:next closure_body_length
-        HStack {
-            Button("Edit Prompt") {
-                openCustomPrompt()
-                refreshCustomPromptState()
-            }
+    private var modelLabel: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text("Model")
+            if testingConnection {
+                Text("Checking\u{2026}")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else if let result = connectionTestResult {
+                switch result {
+                case let .success(msg):
+                    Label(msg, systemImage: "checkmark.circle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.green)
 
-            Button("Import Prompt") {
-                importCustomPrompt()
-                refreshCustomPromptState()
-            }
-
-            Button("Reset to Default") {
-                showResetPromptConfirmation = true
-            }
-            .disabled(!hasCustomPrompt)
-            .confirmationDialog(
-                "Reset protocol prompt to the built-in default?",
-                isPresented: $showResetPromptConfirmation,
-                titleVisibility: .visible,
-            ) {
-                Button("Reset", role: .destructive) {
-                    try? FileManager.default.removeItem(at: AppPaths.customPromptFile)
-                    refreshCustomPromptState()
+                case let .failure(msg):
+                    Label(msg, systemImage: "xmark.circle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.red)
                 }
+            }
+        }
+    }
+
+    private var promptControls: some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Prompt")
+                Text(hasCustomPrompt ? "Using custom prompt" : "Using default prompt")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             Spacer()
 
-            if hasCustomPrompt {
-                Label("Custom prompt active", systemImage: "doc.text.fill")
-                    .foregroundStyle(.blue)
-                    .font(.caption)
-            } else {
-                Label("Using default prompt", systemImage: "doc.text")
-                    .foregroundStyle(.secondary)
-                    .font(.caption)
+            Button("Edit\u{2026}") {
+                openCustomPrompt()
+                refreshCustomPromptState()
+            }
+
+            Menu {
+                Button("Import Prompt\u{2026}") {
+                    importCustomPrompt()
+                    refreshCustomPromptState()
+                }
+                Button("Reset to Default\u{2026}") {
+                    showResetPromptConfirmation = true
+                }
+                .disabled(!hasCustomPrompt)
+            } label: {
+                Image(systemName: "ellipsis.circle")
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .help("More prompt actions")
+            .accessibilityLabel("More prompt actions")
+        }
+        .confirmationDialog(
+            "Reset meeting notes prompt to the built-in default?",
+            isPresented: $showResetPromptConfirmation,
+            titleVisibility: .visible,
+        ) {
+            Button("Reset", role: .destructive) {
+                try? FileManager.default.removeItem(at: AppPaths.customPromptFile)
+                refreshCustomPromptState()
             }
         }
     }
 
     // MARK: - Helpers
+
+    /// A typed key is handed to the connection being left before the change,
+    /// and the key field then shows the selected connection's key.
+    private func switchConnection(_ change: () -> Void) {
+        apiKeyDrafts.commitPending(to: settings)
+        change()
+        apiKeyDrafts.reloadOpenAI(from: settings)
+        availableModels = []
+        connectionTestResult = nil
+        testingConnection = false
+    }
 
     private func refreshCustomPromptState() {
         hasCustomPrompt = FileManager.default.fileExists(atPath: AppPaths.customPromptFile.path)
@@ -304,13 +429,19 @@ struct OutputSettingsView: View {
         testingConnection = true
         didAttemptConnectionTest = true
         connectionTestResult = nil
+        let connectionID = settings.activeOpenAIConnectionID
         Task {
             let apiKey = settings.openAIAPIKey.isEmpty ? nil : settings.openAIAPIKey
             let result = await OpenAIProtocolGenerator.testConnection(
                 endpoint: settings.openAIEndpoint,
                 model: settings.openAIModel,
                 apiKey: apiKey,
+                apiKeyPlacement: settings.openAIAPIKeyPlacement,
+                apiKeyHeaderName: settings.openAIAPIKeyHeaderName,
             )
+            // Another connection was selected meanwhile: its model must not be
+            // replaced by this one's list.
+            guard settings.activeOpenAIConnectionID == connectionID else { return }
             testingConnection = false
             switch result {
             case let .success(models):
@@ -363,11 +494,10 @@ struct OutputSettingsView: View {
         panel.message = "Select a prompt file to import"
         guard panel.runModal() == .OK, let source = panel.url else { return }
         ensurePromptDirectory()
-        let dest = AppPaths.customPromptFile
-        if FileManager.default.fileExists(atPath: dest.path) {
-            _ = try? FileManager.default.replaceItemAt(dest, withItemAt: source)
-        } else {
-            try? FileManager.default.copyItem(at: source, to: dest)
+        do {
+            try OutputSettingsLogic.importPrompt(from: source, to: AppPaths.customPromptFile)
+        } catch {
+            logger.error("prompt_import_failed error=\(error.localizedDescription, privacy: .public)")
         }
     }
 
@@ -384,7 +514,7 @@ struct OutputSettingsView: View {
         panel.canChooseFiles = false
         panel.canCreateDirectories = true
         panel.allowsMultipleSelection = false
-        panel.message = "Choose a folder for protocol output"
+        panel.message = "Choose a folder for recordings, transcripts and meeting notes"
         guard panel.runModal() == .OK, let url = panel.url else { return }
         settings.setCustomOutputDir(url)
     }

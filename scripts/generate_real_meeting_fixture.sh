@@ -56,7 +56,10 @@ ANNO_ZIP="$CACHE_DIR/ami_public_manual_1.6.2.zip"
 ANNO_DIR="$CACHE_DIR/anno"
 
 fetch() {
-    curl -fsSL --retry 3 -o "$2.part" "$1"
+    # Retry flags: see the download in scripts/ci/install-lint-tool.sh. No
+    # --max-time for these large files; the speed limit ends a stalled attempt.
+    curl -fsSL --connect-timeout 10 --speed-limit 10240 --speed-time 60 \
+        --retry 6 --retry-all-errors -o "$2.part" "$1"
     mv "$2.part" "$2"
 }
 
@@ -101,6 +104,10 @@ echo "Wrote:"
 echo "  $OUT_DIR/${FIXTURE}.wav (${WIN_DURATION}s, sha256 verified)"
 echo "  $OUT_DIR/${FIXTURE}_truth.json"
 echo
+# The filter names the engine quality classes, the same list as in
+# .github/workflows/quality-and-safety.yml: a bare `--filter Quality` would
+# also run the baseline-gate test class in the middle of the measurement.
 echo "If the fixture changed, baselines are stale. Re-measure with"
-echo "  RUN_QUALITY_TESTS=1 swift test --filter Quality"
-echo "and re-bless via scripts/bless_quality_baseline.sh."
+echo "  (cd app/MeetingTranscriber && RUN_QUALITY_TESTS=1 swift test --filter \"WhisperKitQualityTests|FluidDiarizerQualityTests|ParakeetQualityTests\")"
+echo "from the repository root, with QUALITY_RESULTS_PATH unset, and re-bless via"
+echo "  scripts/bless_quality_baseline.sh app/MeetingTranscriber/.build/quality-results.json"

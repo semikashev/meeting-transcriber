@@ -6,6 +6,8 @@ struct SettingsView: View {
     var whisperKitEngine: WhisperKitEngine
     var parakeetEngine: ParakeetEngine
     var updateChecker: UpdateChecker?
+    /// Backs the Launch at Login toggle. Nil hides the row, which is what tests get.
+    var loginItem: LoginItemController?
 
     /// Notification visibility from `PermissionsController`, forwarded to the
     /// General tab so it can warn when browser-meeting consent cannot reach the
@@ -25,6 +27,12 @@ struct SettingsView: View {
     /// True when the pipeline is processing a job — soft hint only.
     var pipelineBusy: Bool = false
     var onSpeakerMutate: (() -> Void)?
+    /// Builds the matcher Known Voices and enrollment edit through.
+    var speakerMatcherFactory: () -> SpeakerMatcher = { SpeakerMatcher() }
+    /// The old-models row's state, built once by `EngineController`. Nil leaves the row
+    /// out, which is what tests and the App Store build get.
+    var legacyWhisperModels: LegacyWhisperModelsState?
+    var captionWarmup: LiveCaptionsWarmup = .idle
 
     @State private var selection: SettingsTab = .general
 
@@ -61,6 +69,7 @@ struct SettingsView: View {
             GeneralSettingsView(
                 settings: settings,
                 notificationVisibility: notificationVisibility,
+                loginItem: loginItem,
             )
 
         case .audio:
@@ -71,6 +80,8 @@ struct SettingsView: View {
                 settings: settings,
                 whisperKitEngine: whisperKitEngine,
                 parakeetEngine: parakeetEngine,
+                captionWarmup: captionWarmup,
+                legacyModels: legacyWhisperModels,
             )
 
         case .speakers:
@@ -82,6 +93,7 @@ struct SettingsView: View {
                 namingDialogActive: namingDialogActive,
                 pipelineBusy: pipelineBusy,
                 onSpeakerMutate: onSpeakerMutate,
+                matcherFactory: speakerMatcherFactory,
             )
 
         case .output:

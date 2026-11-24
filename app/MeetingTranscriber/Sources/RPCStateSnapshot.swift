@@ -9,7 +9,7 @@
         let pendingNamingJobs: [PendingNaming]
         let engines: Engines
         /// The most recent pipeline job that finished — `.done` or `.error`.
-        /// Surfaced so a driver script can poll `/state` (or hit `/jobs/last`)
+        /// Surfaced so a driver script can poll `/state`
         /// and assert on the outcome of a triggered meeting without needing
         /// to scrape disk paths from logs.
         let lastJob: LastJob?
@@ -143,8 +143,17 @@
             let hypothesisMic: String
             let hypothesisApp: String
             let recentFinals: [LiveCaptionLine]
+            /// The caption model warm-up: "none", "preparing", "ready" or "failed".
+            let warmup: String
+            /// The load error when `warmup` is "failed".
+            let warmupFailure: String?
+            /// True while auto-detect holds captions to detect the recording's language.
+            let detectingLanguage: Bool
 
-            static let empty = Self(hypothesisMic: "", hypothesisApp: "", recentFinals: [])
+            static let empty = Self(
+                hypothesisMic: "", hypothesisApp: "", recentFinals: [], warmup: "none", warmupFailure: nil,
+                detectingLanguage: false,
+            )
         }
 
         struct ChannelHealth: Codable {
@@ -158,10 +167,16 @@
             /// without screenshot OCR.
             let recordingSilent: Bool
 
+            /// The app tap's noise-floor verdict (issue #699), live and
+            /// uncorroborated: `appFault` says "noiseFloor" only once the
+            /// microphone showed the call is live, and keeps saying it after
+            /// this clears.
+            let appNoiseFloorOnly: Bool
+
             /// The capture fault reported for each channel in this recording:
             /// "noBuffers", "digitalSilence", "gaveUp", "rebuildsExhausted"
-            /// (the app channel only), "stalled" (the microphone only), or
-            /// absent when the channel is fine.
+            /// and "noiseFloor" (the app channel only), "stalled" (the
+            /// microphone only), or absent when the channel is fine.
             /// Distinct from `micSilent` / `appSilent`, which say only that
             /// one channel is quieter than the other and are true of a muted
             /// microphone, a quiet room and a dead tap alike.
@@ -174,6 +189,10 @@
             /// The levels the last poll read, in dBFS. What the tint is
             /// decided from, and absent before the first tick of a recording.
             let micLevelDBFS: Double?
+            /// Whether the user muted the mic in the recording. The level above
+            /// stays the real one, as the health checks see it, so a muted mic
+            /// does not read as a dead one; only the track is silenced.
+            let micMuted: Bool
             let appLevelDBFS: Double?
 
             let micSecondsSinceLastBuffer: Double?
@@ -192,9 +211,11 @@
                 micSilent: false,
                 appSilent: false,
                 recordingSilent: false,
+                appNoiseFloorOnly: false,
                 micFault: nil,
                 appFault: nil,
                 micLevelDBFS: nil,
+                micMuted: false,
                 appLevelDBFS: nil,
                 micSecondsSinceLastBuffer: nil,
                 micSecondsSinceLastEnergy: nil,
@@ -281,6 +302,7 @@
             let durationSec: Double
             let transcriptPath: String?
             let protocolPath: String?
+            let export: JobExportDTO?
             let error: String?
             let warnings: [String]
             let participants: [String]
@@ -371,17 +393,20 @@
                 /// Empty string = auto-detect (mirrors the UserDefaults sentinel).
                 let whisperLanguage: String
                 let parakeetLanguage: String
+                let customVocabularyEnabled: Bool
                 let customVocabularyPath: String
+                let unloadModelsWhenIdle: Bool
 
                 static let empty = Self(
                     engine: "", whisperKitModel: "", whisperLanguage: "",
-                    parakeetLanguage: "", customVocabularyPath: "",
+                    parakeetLanguage: "", customVocabularyEnabled: false, customVocabularyPath: "",
+                    unloadModelsWhenIdle: true,
                 )
             }
 
             struct Diarization: Codable {
                 let diarize: Bool
-                /// `DiarizerMode` raw value ("offline" | "sortformer").
+                /// `DiarizerMode` raw value ("offline" | "sortformer" | "nemotron").
                 let mode: String
                 /// 0 = auto-detect speaker count.
                 let numSpeakers: Int
@@ -406,13 +431,18 @@
                 let language: String
                 let openAIEndpoint: String
                 let openAIModel: String
+                /// Sampling overrides for the OpenAI-compatible provider. Nil
+                /// (omitted from the JSON) means the server default applies.
+                let openAITemperature: Double?
+                let openAITopP: Double?
                 /// Claude CLI binary name/path (non-secret). The App Store build
                 /// never compiles this file (`#if !APPSTORE`).
                 let claudeBin: String
 
                 static let empty = Self(
                     provider: "", language: "", openAIEndpoint: "",
-                    openAIModel: "", claudeBin: "",
+                    openAIModel: "", openAITemperature: nil, openAITopP: nil,
+                    claudeBin: "",
                 )
             }
 
