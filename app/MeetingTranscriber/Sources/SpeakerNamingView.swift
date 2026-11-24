@@ -32,18 +32,30 @@ struct SpeakerNamingView: View { // swiftlint:disable:this type_body_length
     /// keystroke to. `nil` for hosts with no window to close (voice enrollment
     /// renders this view inline), where Escape stays inert.
     let onDismissRequest: (() -> Void)?
-    let onComplete: (PipelineQueue.SpeakerNamingResult) -> Void
+    /// Hands an answer to the host. Returns why the host did not take it, nil
+    /// when it did; a refused answer leaves the dialog usable and says why.
+    let onAnswer: (PipelineQueue.SpeakerNamingResult) -> String?
+    /// Something the host has to say about the job before any answer, shown
+    /// where a refused answer's reason goes: why its last re-run came back
+    /// with nothing.
+    private(set) var notice: String?
 
     /// Window after the dialog appears (or after Re-run produces a fresh `data.revision`)
     /// during which Confirm and Skip remain disabled. Prevents accidental confirms from
     /// stray Enter/Escape keystrokes that leak from another app's focus when
     /// `bringWindowToFront` steals focus mid-keystroke. Historical pipeline_log data
     /// shows ~19% of speaker-naming sessions exiting within 2-3 s — an isolated cluster
-    /// outside the log-normal human-confirm distribution. See
-    /// `docs/plans/.local/research/2026-05-19-late-speaker-renaming-after-done.md`.
+    /// outside the log-normal human-confirm distribution.
     static let defaultKeyboardGracePeriod: TimeInterval = 0.75
 
     let gracePeriod: TimeInterval
+
+    /// Reads the WAV a play button plays from the files and spans to try, best
+    /// first. Replaced only by the tests that check which file and span a
+    /// button asks for; it runs off the main thread.
+    var sampleLoader: @Sendable ([PipelineQueue.SpeakerNamingData.SampleSource]) -> Data? = { sources in
+        Self.sampleWAVData(from: sources)
+    }
 
     init(
         data: PipelineQueue.SpeakerNamingData,
@@ -54,13 +66,59 @@ struct SpeakerNamingView: View { // swiftlint:disable:this type_body_length
         onDismissRequest: (() -> Void)? = nil,
         onComplete: @escaping (PipelineQueue.SpeakerNamingResult) -> Void,
     ) {
+        // Labelled on purpose: a trailing closure would be ambiguous between
+        // the two inits, which both end in a closure.
+        self.init(
+            data: data, knownSpeakerNames: knownSpeakerNames,
+            currentDiarizerMode: currentDiarizerMode, pendingJobCount: pendingJobCount,
+            gracePeriod: gracePeriod, onDismissRequest: onDismissRequest,
+            // swiftlint:disable:next trailing_closure
+            onAnswer: { result in
+                onComplete(result)
+                return nil
+            },
+        )
+    }
+
+    /// For a host that can refuse an answer: `onAnswer` returns the reason, and
+    /// the dialog shows it instead of going dead on an answer nobody took. A
+    /// factory rather than a second public init, which would make every
+    /// trailing-closure call of the other one ambiguous.
+    static func answering(
+        data: PipelineQueue.SpeakerNamingData,
+        knownSpeakerNames: [String] = [],
+        currentDiarizerMode: DiarizerMode? = nil,
+        pendingJobCount: Int = 1,
+        gracePeriod: TimeInterval = Self.defaultKeyboardGracePeriod,
+        onDismissRequest: (() -> Void)? = nil,
+        notice: String? = nil,
+        onAnswer: @escaping (PipelineQueue.SpeakerNamingResult) -> String?,
+    ) -> Self {
+        var view = Self(
+            data: data, knownSpeakerNames: knownSpeakerNames,
+            currentDiarizerMode: currentDiarizerMode, pendingJobCount: pendingJobCount,
+            gracePeriod: gracePeriod, onDismissRequest: onDismissRequest, onAnswer: onAnswer,
+        )
+        view.notice = notice
+        return view
+    }
+
+    private init(
+        data: PipelineQueue.SpeakerNamingData,
+        knownSpeakerNames: [String],
+        currentDiarizerMode: DiarizerMode?,
+        pendingJobCount: Int,
+        gracePeriod: TimeInterval,
+        onDismissRequest: (() -> Void)?,
+        onAnswer: @escaping (PipelineQueue.SpeakerNamingResult) -> String?,
+    ) {
         self.data = data
         self.knownSpeakerNames = knownSpeakerNames
         self.currentDiarizerMode = currentDiarizerMode
         self.pendingJobCount = pendingJobCount
         self.gracePeriod = gracePeriod
         self.onDismissRequest = onDismissRequest
-        self.onComplete = onComplete
+        self.onAnswer = onAnswer
         // Seed `names` and `rerunCount` synchronously so the view renders
         // its fields and chip rows with the right contents on first body
         // evaluation. `.onAppear` re-runs the same logic for belt-and-braces,
@@ -94,6 +152,17 @@ struct SpeakerNamingView: View { // swiftlint:disable:this type_body_length
         1 ... mode.speakerCap
     }
 
+    /// Cap hint under the re-run controls. A dual-source job diarizes the app
+    /// track and the microphone track separately, so the cap holds for each
+    /// of them and the hint says so.
+    static func capHint(for mode: DiarizerMode, isDualSource: Bool) -> String {
+        let cap = mode.speakerCap
+        let scope = isDualSource
+            ? "\(cap) speakers in the call audio and \(cap) on your microphone"
+            : "\(cap) speakers"
+        return "\(mode.shortLabel) caps at \(scope) — switch to Offline for larger meetings."
+    }
+
     /// Identity of the current grace window. Changing it re-locks the buttons.
     var graceKey: NamingGraceKey {
         NamingGraceKey(revision: data.revision, pendingJobCount: pendingJobCount)
@@ -104,12 +173,9 @@ struct SpeakerNamingView: View { // swiftlint:disable:this type_body_length
     /// rows are expanded. A reference type held in `@State`, so a row's write
     /// is observable from outside the view (see `SpeakerNamingRowState`).
     @State private var rows: SpeakerNamingRowState
-    /// Job-ID for which this view has already fired `onComplete`. Tracked
-    /// per-job (not just a Bool) so that when the window switches to a
-    /// different pending job, the `Confirm` / `Skip` / `Re-run` buttons
-    /// are responsive again. Previous Bool-only guard could get stuck
-    /// across multi-job switching, leaving the dialog effectively dead.
-    @State private var completedJobID: UUID?
+    /// Which job this view has already answered for, and why the host refused
+    /// the last answer. See `NamingAnswerGate`.
+    @State private var answerGate = NamingAnswerGate()
     @State private var player: AVAudioPlayer?
     @State private var playingLabel: String?
     @State private var rerunMode: DiarizerMode = .offline
@@ -117,16 +183,28 @@ struct SpeakerNamingView: View { // swiftlint:disable:this type_body_length
     /// Number of "Known:" chips shown by default before "More…" appears.
     private static let knownChipsCollapsedLimit = 8
 
+    /// Width bounds of the dialog. The scene sizes the window to its content
+    /// (`.windowResizability(.contentSize)`), so the window is exactly as wide
+    /// as the content's ideal width allows. A chip row asked for its ideal
+    /// size gets no width to wrap at and answers with all chips on one line,
+    /// so without a maximum here a meeting with many participants, or an
+    /// expanded "More" list, opened the window several screens wide. Bounded,
+    /// the rows are offered a width and wrap. No fixed ideal width: the content
+    /// still sets it within these bounds, so the re-run row (a fixed 280 pt mode
+    /// picker, the stepper and the button) keeps the width it needs.
+    static let minWidth: CGFloat = 400
+    static let maxWidth: CGFloat = 900
+
     private var speakers: [(label: String, autoName: String?, speakingTime: Double)] {
         Self.computeSpeakers(from: data)
     }
 
     /// Re-run controls: mode picker, speaker-count Stepper, and Re-run button.
-    /// Stepper range narrows in Sortformer mode (1...4); mode-flip clamps
-    /// `rerunCount` to the new range. Re-run posts `.rerunWithMode(mode, count)`
-    /// when the picked mode differs from `currentDiarizerMode`, otherwise the
-    /// legacy `.rerun(count)` form (so consumers that don't care about
-    /// mode-switching stay unaffected).
+    /// Stepper range narrows in Sortformer mode (1...4) and Nemotron 3 mode
+    /// (1...8); mode-flip clamps `rerunCount` to the new range. Re-run posts
+    /// `.rerunWithMode(mode, count)` when the picked mode differs from
+    /// `currentDiarizerMode`, otherwise the legacy `.rerun(count)` form (so
+    /// consumers that don't care about mode-switching stay unaffected).
     private var rerunSection: some View {
         VStack(spacing: 6) {
             HStack(spacing: 8) {
@@ -146,22 +224,23 @@ struct SpeakerNamingView: View { // swiftlint:disable:this type_body_length
                 .accessibilityIdentifier(A11yID.rerunStepper)
                 rerunButton
             }
-            if currentDiarizerMode != nil, rerunMode == .sortformer {
-                Text("Sortformer caps at \(DiarizerMode.sortformer.speakerCap) speakers — switch to Offline for larger meetings.")
+            if currentDiarizerMode != nil, rerunMode != .offline {
+                Text(Self.capHint(for: rerunMode, isDualSource: data.isDualSource))
                     .font(.caption2)
                     .foregroundStyle(.secondary)
-                    .accessibilityIdentifier(A11yID.sortformerCapHint)
+                    .accessibilityIdentifier(A11yID.speakerCapHint)
             }
         }
     }
 
     private var rerunModePicker: some View {
         Picker("", selection: $rerunMode) {
-            Text("Sortformer").tag(DiarizerMode.sortformer)
-            Text("Offline").tag(DiarizerMode.offline)
+            Text(DiarizerMode.sortformer.shortLabel).tag(DiarizerMode.sortformer)
+            Text(DiarizerMode.offline.shortLabel).tag(DiarizerMode.offline)
+            Text(DiarizerMode.nemotron.shortLabel).tag(DiarizerMode.nemotron)
         }
         .pickerStyle(.segmented)
-        .frame(width: 200)
+        .frame(width: 280)
         .font(.caption)
         .accessibilityIdentifier(A11yID.rerunModePicker)
         .onChange(of: rerunMode) { _, newMode in
@@ -171,8 +250,6 @@ struct SpeakerNamingView: View { // swiftlint:disable:this type_body_length
 
     private var rerunButton: some View {
         Button("Re-run") {
-            guard completedJobID != data.jobID else { return }
-            completedJobID = data.jobID
             player?.stop()
             // `nil` currentDiarizerMode = legacy / enrollment caller that
             // doesn't track per-job mode → keep the legacy `.rerun(count)`
@@ -183,11 +260,7 @@ struct SpeakerNamingView: View { // swiftlint:disable:this type_body_length
             // the no-arg factory (current global setting), which can differ
             // from the recorded mode if the user touched Settings between
             // recording and re-run.
-            if currentDiarizerMode != nil {
-                onComplete(.rerunWithMode(rerunMode, rerunCount))
-            } else {
-                onComplete(.rerun(rerunCount))
-            }
+            answer(currentDiarizerMode != nil ? .rerunWithMode(rerunMode, rerunCount) : .rerun(rerunCount))
         }
         .font(.caption)
         .accessibilityIdentifier(A11yID.rerunButton)
@@ -227,6 +300,13 @@ struct SpeakerNamingView: View { // swiftlint:disable:this type_body_length
 
             rerunSection
 
+            if let refusalMessage = answerGate.refusalMessage ?? notice {
+                Text(refusalMessage)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .accessibilityIdentifier(A11yID.namingRefusalMessage)
+            }
+
             HStack(spacing: 12) {
                 // Deliberately no `.keyboardShortcut(.escape)`. Skip accepts the
                 // matcher's guesses and then deletes the naming data, so it is
@@ -236,16 +316,12 @@ struct SpeakerNamingView: View { // swiftlint:disable:this type_body_length
                 // Escape now closes the window instead (see `onDismissRequest`),
                 // which leaves the job pending and re-openable.
                 Button("Skip") {
-                    guard completedJobID != data.jobID else { return }
-                    completedJobID = data.jobID
-                    onComplete(.skipped)
+                    answer(.skipped)
                 }
                 .disabled(keyboardGracePeriodActive)
                 .accessibilityIdentifier(A11yID.skipButton)
 
                 Button("Confirm") {
-                    guard completedJobID != data.jobID else { return }
-                    completedJobID = data.jobID
                     confirm()
                 }
                 .keyboardShortcut(.return)
@@ -258,14 +334,14 @@ struct SpeakerNamingView: View { // swiftlint:disable:this type_body_length
             escapeDismissShortcut
         }
         .padding()
-        .frame(minWidth: 400, maxHeight: 700)
+        .frame(minWidth: Self.minWidth, maxWidth: Self.maxWidth, maxHeight: 700)
         .id(data.meetingTitle)
         .onAppear { resetForCurrentPresentation() }
         // After Re-run, lateDiarization replaces the SpeakerNamingData for
         // the same jobID. Watching `data.revision` (a fresh UUID per
         // instance) fires reliably even when the new mapping happens to be
         // byte-identical to the previous one — otherwise the per-job
-        // `completedJobID` guard kept Confirm/Skip/Re-run dead.
+        // answer gate kept Confirm/Skip/Re-run dead.
         .onChange(of: data.revision) { _, _ in
             resetForCurrentPresentation()
         }
@@ -305,7 +381,7 @@ struct SpeakerNamingView: View { // swiftlint:disable:this type_body_length
         // No onDisappear → .skipped: in the non-blocking architecture closing
         // the window (Cmd+Q, click X, app quit) leaves the job in
         // .speakerNamingPending so the user can re-open later. Explicit Skip
-        // button still calls onComplete(.skipped).
+        // button still answers `.skipped`.
     }
 
     /// Zero-sized carrier for the Escape key equivalent, present only when the
@@ -333,7 +409,7 @@ struct SpeakerNamingView: View { // swiftlint:disable:this type_body_length
     /// `revision` and not `mapping` on purpose: a re-diarization can produce a
     /// byte-equal `mapping`, and comparing that would swallow the reset.
     private func resetForCurrentPresentation() {
-        completedJobID = nil
+        answerGate.reset()
         rows.reset(names: Self.computeInitialNames(speakers: speakers))
         // Re-seed `rerunMode` from the prop so cross-job dialog switches
         // (same view identity, different data) start with the correct
@@ -407,7 +483,7 @@ struct SpeakerNamingView: View { // swiftlint:disable:this type_body_length
 
     /// A plain `TextField`, on purpose: it takes a fresh binding on every update,
     /// so nothing parked on the field can outlive the row's position (issue #700).
-    /// Why it is no longer the `NSViewRepresentable` it once was: see CLAUDE.md (#702).
+    /// Why it is no longer the `NSViewRepresentable` it once was: see issue #702.
     private func nameField(for label: String) -> some View {
         TextField("Name", text: nameBinding(for: label))
             .textFieldStyle(.roundedBorder)
@@ -536,28 +612,18 @@ struct SpeakerNamingView: View { // swiftlint:disable:this type_body_length
             return
         }
 
-        guard let audioPath = data.audioPath else { return }
-
-        // Pick the longest pure segment to avoid cross-voice contamination.
+        // Pick the longest pure segment to avoid cross-voice contamination,
+        // and play it from the speaker's own track where there is one.
         guard let chosen = Self.selectSampleSegment(for: label, in: data.segments) else { return }
+        let sources = data.sampleSources(for: chosen)
+        let loadSample = sampleLoader
 
         // Perform file I/O off the main thread
-        Task.detached { [audioPath, chosen] in
+        Task.detached { [sources, loadSample] in
             do {
-                let (samples, sampleRate) = try await AudioMixer.loadAudioAsFloat32(url: audioPath)
-                guard let range = Self.sampleRange(
-                    start: chosen.start,
-                    end: chosen.end,
-                    sampleRate: sampleRate,
-                    totalSamples: samples.count,
-                ) else { return }
+                guard let snippet = loadSample(sources) else { return }
 
-                let snippet = Array(samples[range])
-                let tmpPath = FileManager.default.temporaryDirectory
-                    .appendingPathComponent("speaker_\(label).wav")
-                try AudioMixer.saveWAV(samples: snippet, sampleRate: sampleRate, url: tmpPath)
-
-                let newPlayer = try AVAudioPlayer(contentsOf: tmpPath)
+                let newPlayer = try AVAudioPlayer(data: snippet)
                 let duration = newPlayer.duration
 
                 await MainActor.run {
@@ -596,7 +662,12 @@ struct SpeakerNamingView: View { // swiftlint:disable:this type_body_length
     private func confirm() {
         player?.stop()
         let mapping = Self.buildSpeakerMapping(speakers: speakers, names: rows.names)
-        onComplete(.confirmed(mapping))
+        answer(.confirmed(mapping))
+    }
+
+    /// Hand an answer over at most once per job (`NamingAnswerGate`).
+    private func answer(_ result: PipelineQueue.SpeakerNamingResult) {
+        answerGate.submit(jobID: data.jobID) { onAnswer(result) }
     }
 
     // MARK: - Pure Functions (testable without UI)

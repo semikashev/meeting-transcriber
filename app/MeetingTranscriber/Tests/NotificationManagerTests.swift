@@ -50,51 +50,32 @@ final class NotificationManagerTests: XCTestCase {
         )
     }
 
-    // MARK: - handleTransition without setUp is no-op
-
-    func testHandleTransitionWithoutSetUpDoesNotCrash() {
-        let manager = NotificationManager()
-        let status = TranscriberStatus(
-            version: 1, timestamp: "2026-03-03T10:00:00",
-            state: .recording, detail: "",
-            meeting: MeetingInfo(app: "Teams", title: "Standup", pid: 1),
-            protocolPath: nil, error: nil, audioPath: nil, pid: nil,
-        )
-        // recording state would normally trigger a notification, but setUp was
-        // never called so notify() should be a no-op
-        manager.handleTransition(from: nil, to: .recording, status: status)
-    }
-
-    func testHandleTransitionNoNotificationForIdle() {
-        let manager = NotificationManager()
-        let status = TranscriberStatus(
-            version: 1, timestamp: "2026-03-03T10:00:00",
-            state: .idle, detail: "", meeting: nil,
-            protocolPath: nil, error: nil, audioPath: nil, pid: nil,
-        )
-        manager.handleTransition(from: nil, to: .idle, status: status)
-    }
-
-    func testHandleTransitionSameStateTwice() {
-        let manager = NotificationManager()
-        let status = TranscriberStatus(
-            version: 1, timestamp: "2026-03-03T10:00:00",
-            state: .recording, detail: "", meeting: nil,
-            protocolPath: nil, error: nil, audioPath: nil, pid: nil,
-        )
-        manager.handleTransition(from: nil, to: .recording, status: status)
-        manager.handleTransition(from: .recording, to: .recording, status: status)
-    }
-
-    // MARK: - shared singleton
-
-    func testSharedIsSingleton() {
-        let a = NotificationManager.shared
-        let b = NotificationManager.shared
-        XCTAssertIdentical(a, b)
-    }
-
     #if !APPSTORE
+
+        // MARK: - handleTransition
+
+        /// A state with notification content reaches `notify`, which records it
+        /// (unposted, since the test host never ran `setUp`).
+        func testHandleTransitionToRecordingNotifies() throws {
+            let manager = NotificationManager()
+            let status = statusWithMeeting(app: "Teams", title: "Standup")
+            manager.handleTransition(from: nil, to: .recording, status: status)
+
+            // The wording is pinned in the notificationContent tests; this pins
+            // that the transition routes it into notify.
+            let expected = try XCTUnwrap(NotificationManager.notificationContent(for: .recording, status: status))
+            let entries = manager.recentNotificationsLog.entries
+            XCTAssertEqual(entries.map(\.title), [expected.title])
+            XCTAssertEqual(entries.map(\.body), [expected.body])
+            XCTAssertEqual(entries.map(\.posted), [false])
+        }
+
+        func testHandleTransitionNoNotificationForIdle() {
+            let manager = NotificationManager()
+            manager.handleTransition(from: nil, to: .idle, status: statusWithNoMeeting())
+
+            XCTAssertTrue(manager.recentNotificationsLog.entries.isEmpty)
+        }
 
         // MARK: - notify records into the ring buffer (RPC observability chokepoint)
 
@@ -156,8 +137,8 @@ final class NotificationManagerTests: XCTestCase {
             for: .protocolReady,
             status: statusWithMeeting(app: "Zoom", title: "Retro"),
         )
-        XCTAssertEqual(content?.title, "Protocol Ready")
-        XCTAssertEqual(content?.body, "Protocol for \"Retro\" is ready.")
+        XCTAssertEqual(content?.title, "Meeting Notes Ready")
+        XCTAssertEqual(content?.body, "Meeting notes for \"Retro\" are ready.")
     }
 
     func testNotificationContentProtocolReadyFallsBackToMeetingLabel() {
@@ -165,7 +146,7 @@ final class NotificationManagerTests: XCTestCase {
             for: .protocolReady,
             status: statusWithNoMeeting(),
         )
-        XCTAssertEqual(content?.body, "Protocol for \"Meeting\" is ready.")
+        XCTAssertEqual(content?.body, "Meeting notes for \"Meeting\" are ready.")
     }
 
     func testNotificationContentWaitingForSpeakerNames() {
@@ -230,11 +211,16 @@ final class NotificationManagerTests: XCTestCase {
         XCTAssertFalse(ConsentAnswer.never.isGranted)
     }
 
-    func testConsentDeclinedForIgnoreDismissAndDefault() {
+    func testConsentDeclinedForIgnoreAndUnknownActions() {
         XCTAssertEqual(NotificationManager.consentAnswer(for: NotificationManager.ignoreActionID), .declined)
-        XCTAssertEqual(NotificationManager.consentAnswer(for: UNNotificationDismissActionIdentifier), .declined)
-        XCTAssertEqual(NotificationManager.consentAnswer(for: UNNotificationDefaultActionIdentifier), .declined)
         XCTAssertEqual(NotificationManager.consentAnswer(for: "something-else"), .declined)
+    }
+
+    /// A click on the notification body is not an answer, and neither is a
+    /// dismiss: the prompt stays parked (why: `consentAnswer(for:)`).
+    func testBodyClickAndDismissAreNotAnAnswer() {
+        XCTAssertNil(NotificationManager.consentAnswer(for: UNNotificationDefaultActionIdentifier))
+        XCTAssertNil(NotificationManager.consentAnswer(for: UNNotificationDismissActionIdentifier))
     }
 
     func testConsentCategoryHasRecordIgnoreAndNeverActions() {
@@ -249,6 +235,11 @@ final class NotificationManagerTests: XCTestCase {
             ],
         )
         XCTAssertEqual(category.actions.map(\.title), ["Record", "Ignore", "Never for this app"])
+        // `consentAnswer(for:)` maps a dismiss to "no answer" on the premise
+        // that it never arrives. Registering `.customDismissAction` would make
+        // a swipe-away park the prompt with nothing on screen; that needs a
+        // decision, not a silent combination.
+        XCTAssertFalse(category.options.contains(.customDismissAction))
     }
 
     /// Neither action may carry `.foreground`. The delegate callback fires

@@ -54,25 +54,32 @@ jobs:
     # Non-PR events (push/dispatch) always run. PR events run only for
     # same-repo branches carrying the `run-e2e` label; the label-name check
     # keeps `labeled` events for any OTHER label from starting a duplicate.
+    # A Dependabot PR (a same-repo branch, so the repo check lets it
+    # through) runs only on a run a person started: the label is applied by a
+    # person, but without the actor check it would stay a standing approval
+    # for every later Dependabot push to the branch, which is dependency code
+    # nobody has read. `triggering_actor`, not `actor`: on a re-run `actor`
+    # stays the bot, so only `triggering_actor` lets a maintainer's re-run in.
     if: |
       github.event_name != 'pull_request' ||
       (
         contains(github.event.pull_request.labels.*.name, 'run-e2e') &&
         github.event.pull_request.head.repo.full_name == github.repository &&
+        (github.event.pull_request.user.login != 'dependabot[bot]' || github.triggering_actor != 'dependabot[bot]') &&
         (github.event.action != 'labeled' || github.event.label.name == 'run-e2e')
       )
     runs-on: [self-hosted, macOS, ARM64]
     # Cold-cache runs download multi-GB models (WhisperKit ~1 GB,
-    # Parakeet ~50 MB); hot runs <10 min. 30 min job
-    # budget covers worst-case cold download. The `Run E2E tests` step
-    # below has a 25 min step-timeout so a hang surfaces as `timed_out`
-    # — see docs/plans/.local/open/2026-05-11-job-timeout-visibility.md.
-    timeout-minutes: 30
+    # Parakeet ~50 MB); hot runs <10 min. The runner-home pre-warm (20 min)
+    # and the `Run E2E tests` step (25 min) each carry a step-timeout so a
+    # hang surfaces as `timed_out`; the job budget holds both plus the
+    # fault-injection parser tests (10 min).
+    timeout-minutes: 60
     env:
       E2E_ENABLED: "1"
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - uses: ./.github/actions/verify-xcode
 
@@ -90,12 +97,58 @@ jobs:
 
       # No actions/cache here: the self-hosted Mini has persistent disk
       # between runs, so the SPM `.build` directory and the on-disk model
-      # caches (~/Documents/huggingface, ~/Library/Application Support/
-      # FluidAudio) are already populated. actions/cache would re-download
+      # caches are already populated. actions/cache would re-download
       # via HTTPS on hit and waste the multi-GB upload on miss — the
       # latter timed out the post-action on a real run (5.6 GB → GitHub).
+      #
+      # Those caches are in the runner's own test home (see the action). The
+      # run is serial, so a cold home would not race, but the test step's 25
+      # min are sized for warm models: the pre-warm fetches them in a step of
+      # its own instead, bounded separately and reusing this lane's build, and
+      # is a file check once warm. It fetches every pre-warmed model, also for
+      # a dispatch narrowed to one engine: a one-time cost per runner home.
+      - id: home
+        uses: ./.github/actions/runner-home
+        timeout-minutes: 20
+        with:
+          prewarm: "true"
+
+      # For the MKV and WebM legs of WhisperKitE2ETests' format sweep.
+      - uses: ./.github/actions/setup-ffmpeg
+
+      # RunnerHomeIsolationTests is added to the filter so this lane, too,
+      # fails if it ever runs in the account's real home.
       - name: Run E2E tests
         timeout-minutes: 25
+        env:
+          CFFIXED_USER_HOME: ${{ steps.home.outputs.home }}
+        run: |
+          set -o pipefail
+          cd app/MeetingTranscriber
+          swift test --filter '${{ steps.filter.outputs.filter }}|RunnerHomeIsolationTests' 2>&1 \
+            | tee "$RUNNER_TEMP/e2e-test.log"
+
+      # The lane's model tests sit behind XCTSkip gates and `swift test` exits
+      # 0 on a skip, so a test that stops running here would keep the run
+      # green. SortformerEmbeddingsE2ETests matches the filter by name but
+      # is gated on RUN_QUALITY_TESTS and runs in quality-and-safety.yml.
+      - name: Fail on skipped tests
+        run: |
+          bash scripts/ci/fail-on-skipped-tests.sh "$RUNNER_TEMP/e2e-test.log" \
+            SortformerEmbeddingsE2ETests
+
+      # E2EMicFaultTests exists only in a -DE2E_FAULT_INJECTION build, like the
+      # type it tests, so no other `swift test` in CI ever compiled it: the
+      # parser that picks the fault for the mic-device-change and mic-stall
+      # lanes had tests that ran nowhere. Its own scratch path, because the
+      # flag changes every object file and must not turn the build the step
+      # above just made into a different one. That costs one more build of the
+      # package (about half a minute on this runner) for five parser tests.
+      - name: Run fault-injection parser tests
+        timeout-minutes: 10
+        env:
+          CFFIXED_USER_HOME: ${{ steps.home.outputs.home }}
         run: |
           cd app/MeetingTranscriber
-          swift test --filter '${{ steps.filter.outputs.filter }}'
+          swift test -Xswiftc -DE2E_FAULT_INJECTION --scratch-path .build-fault \
+            --filter 'E2EMicFaultTests|RunnerHomeIsolationTests'

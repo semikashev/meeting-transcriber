@@ -19,7 +19,15 @@ import Foundation
 enum A11yID {
     // Settings — section anchors + record-only controls.
     static let recordOnlyToggle = "recordOnlyToggle"
+    static let autoWatchToggle = "autoWatchToggle"
+    /// Stays off the `/ui/press` allowlist: a live press would add a real login item.
+    static let launchAtLoginToggle = "launchAtLoginToggle"
+    static let launchAtLoginHint = "launchAtLoginHint"
+    static let startRecordingsMicMutedToggle = "startRecordingsMicMutedToggle"
+    static let micMuteHotkeyButton = "micMuteHotkeyButton"
+    static let micMuteHotkeyConflict = "micMuteHotkeyConflict"
     static let watchBrowserToggle = "watchBrowserToggle"
+    static let watchSlackToggle = "watchSlackToggle"
     static let browserAutoRecordTitlesField = "browserAutoRecordTitlesField"
     static let calendarTitlesToggle = "calendarTitlesToggle"
     static let autoRecordCalendarMeetingsToggle = "autoRecordCalendarMeetingsToggle"
@@ -48,32 +56,108 @@ enum A11yID {
         "jobRetryButton.\(index)"
     }
 
+    static func jobNotionRetryButton(_ index: Int) -> String {
+        "jobNotionRetryButton.\(index)"
+    }
+
+    static func jobNotesRetryButton(_ index: Int) -> String {
+        "jobNotesRetryButton.\(index)"
+    }
+
+    static let retryAllMeetingNotesButton = "retryAllMeetingNotesButton"
+    static let generateNotesFromTranscriptButton = "generateNotesFromTranscriptButton"
+
+    /// Menu bar items that answer an open browser consent prompt.
+    static let menuRecordPendingConsent = "menuRecordPendingConsent"
+    static let menuDeclinePendingConsent = "menuDeclinePendingConsent"
+
     static let recordOnlyBanner = "recordOnlyBanner"
+    /// Settings → Advanced: the line saying where the diagnostics export went.
+    static let diagnosticExportStatus = "diagnosticExportStatus"
+    static let accessibilityPermissionRow = "accessibilityPermissionRow"
     static let transcriptionSection = "transcriptionSection"
+    static let unloadModelsWhenIdleToggle = "unloadModelsWhenIdleToggle"
+    static let vocabularySection = "vocabularySection"
+    /// Opens a confirmation dialog, so it stays off the `/ui/press` allowlist.
+    static let legacyWhisperModelsTrashButton = "legacyWhisperModelsTrashButton"
+
+    /// Per-variant checkbox in the old-models row, addressed by ROW INDEX like
+    /// `consentDeniedAppRemove`.
+    static func legacyWhisperModelToggle(_ index: Int) -> String {
+        "legacyWhisperModelToggle.\(index)"
+    }
+
     static let protocolSection = "protocolSection"
+    static let protocolProviderSection = "protocolProviderSection"
+    static let openAIConnectionSection = "openAIConnectionSection"
+    static let notifyOnMeetingNotesFailureToggle = "notifyOnMeetingNotesFailureToggle"
     static let includeFullTranscriptToggle = "includeFullTranscriptToggle"
     static let saveRawTranscriptToggle = "saveRawTranscriptToggle"
     static let useAITitleForFilenamesToggle = "useAITitleForFilenamesToggle"
+    static let openAIAPIKeyField = "openAIAPIKeyField"
+    static let openAIEndpointField = "openAIEndpointField"
+    static let openAIModelField = "openAIModelField"
+    static let claudeAPIKeyBillingNote = "claudeAPIKeyBillingNote"
+    static let openAIConnectionPicker = "openAIConnectionPicker"
+    static let openAIConnectionRenameButton = "openAIConnectionRenameButton"
+    static let openAIRefreshModelsButton = "openAIRefreshModelsButton"
+    static let openAIAdvancedToggle = "openAIAdvancedToggle"
+    static let openAIConnectionAddButton = "openAIConnectionAddButton"
+    static let openAIConnectionDeleteButton = "openAIConnectionDeleteButton"
+    static let claudeAPIKeyField = "claudeAPIKeyField"
+    static let openAIAPIKeyPlacementPicker = "openAIAPIKeyPlacementPicker"
+    static let openAIAPIKeyHeaderNameField = "openAIAPIKeyHeaderNameField"
+    static let openAIAPIKeyHeaderNameWarning = "openAIAPIKeyHeaderNameWarning"
+    static let openAITemperatureToggle = "openAITemperatureToggle"
+    static let openAITemperatureValue = "openAITemperatureValue"
+    static let openAITopPToggle = "openAITopPToggle"
+    static let openAITopPValue = "openAITopPValue"
+    static let notionSection = "notionSection"
+    static let notionExportToggle = "notionExportToggle"
+    static let notionConfigurationNotice = "notionConfigurationNotice"
+    static let notionSkipLocalMarkdownToggle = "notionSkipLocalMarkdownToggle"
+    static let notionSpeakerTagsToggle = "notionSpeakerTagsToggle"
+    static let notionConfirmDatabaseButton = "notionConfirmDatabaseButton"
+    static let notionAPIKeyField = "notionAPIKeyField"
+    static let notionDatabasePicker = "notionDatabasePicker"
+    static let notionDatabaseIDField = "notionDatabaseIDField"
+    static let notionTestConnectionButton = "notionTestConnectionButton"
+    static let notionParentPagePicker = "notionParentPagePicker"
+    static let notionParentPageField = "notionParentPageField"
+    static let notionInitDatabaseButton = "notionInitDatabaseButton"
+    static let notionUpgradeSchemaButton = "notionUpgradeSchemaButton"
+    static let notionRefreshButton = "notionRefreshButton"
     static let outputFolderSection = "outputFolderSection"
+    static let recordingRetentionToggle = "recordingRetentionToggle"
     static let vadSection = "vadSection"
+    static let staleNamingTimeoutPicker = "staleNamingTimeoutPicker"
     static let echoCancellationToggle = "echoCancellationToggle"
     static let echoDedupToggle = "echoDedupToggle"
     static let diarizationSection = "diarizationSection"
+    static let autoOpenSpeakerNamingToggle = "autoOpenSpeakerNamingToggle"
     static let liveTranscriptionSection = "liveTranscriptionSection"
     static let liveCaptionsOverlayToggle = "liveCaptionsOverlayToggle"
     static let liveCaptionsSizePicker = "liveCaptionsSizePicker"
+    static let liveCaptionsWarmupStatus = "liveCaptionsWarmupStatus"
+    static let liveCaptionsWarmupElapsed = "liveCaptionsWarmupElapsed"
     static let channelIndicatorSection = "channelIndicatorSection"
     static let silentTrackWatchdogToggle = "silentTrackWatchdogToggle"
     static let experimentalTuningDisclosure = "experimentalTuningDisclosure"
-    static let sortformerCapHint = "sortformer-cap-hint"
+    static let speakerCapHint = "speaker-cap-hint"
 
     /// Mic speaker-name field (Settings → Speakers). The `/ui/type` allowlist's
     /// only entry: a plain, non-secret text field whose write-back is readable in
     /// `/state`, which is what makes it a usable text-entry probe.
     static let micNameField = "micNameField"
     static let customVocabularyPathField = "customVocabularyPathField"
-    static let whisperKitVocabularyPromptToggle = "whisperKitVocabularyPromptToggle"
+    static let customVocabularyToggle = "customVocabularyToggle"
+    static let whisperKitModelPicker = "whisperKitModelPicker"
+    static let whisperKitCustomRepoField = "whisperKitCustomRepoField"
+    static let whisperKitCustomVariantField = "whisperKitCustomVariantField"
+    static let whisperKitCustomModelFolderField = "whisperKitCustomModelFolderField"
     static let terminologyRulesEditor = "terminologyRulesEditor"
+    static let terminologyRulesFilePathField = "terminologyRulesFilePathField"
+    static let terminologyRulesFilePreview = "terminologyRulesFilePreview"
 
     /// Settings sidebar row for one tab (`settings-tab-<rawValue>`). The detail
     /// pane renders only the selected tab, so a control in another tab is absent
@@ -97,6 +181,9 @@ enum A11yID {
     static let voiceSampleRemoveButton = "voice-sample-remove-button"
     static let voiceSamplePinButton = "voice-sample-pin-button"
     static let voiceUndoMeetingButton = "voice-undo-meeting-button"
+    // About tab, update actions: one per install route.
+    static let updateDownload = "update-download"
+    static let updateCopyBrewCommand = "update-copy-brew-command"
 
     // Speaker-naming dialog.
     static let confirmButton = "confirm-button"
@@ -104,6 +191,12 @@ enum A11yID {
     static let rerunButton = "rerun-button"
     static let rerunStepper = "rerun-stepper"
     static let rerunModePicker = "rerun-mode-picker"
+    /// The pending-meeting menu at the top of the naming window, shown once
+    /// more than one meeting waits. `scripts/drive-naming-field.swift
+    /// select-job` finds it by this value.
+    static let namingJobPicker = "naming-job-picker"
+    /// Why the session did not take the last answer (`SpeakerNamingRefusal`).
+    static let namingRefusalMessage = "naming-refusal-message"
 
     /// Per-speaker play button (`play-<label>`); the label varies at runtime.
     static func play(_ speakerLabel: String) -> String {

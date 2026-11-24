@@ -9,7 +9,7 @@ import XCTest
 /// that breaks file move semantics or sidecar JSON shape surfaces against
 /// realistic content. They also exercise the auto-detect entry point (vs the
 /// existing manual-recording entry point) so a refactor that touches one
-/// `enqueueRecording` caller without the other is caught.
+/// `stopAndEnqueue` caller without the other is caught.
 @MainActor
 final class RecordOnlyE2ETests: XCTestCase { // swiftlint:disable:this balanced_xctest_lifecycle
     // swiftlint:disable implicitly_unwrapped_optional
@@ -70,7 +70,7 @@ final class RecordOnlyE2ETests: XCTestCase { // swiftlint:disable:this balanced_
 
     func test_handleMeeting_recordOnly_writeFailure_notifiesAndDoesNotEnqueue() async throws {
         // `/dev/null/...` makes `createDirectory(at:)` throw, hitting the
-        // error branch in `writeRecordOnlySidecar`.
+        // error branch in `writeRecordOnlyOffMain`.
         let unwritable = URL(fileURLWithPath: "/dev/null/cannot-write")
         let loop = makeRecordOnlyLoop(outputDir: unwritable)
 
@@ -120,7 +120,7 @@ final class RecordOnlyE2ETests: XCTestCase { // swiftlint:disable:this balanced_
             pollInterval: 0.05,
             endGracePeriod: 0.1,
             maxDuration: 10,
-            noMic: false,
+            noMic: { false },
             recordOnly: { true },
             recordOnlyDestination: { .unscoped(outputDir) },
             notifier: notifier,

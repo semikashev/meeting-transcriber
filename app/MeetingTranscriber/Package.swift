@@ -2,6 +2,26 @@
 
 import PackageDescription
 
+// Type-check gate for both targets. Surfaces accidental compile-time blowups:
+// pathological generic-overload search or deeply nested SwiftUI builders take
+// seconds to type-check.
+//
+// 1000 ms, not the 100 ms often recommended, because the timer also counts the
+// lazy `@Observable` expansion of a type declared in another file, charged to
+// whichever body first touches it in a compile job. For `AppSettings` and
+// `PipelineQueue` that is about 50 to 70 ms each on an M-series Mac, so a
+// 10-line body that touches both measures over 100 ms on its own, and 300 to
+// 430 ms on a loaded CI runner while the body itself takes 1 ms. Rewriting the
+// body only moves the cost to the next first toucher.
+//
+// The expression timer is charged the same way (53 ms on the first
+// `settings.watchApps` expression in `defaultDetectors`), so both flags move
+// together. Raised from 300 ms.
+let typeCheckGate: SwiftSetting = .unsafeFlags([
+    "-Xfrontend", "-warn-long-function-bodies=1000",
+    "-Xfrontend", "-warn-long-expression-type-checking=1000",
+])
+
 let package = Package(
     name: "MeetingTranscriber",
     platforms: [.macOS(.v14)],
@@ -9,11 +29,16 @@ let package = Package(
         .package(url: "https://github.com/nalexn/ViewInspector", from: "0.10.5"),
         .package(url: "https://github.com/pointfreeco/swift-snapshot-testing", from: "1.19.1"),
         .package(url: "https://github.com/argmaxinc/WhisperKit.git", from: "1.0.0"),
-        // 0.15.5 is the first release whose offline diarizer reads the
-        // `computeUnits` of the configuration passed to `prepareModels`.
-        // Before it the argument compiles and is silently ignored, which
-        // would put the Metal routing back with no diagnostic.
-        .package(url: "https://github.com/FluidInference/FluidAudio.git", from: "0.15.5"),
+        // Floor 0.17.4, for two reasons. API: `Nemotron3Diarizer` streaming
+        // (`appendAudio` / `finishStream`) exists since 0.17.0. Behaviour:
+        // the Nemotron 3 bundles that 0.17.0 to 0.17.3 load do not compile for
+        // the Neural Engine on M3-class Macs (upstream issue 951); 0.17.2
+        // stops the resulting first-prediction failure by retrying without the
+        // fixed output buffers, and 0.17.4 loads the re-exported
+        // `monolithic/v2` bundles that compile there. It also keeps the older
+        // 0.15.5 floor, below which the offline diarizer silently ignores the
+        // `computeUnits` passed to `prepareModels` and falls back to Metal.
+        .package(url: "https://github.com/FluidInference/FluidAudio.git", from: "0.17.4"),
         .package(path: "../../tools/audiotap"),
     ],
     targets: [
@@ -53,9 +78,11 @@ let package = Package(
                 "CLocalVQE",
             ],
             path: "Sources",
-            // Assets.xcassets is compiled by `actool` in scripts/build_release.sh,
-            // not by SPM. Excluding silences "unhandled file" warnings without
-            // changing the runtime bundle.
+            // Assets.xcassets is never compiled as a catalog, by SPM or anything
+            // else: scripts/build_release.sh copies the PNGs out of its
+            // AppIcon.appiconset and turns them into AppIcon.icns with
+            // `iconutil -c icns`. Excluding it silences "unhandled file" warnings
+            // without changing the runtime bundle.
             exclude: ["Info.plist", "Assets.xcassets"],
             // Treat any new compiler warning as a build failure so deprecations
             // and concurrency hints are caught at PR time, not on a future
@@ -63,16 +90,7 @@ let package = Package(
             // to WhisperKit/FluidAudio.
             swiftSettings: [
                 .treatAllWarnings(as: .error),
-                // Surface accidental compile-time blowups. Type-checking a
-                // function body or expression beyond 300 ms is almost always
-                // a sign of pathological generic-overload search or deeply
-                // nested SwiftUI builders. Apple recommends 100 ms; 300 ms
-                // is the historical pre-Swift-6 setting that turned out to
-                // be sustainable once strict-concurrency analysis settled.
-                .unsafeFlags([
-                    "-Xfrontend", "-warn-long-function-bodies=300",
-                    "-Xfrontend", "-warn-long-expression-type-checking=300",
-                ]),
+                typeCheckGate,
                 .enableUpcomingFeature("ExistentialAny"),
             ],
             linkerSettings: [
@@ -98,10 +116,7 @@ let package = Package(
             exclude: ["Fixtures", "__Snapshots__"],
             swiftSettings: [
                 .treatAllWarnings(as: .error),
-                .unsafeFlags([
-                    "-Xfrontend", "-warn-long-function-bodies=300",
-                    "-Xfrontend", "-warn-long-expression-type-checking=300",
-                ]),
+                typeCheckGate,
                 .enableUpcomingFeature("ExistentialAny"),
             ]
         ),

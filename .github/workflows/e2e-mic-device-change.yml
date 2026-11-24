@@ -46,7 +46,12 @@ jobs:
     timeout-minutes: 20
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      # See the same step in e2e-app.yml: the lane works in ~/Downloads.
+      - name: Preflight TCC grants
+        timeout-minutes: 2
+        run: bash scripts/ci/tcc-preflight.sh --downloads
 
       - uses: ./.github/actions/verify-xcode
 
@@ -71,7 +76,7 @@ jobs:
 
       - name: Upload simulator log
         if: failure()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: meeting-simulator.log
           path: /tmp/e2e-app-sim.log
@@ -90,6 +95,12 @@ jobs:
           DEVELOPER_ID: ${{ secrets.DEVELOPER_ID }}
         timeout-minutes: 5
         run: bash scripts/e2e-app.sh --redeploy-only
+
+      # See the same step in e2e-app.yml.
+      - name: End e2e drivers a step timeout left behind
+        if: always()
+        timeout-minutes: 3
+        run: source scripts/lib/e2e-helpers.sh && e2e_reap_registered_drivers
 
       - name: Cleanup signing keychain
         if: always() && env.E2E_SIGNING_KEYCHAIN != ''

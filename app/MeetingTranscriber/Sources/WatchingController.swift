@@ -27,7 +27,16 @@ import Observation
 @Observable
 @MainActor
 final class WatchingController {
-    var watchLoop: WatchLoop?
+    var watchLoop: WatchLoop? {
+        didSet {
+            if let watchLoop { builtLoops.add(watchLoop) }
+            watchLoop?.onMicMuteAvailabilityChange = { [weak self] in self?.syncMicMuteHotkey() }
+            syncMicMuteHotkey()
+        }
+    }
+
+    /// Registered only while a recording can be muted; otherwise the keys reach the frontmost app.
+    let micMuteHotkeyRegistrar: any HotkeyRegistering
 
     /// Non-nil while `toggleWatching`'s async start is in flight — it awaits mic
     /// access before `watchLoop` is assigned, so without this a second toggle in
@@ -37,6 +46,11 @@ final class WatchingController {
 
     /// See `defaultStartJoinTimeout`.
     private let startJoinTimeout: Duration
+
+    /// What `startJoinTimeout` is measured on. The continuous clock in
+    /// production; a test passes one it advances itself, so it can let the
+    /// bound pass at a point it chooses instead of timing a real wait.
+    private let joinClock: any Clock<Duration>
 
     /// Set while `startManualRecording` is in flight, i.e. from the call until
     /// `watchLoop` holds the manual loop. `startTask`'s counterpart for the
@@ -51,12 +65,21 @@ final class WatchingController {
     /// Set by `finishForQuit`: a start parked on a permission prompt gives up.
     var isQuitting = false
 
+    /// Shared by every loop built here; see `WatchingController+Quit`.
+    let unfinishedRecordingWork = UnfinishedWork()
+    /// Every loop `watchLoop` has held that is still alive (weakly); see
+    /// `WatchingController+Quit`.
+    let builtLoops = NSHashTable<WatchLoop>.weakObjects()
+
     let settings: AppSettings
     let notifier: any AppNotifying
     private let pipeline: PipelineController
     let channelHealth: ChannelHealthController
     private let permissions: PermissionsController
     let liveTranscription: LiveTranscriptionCoordinator
+
+    /// Test seam for `startCaptionFlush()`; nil flushes `liveTranscription`.
+    let captionFlushOverride: (@MainActor () -> Void)?
 
     /// Microphone-access gate. Injectable so tests skip the real TCC prompt; the
     /// return value is intentionally ignored (the loop is created regardless, and
@@ -82,8 +105,9 @@ final class WatchingController {
     /// Accessibility request, fired at watch start. Injectable so tests skip
     /// the real TCC prompt.
     ///
-    /// `PermissionHealthCheck` already reports a missing Accessibility grant as
-    /// a problem — red menu-bar badge plus a notification — because
+    /// Where the build can use the grant (`PermissionHealthCheck.accessibilityApplies`),
+    /// `PermissionHealthCheck` reports a missing one as a problem, a red
+    /// menu-bar badge plus a notification, because
     /// `ParticipantReader` needs it to read the Teams roster via
     /// `AXUIElementCreateApplication`. Without this call nothing ever showed the
     /// prompt, so the app diagnosed the problem but never offered the fix and
@@ -99,8 +123,8 @@ final class WatchingController {
     /// otherwise raises a system alert three seconds after every launch with no
     /// click of any kind; only when `watchTeams` is on, since the roster read is
     /// the grant's sole consumer and is itself Teams-gated; and the production
-    /// default is compiled out of the sandboxed build, which cannot use the API
-    /// against another process at all.
+    /// default does nothing in the sandboxed build, where
+    /// `PermissionHealthCheck.accessibilityApplies` is false.
     ///
     /// The result is ignored, like the other two gates. Watching, capture and
     /// transcription all work without the grant, so a refusal must not block the
@@ -138,24 +162,30 @@ final class WatchingController {
         ensureMicAccess: @escaping () async -> Bool = { await Permissions.ensureMicrophoneAccess() },
         requestScreenRecording: @escaping () -> Void = { Permissions.ensureScreenRecordingAccess() },
         requestAccessibility: @escaping () -> Void = {
-            #if !APPSTORE
+            if PermissionHealthCheck.accessibilityApplies {
                 Permissions.ensureAccessibilityAccess()
-            #endif
+            }
         },
         startJoinTimeout: Duration = WatchingController.defaultStartJoinTimeout,
+        joinClock: any Clock<Duration> = ContinuousClock(),
         makeDetector: (() -> any MeetingDetecting)? = nil,
         makeRecorder: @escaping @MainActor () -> any RecordingProvider = { DualSourceRecorder() },
+        captionFlushOverride: (@MainActor () -> Void)? = nil,
+        micMuteHotkeyRegistrar: any HotkeyRegistering = GlobalHotkeyRegistrar(),
     ) {
+        self.micMuteHotkeyRegistrar = micMuteHotkeyRegistrar
         self.settings = settings
         self.notifier = notifier
         self.pipeline = pipeline
         self.channelHealth = channelHealth
         self.permissions = permissions
         self.liveTranscription = liveTranscription
+        self.captionFlushOverride = captionFlushOverride
         self.ensureMicAccess = ensureMicAccess
         self.requestScreenRecording = requestScreenRecording
         self.requestAccessibility = requestAccessibility
         self.startJoinTimeout = startJoinTimeout
+        self.joinClock = joinClock
         self.makeRecorder = makeRecorder
         // Tests inject a deterministic detector; production defaults to one
         // filtered by the "Apps to Watch" toggles, re-read at each watch start.
@@ -164,7 +194,7 @@ final class WatchingController {
         }
         // See `PipelineController.onQueueReplaced`.
         pipeline.onQueueReplaced = { [weak self] queue in
-            self?.watchLoop?.pipelineQueue = queue
+            self?.builtLoops.allObjects.forEach { $0.pipelineQueue = queue }
         }
     }
 
@@ -176,31 +206,38 @@ final class WatchingController {
 
     // MARK: - Derived
 
-    var isWatching: Bool {
-        watchLoop?.isActive == true && watchLoop?.isManualRecording == false
-    }
-
-    /// Whether a recording is currently in progress (the watch loop is in its
-    /// `.recording` state).
-    var isRecording: Bool {
-        watchLoop?.state == .recording
-    }
-
-    /// Whether a manual (app-picker) recording owns the loop, or is on its way
-    /// to owning it. Exposed because `toggleWatching` silently refuses in that
-    /// state, and a silent refusal is invisible to a remote caller — the
-    /// automation API turns this into a 409.
-    ///
-    /// The in-flight half matters: `startManualRecording` assigns `watchLoop`
-    /// only after awaiting the mic gate, so reading the loop alone reports
-    /// "no manual recording" for the whole of that window, and a remote start
-    /// landing in it would build an auto loop that the manual task then
-    /// overwrites without stopping.
-    var isManualRecording: Bool {
-        manualStartTask != nil || watchLoop?.isManualRecording == true
-    }
+    /// Caption flushes still running; ASR stays loaded while any is. Written only
+    /// by `flushLiveTranscriptionAfterRecording()` (WatchingController+CaptionFlush).
+    var captionFlushesInFlight = 0
 
     // MARK: - Start / Stop
+
+    /// The loop an auto-watch start polls with.
+    private func makeAutoWatchLoop() -> WatchLoop {
+        WatchLoop(
+            detector: makeDetector(),
+            recorderFactory: makeRecorderFactory(),
+            pipelineQueue: pipeline.queue,
+            pollInterval: settings.pollInterval,
+            endGracePeriod: settings.endGrace,
+            noMic: { [settings] in settings.noMic },
+            micDeviceUID: { [settings] in settings.micDeviceUIDOrNil },
+            verboseDiagnostics: { [settings] in settings.verboseDiagnostics },
+            recordOnly: { [settings] in settings.recordOnly },
+            // Decided per write, not per poll: the loop calls this once
+            // when a record-only recording is persisted, so a folder that
+            // cannot be reached is reported there (see the resolver).
+            recordOnlyDestination: { [pipeline] in
+                .production(parent: pipeline.outputDirectory.resolve())
+            },
+            notifier: notifier,
+            browserTitleKeywords: { [settings] in BrowserTitleVouch.keywords(from: settings.browserAutoRecordTitleKeywords) },
+            denyListStore: ConsentDenyListStore(settings: settings),
+            autoRecordCalendarMeetings: { [settings] in settings.autoRecordCalendarMeetings },
+            calendarLookup: EventKitMeetingLookup(settings: settings),
+            unfinishedWork: unfinishedRecordingWork,
+        )
+    }
 
     /// - Parameter userInitiated: True for a deliberate Start/Stop press, which
     ///   is the one moment where asking for an optional permission is warranted.
@@ -239,32 +276,12 @@ final class WatchingController {
                 // self-retaining watch task yet.
                 guard !isManualRecording, !isQuitting else { return }
 
+                guard await waitForStoppedLoopsBeforeRebuild() else { return }
+
                 syncEngines?()
                 pipeline.rebuild()
 
-                let loop = WatchLoop(
-                    detector: makeDetector(),
-                    recorderFactory: makeRecorderFactory(),
-                    pipelineQueue: pipeline.queue,
-                    pollInterval: settings.pollInterval,
-                    endGracePeriod: settings.endGrace,
-                    noMic: settings.noMic,
-                    micDeviceUID: settings.micDeviceUID.isEmpty ? nil : settings.micDeviceUID,
-                    verboseDiagnostics: { [settings] in settings.verboseDiagnostics },
-                    recordOnly: { [settings] in settings.recordOnly },
-                    // Decided per write, not per poll: the loop calls this once
-                    // when a record-only recording is persisted, so a folder that
-                    // cannot be reached is reported there (see the resolver).
-                    recordOnlyDestination: { [pipeline] in
-                        .production(parent: pipeline.outputDirectory.resolve())
-                    },
-                    notifier: notifier,
-                    browserTitleKeywords: { [settings] in BrowserTitleVouch.keywords(from: settings.browserAutoRecordTitleKeywords) },
-                    denyListStore: ConsentDenyListStore(settings: settings),
-                    autoRecordCalendarMeetings: { [settings] in settings.autoRecordCalendarMeetings },
-                    calendarLookup: EventKitMeetingLookup(settings: settings),
-                )
-
+                let loop = makeAutoWatchLoop()
                 attachStateChangeHandler(to: loop, notifyOnRecording: true)
 
                 if let health = permissions.health {
@@ -356,14 +373,21 @@ final class WatchingController {
     /// settled, false on expiry or cancellation. See `joinStart` for why the
     /// bound and the polling shape are what they are.
     private func join(while inFlight: () -> Bool) async -> Bool {
-        let deadline = ContinuousClock.now + startJoinTimeout
-        while inFlight() {
-            if Task.isCancelled { return false }
-            if ContinuousClock.now >= deadline { return false }
-            try? await Task.sleep(for: .milliseconds(50))
+        // Opens the existential so the deadline is an instant of that clock.
+        func wait(on clock: some Clock<Duration>) async -> Bool {
+            let deadline = clock.now.advanced(by: startJoinTimeout)
+            while inFlight() {
+                if Task.isCancelled { return false }
+                if clock.now >= deadline { return false }
+                try? await clock.sleep(for: Self.joinPollInterval)
+            }
+            return true
         }
-        return true
+        return await wait(on: joinClock)
     }
+
+    /// How often a join rechecks whether the start it waits for has settled.
+    static let joinPollInterval: Duration = .milliseconds(50)
 
     // MARK: - Manual recording
 
@@ -468,8 +492,8 @@ final class WatchingController {
             recorderFactory: makeRecorderFactory(),
             pipelineQueue: pipeline.queue,
             pollInterval: settings.pollInterval,
-            noMic: settings.noMic,
-            micDeviceUID: settings.micDeviceUID.isEmpty ? nil : settings.micDeviceUID,
+            noMic: { [settings] in settings.noMic },
+            micDeviceUID: { [settings] in settings.micDeviceUIDOrNil },
             verboseDiagnostics: { [settings] in settings.verboseDiagnostics },
             recordOnly: { [settings] in settings.recordOnly },
             // Same seam as the auto-watch loop above: per write, through the
@@ -479,6 +503,7 @@ final class WatchingController {
             },
             notifier: notifier,
             calendarLookup: EventKitMeetingLookup(settings: settings),
+            unfinishedWork: unfinishedRecordingWork,
         )
         watchLoop = loop
 
@@ -528,8 +553,11 @@ final class WatchingController {
         }
     }
 
-    func stopManualRecording() {
-        watchLoop?.stopManualRecording()
-        watchLoop = nil
+    /// Returns once the recording is enqueued. The loop is held until then, so
+    /// the menu and `/v1` go on showing the recording while it mixes.
+    func stopManualRecording() async {
+        let loop = watchLoop
+        await loop?.stopManualRecording()
+        if watchLoop === loop { watchLoop = nil }
     }
 }

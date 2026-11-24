@@ -11,7 +11,7 @@ struct MTCLI: AsyncParsableCommand {
             State.self, Healthz.self, Screenshot.self, UITree.self, UIPress.self,
             OpenSettings.self, CloseSettings.self, ConfirmBrowserConsent.self,
             SeedSpeaker.self, RenameSpeaker.self, DeleteSpeaker.self, MergeSpeakers.self,
-            WavVerdictCommand.self, Watch.self, Record.self,
+            WavVerdictCommand.self, Watch.self, Record.self, LogCommand.self,
         ],
     )
 }
@@ -355,7 +355,7 @@ struct UIPress: AsyncParsableCommand {
         commandName: "ui-press",
         abstract: "Press a control (by accessibility identifier) in an allowed app window. "
             + "Drives a real in-process UI action — assert the effect via `state`, "
-            + "not the returned `pressed` flag.",
+            + "not the returned `dispatched` flag.",
     )
 
     @Argument(help: "Accessibility identifier of the control to press.")
@@ -381,9 +381,49 @@ struct UIPress: AsyncParsableCommand {
     }
 }
 
+/// `mt-cli log [--since <seconds>] [--limit <n>]`: the app's own recent
+/// unified-log entries (`GET /log`) as JSON. Debug only, not part of `/v1`.
+/// A flag left out is left out of the request, so the server's own default
+/// applies.
+struct LogCommand: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "log",
+        abstract: "Print the app's own recent log entries as JSON, oldest first.",
+    )
+
+    @Option(name: .long, help: "How many seconds back from now to read. The app's default when omitted.")
+    var since: Double?
+
+    @Option(name: .long, help: "At most this many entries, the newest kept. The app's default when omitted; the app caps it.")
+    var limit: Int?
+
+    /// The server refuses these with a bare 400; saying which flag is wrong
+    /// here is more use to whoever typed it.
+    func validate() throws {
+        if let since, !(since.isFinite && since >= 0) {
+            throw ValidationError("--since must be a finite number of seconds, 0 or more")
+        }
+        if let limit, limit < 1 { throw ValidationError("--limit must be 1 or more") }
+    }
+
+    var requestPath: String {
+        var query: [String] = []
+        if let since { query.append("since=\(since)") }
+        if let limit { query.append("limit=\(limit)") }
+        return query.isEmpty ? "/log" : "/log?" + query.joined(separator: "&")
+    }
+
+    func run() async throws {
+        let client = try RPCClient.loadDefault()
+        let data = try await client.get(requestPath, timeout: RPCClient.logTimeoutSeconds)
+        FileHandle.standardOutput.write(data)
+        FileHandle.standardOutput.write(Data("\n".utf8))
+    }
+}
+
 struct Screenshot: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
-        abstract: "Save a PNG of the app's frontmost window.",
+        abstract: "Save a PNG of the app's largest visible window (Settings only).",
     )
 
     @Argument(help: "Output PNG path. Defaults to ./screenshot.png.")

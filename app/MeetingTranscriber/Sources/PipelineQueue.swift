@@ -35,6 +35,14 @@ class PipelineQueue {
     /// in-place field updates, snapshot restore (whole-array assign), and
     /// recovery appends.
     var jobs: [PipelineJob] = []
+    @ObservationIgnored private var menuTrackingDepth = 0
+    @ObservationIgnored private var expiredCompletedJobIDs: Set<UUID> = []
+    @ObservationIgnored private var completedJobRemovalTokens: [UUID: UUID] = [:]
+    /// Fires for every finished export, first attempt or retry, with the short
+    /// failure cause or nil on success.
+    @ObservationIgnored var onNotionExportFinished: ((PipelineJob, String?) -> Void)?
+    @ObservationIgnored var pendingNotionExports: [UUID: PendingNotionExport] = [:]
+    @ObservationIgnored var notionExportTasks: [UUID: NotionExportRun] = [:]
     /// Internal (not private) because `loadSnapshot` in PipelineQueue+Recovery.swift
     /// reads it to locate the snapshot file.
     let logDir: URL
@@ -82,12 +90,28 @@ class PipelineQueue {
     /// wrong URL. A rebuilt queue opens its own; the queue it replaces keeps
     /// its scope until it is deallocated, which a running job delays, since
     /// the processing task holds the queue until the job returns.
-    private let scopedOutputDir: URL?
+    ///
+    /// Internal (not private) because a retention pass opens its own nested
+    /// scope on it, and deletes only under a folder whose scope is held.
+    let scopedOutputDir: URL?
     /// Where `DualSourceRecorder` writes, i.e. the audio this app produced and
     /// may therefore relocate. Injectable so a test can exercise the hand-off
     /// without writing into the real user directory; see `AudioPersistencePolicy`.
     let stagingDir: URL
     let diarizeEnabled: Bool
+
+    /// How long a job may wait for its names before `cleanupStalePending()`
+    /// accepts the auto-names (`AppSettings.staleNamingTimeout`); nil keeps it
+    /// waiting. Read through a closure, like `isEchoCancellationEnabled`. Its
+    /// only caller today is the cleanup on snapshot restore, which runs right
+    /// after the queue is built, so in practice a change applies at the next
+    /// launch.
+    private let staleNamingMaxAgeProvider: () -> TimeInterval?
+
+    var staleNamingMaxAge: TimeInterval? {
+        staleNamingMaxAgeProvider()
+    }
+
     /// Leave loudspeaker copies out of the transcript (`AppSettings.echoDedupEnabled`).
     let echoDedupEnabled: Bool
 
@@ -105,6 +129,17 @@ class PipelineQueue {
 
     var echoCancellationEnabled: Bool {
         isEchoCancellationEnabled()
+    }
+
+    /// Pop the naming window when a job reaches `.speakerNamingPending`
+    /// (`AppSettings.autoOpenSpeakerNaming`). Read through a closure for the
+    /// same reason as `isEchoCancellationEnabled`: the queue outlives a
+    /// Settings change. Only the automatic pops ask; a window the user opens,
+    /// or one a late re-run they started returns to, opens regardless.
+    private let isSpeakerNamingAutoOpenEnabled: () -> Bool
+
+    var autoOpensSpeakerNaming: Bool {
+        isSpeakerNamingAutoOpenEnabled()
     }
 
     /// Produces the canceller for a run, or nil when no model can be resolved.
@@ -140,6 +175,9 @@ class PipelineQueue {
 
     let completedJobLifetime: TimeInterval
 
+    /// Resolve the exporter and its destination/output policy together for each export.
+    let notionExportConfigurationProvider: (() -> NotionExportResolution)?
+
     /// Process-wide claim on the runs currently executing, so a replacement
     /// queue cannot start a job the queue it replaced is still working on.
     /// Defaults to the shared instance; tests inject their own to stay isolated
@@ -150,7 +188,21 @@ class PipelineQueue {
     /// nil (default) disables it; production injects one, tests opt in.
     let terminalJobStore: TerminalJobStore?
 
-    /// Cached FluidVAD instance — reused across jobs to avoid model reload.
+    /// Records the audio stage 3 relocates and deletes it once the retention
+    /// setting says it is due; see `PipelineQueue+Retention.swift`. Shared
+    /// across queue rebuilds. nil (default) disables it; production injects
+    /// one, tests opt in.
+    let recordingRetention: RecordingRetention?
+
+    /// Moves one artifact during the AI-title rename. Injectable so a test can
+    /// make a move, or the move undoing it, fail; production moves the file.
+    let moveArtifact: (URL, URL) throws -> Void
+
+    /// The production `moveArtifact`.
+    static let liveMoveArtifact: (URL, URL) throws -> Void = { try FileManager.default.moveItem(at: $0, to: $1) }
+
+    /// Cached batch FluidVAD — reused across queued jobs. EngineController
+    /// releases it at idle when `unloadModelsWhenIdle` is enabled.
     /// Internal (not private) because `preprocessWithVAD` in
     /// PipelineQueue+Stages.swift reads and writes it.
     var vad: FluidVAD?
@@ -158,6 +210,10 @@ class PipelineQueue {
     /// Internal setter (not `private(set)`) because `processNext` in
     /// PipelineQueue+Stages.swift clears this flag across the file boundary.
     var isProcessing = false
+
+    /// Durable drain signal: an observer may miss a busy→idle transition that
+    /// fits in one actor turn. Internal setter for PipelineQueue+Stages.
+    var lastDrainID: UUID?
 
     /// Historical average wall-clock seconds per (stage, engine, diarizer-mode)
     /// config (last 30 days), used by the menu to show "live vs. typical".
@@ -174,18 +230,59 @@ class PipelineQueue {
     /// starts, because `jobs[].state` is observed on its own, and a view that read
     /// this dictionary would be rebuilt on every transition for no gain.
     @ObservationIgnored private var stageStartByJob: [UUID: ContinuousClock.Instant] = [:]
+    /// Seconds of sub-stages already logged as events of their own inside a
+    /// job's current stage (the echo canceller's run inside `.transcribing`),
+    /// taken out of the enclosing stage's event when that stage is left.
+    /// Ignored by observation for the same reason as `stageStartByJob`.
+    @ObservationIgnored private var excludedSubStageSecondsByJob: [UUID: Double] = [:]
     /// Audio length (seconds) each job processed, captured when transcription
     /// completes, so stage durations can be normalised into an RTF.
     /// Internal (not private) because `transcribe` in PipelineQueue+Stages.swift stamps it.
     var jobAudioSeconds: [UUID: Double] = [:]
 
     private var processTask: Task<Void, Never>?
+    /// The task running each job's pipeline run, for as long as the run lasts.
+    /// Cancelling a job cancels its entry here and nothing else. The job's state
+    /// cannot stand in for this: a late speaker re-run and a late confirm move a
+    /// job back to `.diarizing` / `.generatingProtocol` on a task of the naming
+    /// session's own, while the queue may be running a different job.
+    ///
+    /// The run's own task rather than `processTask`, because `processTask` is
+    /// only one of the ways into `processNext`: a caller awaiting `processNext`
+    /// directly runs the job on its own task, and cancelling `processTask` then
+    /// stopped whatever that task held, or nothing. Keyed by job rather than a
+    /// single slot for the same reason: two such entries can overlap.
     /// Internal (not private) because `processNext` in PipelineQueue+Stages.swift
-    /// reads this to distinguish a cancellation from a real pipeline error.
-    var cancelledJobIDs = Set<UUID>()
+    /// fills it.
+    @ObservationIgnored var pipelineRuns: [UUID: Task<Bool, Never>] = [:]
+    /// The move of the last cancelled job's recording, which runs off the main
+    /// actor. Tests await it; nothing else needs to.
+    /// Internal (not private) because `relocateRecordingOfCancelledJob` in
+    /// PipelineQueue+Stages.swift sets it.
+    @ObservationIgnored var lastRecordingRelocation: Task<Void, Never>?
 
     /// Called when a job completes (success or error) — for notifications
     var onJobStateChange: ((PipelineJob, JobState, JobState) -> Void)?
+
+    /// Called when confirming a job's speakers left names out of the speaker
+    /// DB because their voice sample was unusable (NaN/Inf embedding), at
+    /// most once per name and job — for notifications.
+    var onUnusableVoices: ((PipelineJob, [String]) -> Void)?
+    /// Where each saved protocol is handed on to (the webhook), nil for
+    /// nowhere. Set by `PipelineController` from its environment, never looked
+    /// up here: the webhook URL lives in the login Keychain, so a queue that
+    /// read it would post a test's protocols to the real receiver.
+    @ObservationIgnored var deliverProtocol: ProtocolWebhook.Delivery?
+
+    /// Called instead of opening the naming window when auto-open is off
+    /// (`AppSettings.autoOpenSpeakerNaming`): with the meeting that just
+    /// started waiting for names, or on launch with all that were already
+    /// waiting — for notifications.
+    var onSpeakerNamesWaiting: (([PipelineJob]) -> Void)?
+    /// Names `onUnusableVoices` already reported, per job. A job can be
+    /// confirmed more than once (late naming, re-runs): the same name needs
+    /// telling once, a newly affected one still does.
+    private var unusableVoicesReported: [UUID: Set<String>] = [:]
 
     // MARK: - Speaker Naming
 
@@ -212,10 +309,9 @@ class PipelineQueue {
         set { naming.speakerNamingHandler = newValue }
     }
 
-    /// The currently displayed naming data (first pending item).
+    /// Naming data of the first job awaiting naming, nil when there is none.
     var pendingSpeakerNaming: SpeakerNamingData? {
-        guard let firstPendingJob = pendingSpeakerNamingJobs.first else { return nil }
-        return speakerNamingDataByJob[firstPendingJob.id]
+        speakerNamingData(forJobID: nil)
     }
 
     /// Filesystem slug for a job's persisted artefacts. Thin alias for
@@ -225,10 +321,26 @@ class PipelineQueue {
         SpeakerNamingStore.slug(title: title, jobID: jobID, startTime: startTime)
     }
 
-    /// Returns naming data for a specific job ID, or the first pending job as fallback.
+    /// The job the naming window shows: `preferred` while it is awaiting
+    /// naming, else the first job that is. Only ever a job awaiting naming.
+    /// A selection can outlive that state (a re-run moves its job to
+    /// `.diarizing`, and the window reopens when another job reaches naming),
+    /// and showing that job again would offer a dialog whose answers the
+    /// session no longer takes.
+    func namingJobID(preferring preferred: UUID?) -> UUID? {
+        let pending = pendingSpeakerNamingJobs
+        if let preferred, pending.contains(where: { $0.id == preferred }) { return preferred }
+        return pending.first?.id
+    }
+
+    /// Why the job's last re-run came back with nothing, for the dialog.
+    func lateRerunFailure(forJobID jobID: UUID) -> SpeakerNamingRefusal? {
+        naming.lateRerunFailures[jobID]
+    }
+
+    /// Naming data for the job `namingJobID(preferring:)` picks.
     func speakerNamingData(forJobID jobID: UUID?) -> SpeakerNamingData? {
-        if let jobID, let data = speakerNamingDataByJob[jobID] { return data }
-        return pendingSpeakerNaming
+        namingJobID(preferring: jobID).flatMap { speakerNamingDataByJob[$0] }
     }
 
     /// Diarizer mode used to produce the current `speakerNamingDataByJob`
@@ -246,19 +358,20 @@ class PipelineQueue {
     /// Called by the UI (and the test handler) when the user confirms, skips, or
     /// re-runs speaker naming. Thin forwarder to the naming session, which
     /// always handles "late" completion — the pipeline never blocks on naming.
+    /// Returns why the answer was not taken, nil when it was.
+    @discardableResult
     func completeSpeakerNaming(
         jobID: UUID, result: SpeakerNamingResult, source: RecognitionSource = .dialog,
-    ) {
+    ) -> SpeakerNamingRefusal? {
         naming.completeSpeakerNaming(jobID: jobID, result: result, source: source)
     }
 
     /// Called by the UI when the user confirms or skips speaker naming without a
-    /// specific job in hand — resolves the first pending job (or any stashed
-    /// naming data) and forwards to the session.
+    /// specific job in hand — resolves the first pending job and forwards to
+    /// the session, which takes answers only for a job awaiting naming.
     func completeSpeakerNaming(result: SpeakerNamingResult, source: RecognitionSource = .dialog) {
-        if let jobID = pendingSpeakerNamingJobs.first?.id ?? naming.speakerNamingDataByJob.keys.first {
-            naming.completeSpeakerNaming(jobID: jobID, result: result, source: source)
-        }
+        guard let jobID = pendingSpeakerNamingJobs.first?.id else { return }
+        naming.completeSpeakerNaming(jobID: jobID, result: result, source: source)
     }
 
     /// Default factory for `speakerMatcherFactory`: a matcher that writes to a
@@ -281,19 +394,28 @@ class PipelineQueue {
     /// `stagingDir` is a parameter rather than always `AppPaths.recordingsDir`
     /// because this queue decides from it whether finished audio is the app's
     /// own to relocate; a caller working in temp folders must be able to say so.
+    ///
+    /// `logDir` has no default for the same reason, more strongly: the snapshot,
+    /// the event log and the processed-recordings ledger all live there, so a
+    /// default of the app's own folder put every caller that left it out into
+    /// the installed app's queue and history. Production passes
+    /// `AppPaths.ipcDir` through `PipelineController.QueueEnvironment.production`.
     init(
-        logDir: URL? = nil,
+        logDir: URL,
         stagingDir: URL = AppPaths.recordingsDir,
         speakerMatcherFactory: @escaping () -> SpeakerMatcher = PipelineQueue.throwawayMatcherFactory(),
         snapshotWriter: @escaping @Sendable ([PipelineJob], URL) throws -> Void = PipelineSnapshot.save,
         stageTimingLog: StageTimingLog? = nil,
         completedJobLifetime: TimeInterval = 60,
+        notionExportConfigurationProvider: (() -> NotionExportResolution)? = nil,
         terminalJobStore: TerminalJobStore? = nil,
+        staleNamingMaxAge: @escaping () -> TimeInterval? = { StaleNamingTimeout.oneDay.maxAge },
         inFlightRuns: InFlightRunRegistry? = nil,
         echoCancellationEnabled: @escaping () -> Bool = { false },
         echoCancellerFactory: (() -> (any EchoCancelling)?)? = nil,
+        autoOpenSpeakerNaming: @escaping () -> Bool = { true },
     ) {
-        self.logDir = logDir ?? AppPaths.ipcDir
+        self.logDir = logDir
         self.processedLedger = ProcessedRecordingsLedger(logDir: self.logDir)
         eventLog = PipelineEventLog(logDir: self.logDir)
         self.engine = nil
@@ -305,9 +427,11 @@ class PipelineQueue {
         scopedOutputDir = nil
         self.stagingDir = stagingDir
         self.diarizeEnabled = false
+        staleNamingMaxAgeProvider = staleNamingMaxAge
         echoDedupEnabled = true
         isEchoCancellationEnabled = echoCancellationEnabled
         self.echoCancellerFactory = echoCancellerFactory ?? { Self.bundledEchoCanceller() }
+        isSpeakerNamingAutoOpenEnabled = autoOpenSpeakerNaming
         self.numSpeakers = 0
         self.micLabel = "Me"
         let outputOptions = TranscriptOutputOptions(
@@ -324,7 +448,10 @@ class PipelineQueue {
         terminologyNormalizer = { TerminologyNormalizer() }
         self.stageTimingLog = stageTimingLog
         self.completedJobLifetime = completedJobLifetime
+        self.notionExportConfigurationProvider = notionExportConfigurationProvider
         self.terminalJobStore = terminalJobStore
+        recordingRetention = nil
+        moveArtifact = Self.liveMoveArtifact
         self.inFlightRuns = inFlightRuns ?? .shared
         naming = SpeakerNamingSession(
             namingStore: SpeakerNamingStore(outputDir: nil),
@@ -373,13 +500,76 @@ class PipelineQueue {
         speakingTimes: [String: TimeInterval],
         provenance: SampleProvenance,
     ) {
-        matcher.updateDB(
+        let outcome = matcher.updateDB(
             mapping: mapping,
             embeddings: embeddings,
             speakingTimes: speakingTimes,
             provenance: provenance,
         )
         refreshKnownSpeakerNames()
+        // A DB that could not be read or written is reported by the matcher
+        // itself, and then no voice was kept; only when the rest was saved is
+        // the per-voice skip this job's to report.
+        guard let jobID = provenance.jobID else { return }
+        let reported = unusableVoicesReported[jobID, default: []]
+        let newlyUnusable = outcome.unusableVoice.filter { !reported.contains($0) }
+        guard outcome.persistence == .saved, !newlyUnusable.isEmpty,
+              let job = job(withID: jobID) else { return }
+        unusableVoicesReported[jobID] = reported.union(newlyUnusable)
+        onUnusableVoices?(job, newlyUnusable)
+    }
+
+    /// The notification for a finished job. With meeting notes that failed and
+    /// `announceNotesFailure` on (`AppSettings.notifyOnMeetingNotesFailure`),
+    /// it says so with the fixed sentence for the kind of failure; otherwise
+    /// "Meeting Notes Ready" or "Transcript Saved". Standard urgency: the
+    /// failure is over by the time it is announced, and a batch import with a
+    /// signed-out CLI posts one per job.
+    ///
+    /// A notes-only run (`generatesNotesOnly`) that saved nothing saved no
+    /// transcript either, so it never reads "Transcript Saved", and a failure
+    /// of it does not add "The transcript is saved". That covers a transcript
+    /// that could not be read, which only a notes-only run can meet.
+    static func doneNotification(for job: PipelineJob, announceNotesFailure: Bool) -> (title: String, body: String) {
+        if job.generatesNotesOnly == true, !job.hasSavedProtocol, job.notesFailure == nil || !announceNotesFailure {
+            let reason = job.notesFailure?.summary ?? "Notes already exist next to the transcript, so nothing was written"
+            return ("Meeting Notes Not Saved", announceNotesFailure ? "\"\(job.meetingTitle)\": \(reason)." : job.meetingTitle)
+        }
+        guard let failure = job.notesFailure, announceNotesFailure else {
+            return (job.hasSavedProtocol ? "Meeting Notes Ready" : "Transcript Saved", job.meetingTitle)
+        }
+        let savedATranscript = job.generatesNotesOnly != true
+        let body = "\"\(job.meetingTitle)\": \(failure.summary)." + (savedATranscript ? " The transcript is saved." : "")
+        return ("Meeting Notes Failed", failure.hint.map { "\(body) \($0)" } ?? body)
+    }
+
+    /// Notification text for `onUnusableVoices`.
+    static func unusableVoicesMessage(_ names: [String], in job: PipelineJob) -> String {
+        "No usable voice sample for \(names.joined(separator: ", ")) in \"\(job.meetingTitle)\": too short "
+            + "or too quiet to remember, so it will not be recognised next time. The transcript keeps the name."
+    }
+
+    /// On snapshot restore: brings jobs that still wait for names to the user,
+    /// by the naming window (the same post as after processing, which
+    /// `MeetingTranscriberApp` brings forward) or, with auto-open off, by
+    /// `onSpeakerNamesWaiting`. A job restored already pending never makes the
+    /// `.speakerNamingPending` transition again, so this is its only prompt.
+    func announceRestoredSpeakerNaming() {
+        let waiting = pendingSpeakerNamingJobs
+        guard !waiting.isEmpty else { return }
+        if autoOpensSpeakerNaming {
+            NotificationCenter.default.post(name: .showSpeakerNaming, object: nil)
+        } else {
+            onSpeakerNamesWaiting?(waiting)
+        }
+    }
+
+    /// Notification text for `onSpeakerNamesWaiting`.
+    static func speakerNamesWaitingMessage(_ jobs: [PipelineJob]) -> String {
+        let what = jobs.count == 1
+            ? "\"\(jobs[0].meetingTitle)\" is waiting for speaker names."
+            : "\(jobs.count) meetings are waiting for speaker names."
+        return what + " Open Name Speakers... in the menu bar."
     }
 
     /// Full init with all processing dependencies.
@@ -389,12 +579,14 @@ class PipelineQueue {
         diarizationFactoryWithMode: ((DiarizerMode) -> any DiarizationProvider)? = nil,
         protocolGeneratorFactory: @escaping () -> (any ProtocolGenerating)?,
         outputDir: URL,
-        logDir: URL? = nil,
+        logDir: URL,
         stagingDir: URL = AppPaths.recordingsDir,
         diarizeEnabled: Bool = false,
+        staleNamingMaxAge: @escaping () -> TimeInterval? = { StaleNamingTimeout.oneDay.maxAge },
         echoDedupEnabled: Bool = true,
         echoCancellationEnabled: @escaping () -> Bool = { false },
         echoCancellerFactory: (() -> (any EchoCancelling)?)? = nil,
+        autoOpenSpeakerNaming: @escaping () -> Bool = { true },
         numSpeakers: Int = 0,
         micLabel: String = "Me",
         includeFullTranscriptInProtocol: Bool = true,
@@ -408,11 +600,14 @@ class PipelineQueue {
         terminologyNormalizer: @escaping () -> TerminologyNormalizer = { TerminologyNormalizer() },
         stageTimingLog: StageTimingLog? = nil,
         completedJobLifetime: TimeInterval = 60,
+        notionExportConfigurationProvider: (() -> NotionExportResolution)? = nil,
         terminalJobStore: TerminalJobStore? = nil,
         inFlightRuns: InFlightRunRegistry? = nil,
         securityScope: SecurityScopeAccess = .live,
+        recordingRetention: RecordingRetention? = nil,
+        moveArtifact: @escaping (URL, URL) throws -> Void = PipelineQueue.liveMoveArtifact,
     ) {
-        self.logDir = logDir ?? AppPaths.ipcDir
+        self.logDir = logDir
         self.processedLedger = ProcessedRecordingsLedger(logDir: self.logDir)
         eventLog = PipelineEventLog(logDir: self.logDir)
         self.engine = engine
@@ -424,19 +619,26 @@ class PipelineQueue {
         scopedOutputDir = securityScope.start(outputDir) ? outputDir : nil
         self.stagingDir = stagingDir
         self.diarizeEnabled = diarizeEnabled
+        staleNamingMaxAgeProvider = staleNamingMaxAge
         self.echoDedupEnabled = echoDedupEnabled
         isEchoCancellationEnabled = echoCancellationEnabled
         self.echoCancellerFactory = echoCancellerFactory ?? { Self.bundledEchoCanceller() }
+        isSpeakerNamingAutoOpenEnabled = autoOpenSpeakerNaming
         self.numSpeakers = numSpeakers
         // "Remote" is the reserved routing tag for the app/remote track
         // (DiarizationProcess.remoteSpeakerLabel). If the user names the mic
         // speaker that too, mergeDualSourceSegments tags both tracks identically
         // and labelSegments' per-track filters each match every segment → app
         // audio is double-counted under both speakers. Fall back to the default
-        // so the two routing tags can never collide. (This is the single source
-        // of micLabel for both the tagging and the re-split, so sanitizing here
+        // so the two routing tags can never collide. An empty or whitespace-only
+        // name falls back too: an earlier Settings caption advised leaving the
+        // field empty to diarize the mic track, which the pipeline never did, so
+        // such values are stored, and a blank label leaves mic segments without
+        // a speaker in transcript and protocol. (This is the single source of
+        // micLabel for both the tagging and the re-split, so sanitizing here
         // keeps them consistent.)
-        self.micLabel = micLabel == DiarizationProcess.remoteSpeakerLabel ? "Me" : micLabel
+        let isBlank = micLabel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        self.micLabel = isBlank || micLabel == DiarizationProcess.remoteSpeakerLabel ? "Me" : micLabel
         let outputOptions = TranscriptOutputOptions(
             includeFullTranscriptInProtocol: includeFullTranscriptInProtocol,
             saveRawTranscriptSeparately: saveRawTranscriptSeparately,
@@ -451,7 +653,10 @@ class PipelineQueue {
         self.terminologyNormalizer = terminologyNormalizer
         self.stageTimingLog = stageTimingLog
         self.completedJobLifetime = completedJobLifetime
+        self.notionExportConfigurationProvider = notionExportConfigurationProvider
         self.terminalJobStore = terminalJobStore
+        self.recordingRetention = recordingRetention
+        self.moveArtifact = moveArtifact
         self.inFlightRuns = inFlightRuns ?? .shared
         naming = SpeakerNamingSession(
             namingStore: SpeakerNamingStore(outputDir: outputDir),
@@ -544,7 +749,14 @@ class PipelineQueue {
     /// from `enqueue` → `triggerProcessing()`.
     func awaitProcessing() async {
         while isProcessing || !pendingJobs.isEmpty {
-            if let task = processTask {
+            // A run first: its job stays `.waiting` until the run's task gets
+            // going, and an already finished `processTask` would return at once
+            // and spin this loop on the main actor the run needs.
+            if let run = pipelineRuns.values.first {
+                _ = await run.value
+                // Lets the entry that ran it take the run off the record.
+                await Task.yield()
+            } else if let task = processTask {
                 await task.value
             } else {
                 // processTask not yet assigned — yield so the spawning Task
@@ -552,6 +764,7 @@ class PipelineQueue {
                 await Task.yield()
             }
         }
+        await awaitNotionExports()
     }
 
     /// Every folder a job's sidecars may sit in, newest last. What a cleanup
@@ -583,6 +796,11 @@ class PipelineQueue {
     }
 
     func removeJob(id: UUID) {
+        // An export-only retry still needs its job to retain a created page's
+        // ID if the remote request completes after the menu closes.
+        guard !jobs.contains(where: { $0.id == id && $0.state == .done && $0.notionExportStatus == .inProgress }) else { return }
+        expiredCompletedJobIDs.remove(id)
+        completedJobRemovalTokens.removeValue(forKey: id)
         if let index = jobs.firstIndex(where: { $0.id == id }) {
             processedLedger.markProcessed(mixPath: jobs[index].mixPath)
             // Unconditional, because removing a job has to remove what belongs
@@ -601,9 +819,51 @@ class PipelineQueue {
             )
             jobs.remove(at: index)
         }
-        stageStartByJob.removeValue(forKey: id)
-        jobAudioSeconds.removeValue(forKey: id)
+        cancelWork(of: id)
+        forgetStageBookkeeping(for: id)
+        // A restored job marked for a protocol-only resume keeps no claim on
+        // that once it is gone.
+        protocolResumeDispositions.removeValue(forKey: id)
         saveSnapshot()
+    }
+
+    /// Stop what is still running for a job that is being dropped: its
+    /// pipeline run, when this queue is running one for it, and its late naming
+    /// work. Only the job's own work: a job in a working state may be in a late
+    /// re-run or late confirm, on the naming session's tasks, while the queue
+    /// runs a different job, and stopping the queue's run then stopped that
+    /// other job half-way and left this one going. The late work is cancelled
+    /// whatever the state, because accepting auto-names starts it while the job
+    /// is still `.speakerNamingPending`.
+    private func cancelWork(of id: UUID) {
+        pipelineRuns[id]?.cancel()
+        naming.cancelLateWork(jobID: id)
+    }
+
+    func beginMenuTracking() {
+        menuTrackingDepth += 1
+    }
+
+    func endMenuTracking() {
+        guard menuTrackingDepth > 0 else { return }
+        menuTrackingDepth -= 1
+        guard menuTrackingDepth == 0 else { return }
+        let expired = expiredCompletedJobIDs
+        expiredCompletedJobIDs.removeAll()
+        for id in expired {
+            expireCompletedJob(id: id)
+        }
+    }
+
+    private func expireCompletedJob(id: UUID) {
+        guard jobs.contains(where: { $0.id == id && $0.state == .done && !$0.isHeldAfterCompletion }) else { return }
+        // Native menus update in place. Removing a finished export's row while
+        // the menu is open moves its actions underneath the pointer.
+        if menuTrackingDepth > 0, jobs.contains(where: { $0.id == id && $0.notionExportStatus != nil }) {
+            expiredCompletedJobIDs.insert(id)
+        } else {
+            removeJob(id: id)
+        }
     }
 
     /// Cancel a job. Removes the job + cleans up sidecar files if naming was
@@ -616,40 +876,21 @@ class PipelineQueue {
     /// relabelled as a recovered recording. Cancelling that copy only re-armed
     /// the loop. Re-importing the file by hand stays the way back and never
     /// consults the ledger.
+    ///
+    /// Everything else is what dismissing a job does, so it goes through
+    /// `removeJob`: its naming data and sidecars go, its stage bookkeeping is
+    /// forgotten, and its own work is stopped (`cancelWork`), whatever state
+    /// it is in.
+    ///
+    /// The one thing of the job that is kept is its recording, moved out of
+    /// staging into the output folder (`relocateRecordingOfCancelledJob`).
+    /// The ledger mark above does not wait for that move: orphan recovery
+    /// enqueues and processes an unmarked recording, so one still in staging
+    /// while the move runs, or after it failed, has to be marked already.
     func cancelJob(id: UUID) {
-        guard let index = jobs.firstIndex(where: { $0.id == id }) else { return }
-        let state = jobs[index].state
-        let slug = jobs[index].namingSlug
-        // cancelJob removes the job directly (not via removeJob) and skips the
-        // normal terminal transition, so reap the stage-timing bookkeeping here
-        // too — otherwise a job cancelled mid-stage leaks these entries.
-        stageStartByJob.removeValue(forKey: id)
-        jobAudioSeconds.removeValue(forKey: id)
-        if state != .done, state != .error {
-            processedLedger.markProcessed(mixPath: jobs[index].mixPath)
-        }
-        switch state {
-        case .waiting:
-            jobs.remove(at: index)
-            saveSnapshot()
-
-        case .transcribing, .diarizing, .generatingProtocol:
-            cancelledJobIDs.insert(id)
-            processTask?.cancel()
-            naming.removeNamingData(jobID: id, slug: slug)
-            jobs.remove(at: index)
-            saveSnapshot()
-
-        case .speakerNamingPending:
-            // User cancelled while waiting for late-confirm — drop the sidecar
-            // files and the in-memory state so it doesn't sit around.
-            naming.removeNamingData(jobID: id, slug: slug)
-            jobs.remove(at: index)
-            saveSnapshot()
-
-        case .done, .error:
-            break
-        }
+        guard let job = job(withID: id), job.state != .done, job.state != .error else { return }
+        relocateRecordingOfCancelledJob(job)
+        removeJob(id: id)
     }
 
     func updateJobState(id: UUID, to newState: JobState, error: String? = nil) {
@@ -664,13 +905,16 @@ class PipelineQueue {
         guard oldState != newState || error != nil else { return }
         jobs[index].state = newState
         if let error { jobs[index].error = error }
-        // The stale-naming day counts from the first entry, see
+        // The stale-naming wait counts from the first entry, see
         // `namingDeadlineStart`. Returning from a late re-diarization is the
         // same wait, not a new one.
         if newState == .speakerNamingPending, jobs[index].namingStartedAt == nil {
             jobs[index].namingStartedAt = Date()
         }
         if newState == .done {
+            // Only now, with the notes saved, is a failure over: a retry that
+            // fails again, or finds no provider, keeps it and stays on offer.
+            if jobs[index].hasSavedProtocol { clearNotesFailure(at: index) }
             removeRawTranscriptArtifactsIfSafe(for: index)
         } else if newState == .error,
                   !transcriptOutputOptions(forJobID: id).saveRawTranscriptSeparately,
@@ -690,17 +934,36 @@ class PipelineQueue {
             recordTerminalJob(jobs[index])
         }
         if newState == .done {
-            Task { [weak self] in
-                try? await Task.sleep(for: .seconds(self?.completedJobLifetime ?? 60))
-                self?.removeJob(id: id)
+            startPendingNotionExport(jobID: id)
+            scheduleCompletedJobRemoval(id: id)
+            if recordingRetention != nil {
+                Task { [weak self] in await self?.sweepRetainedRecordings() }
             }
+            // A held export retries from its Markdown, and a notes retry from
+            // the transcript, never from the audio sidecars, and either may be
+            // held for as long as the user leaves it.
+            if jobs[index].isHeldAfterCompletion {
+                naming.removeNamingData(jobID: id, slug: jobs[index].namingSlug, in: allSidecarDirs(of: jobs[index]))
+            }
+        }
+    }
+
+    func scheduleCompletedJobRemoval(id: UUID) {
+        guard jobs.contains(where: { $0.id == id && $0.state == .done && !$0.isHeldAfterCompletion }) else { return }
+        let token = UUID()
+        completedJobRemovalTokens[id] = token
+        expiredCompletedJobIDs.remove(id)
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(self?.completedJobLifetime ?? 60))
+            guard self?.completedJobRemovalTokens[id] == token else { return }
+            self?.expireCompletedJob(id: id)
         }
     }
 
     /// Persist a durable terminal-state record so the automation API can read
     /// back a finished job's outcome even after `completedJobLifetime` removes
     /// it from the in-memory list. No-op when no store is wired.
-    private func recordTerminalJob(_ job: PipelineJob) {
+    func recordTerminalJob(_ job: PipelineJob) {
         terminalJobStore?.record(JobStatusDTO(job: job))
     }
 
@@ -710,9 +973,10 @@ class PipelineQueue {
     /// losing it with no generated minutes to show for it.
     private func removeRawTranscriptArtifactsIfSafe(for index: Int) {
         guard !transcriptOutputOptions(forJobID: jobs[index].id).saveRawTranscriptSeparately else { return }
-        guard jobs[index].protocolPath != nil else {
+        guard jobs[index].hasSavedProtocol else {
             if jobs[index].transcriptPath != nil {
-                let warning = "Raw transcript retained because no protocol was saved"
+                // Matched by /v1 clients and persisted jobs; keep the text stable.
+                let warning = Self.rawTranscriptRetainedWithoutNotesWarning
                 if !jobs[index].warnings.contains(warning) {
                     jobs[index].warnings.append(warning)
                 }
@@ -755,6 +1019,13 @@ class PipelineQueue {
         guard let index = jobs.firstIndex(where: { $0.id == id }) else { return }
         guard !jobs[index].warnings.contains(message) else { return }
         jobs[index].warnings.append(message)
+    }
+
+    /// Record why this job's meeting notes could not be generated
+    /// (`PipelineJob.notesFailure`).
+    func recordNotesFailure(id: UUID, _ failure: MeetingNotesFailure) {
+        guard let index = jobs.firstIndex(where: { $0.id == id }) else { return }
+        jobs[index].notesFailure = failure
     }
 
     /// Record which tracks of this job's recording had audio. Read back through
@@ -826,36 +1097,97 @@ class PipelineQueue {
     // MARK: - Stage timing metrics
 
     /// On every state change: if we left a timed stage, log its wall-clock
-    /// duration; if we entered one, stamp its start. Measuring per-state means
-    /// the recorded duration matches exactly what the menu's elapsed timer shows
-    /// and excludes the speaker-naming pause (see `StageKind(jobState:)`).
+    /// duration; if we entered one, stamp its start. Measuring per-state
+    /// excludes the speaker-naming pause (see `StageKind(jobState:)`). A
+    /// sub-stage logged as an event of its own (the echo canceller's run inside
+    /// `.transcribing`) is taken back out of the enclosing stage's event, so
+    /// that average stays the cost of the stage for the jobs that never run it.
+    /// The menu's elapsed timer keeps the run, since the state is still
+    /// `.transcribing` while it runs, so on an echo-cancelled job that timer
+    /// reads above the average and can say "longer than usual": the stage is
+    /// taking longer, and the alternative, re-stamping the stage start after
+    /// the run, would make a counter the user is watching jump backwards.
     private func recordStageTransition(from oldState: JobState, to newState: JobState, jobID: UUID) {
         // A same-state "transition" (e.g. the confirm path re-enters
         // .generatingProtocol while already .generatingProtocol) is not a stage
         // boundary; ignore it so it neither logs a partial event nor resets the start.
         guard oldState != newState else { return }
+        let excluded = excludedSubStageSecondsByJob.removeValue(forKey: jobID) ?? 0
         if let leaving = StageKind(jobState: oldState), let start = stageStartByJob.removeValue(forKey: jobID) {
-            logStageTiming(stage: leaving, wallClock: (ContinuousClock.now - start).inSeconds, jobID: jobID)
+            // audioSeconds is 0 for stages with no known audio length (e.g. a
+            // late re-diarization with no transcription this session);
+            // aggregate() then excludes it from the RTF but still counts its
+            // wall-clock.
+            logStageTiming(
+                stage: leaving, wallClock: max(0, (ContinuousClock.now - start).inSeconds - excluded),
+                jobID: jobID, audioSeconds: jobAudioSeconds[jobID] ?? 0,
+            )
         }
         if StageKind(jobState: newState) != nil {
             stageStartByJob[jobID] = ContinuousClock.now
         }
     }
 
+    /// Drop every per-job timing entry. One place, because the two exits that
+    /// bypass the terminal transition (`removeJob`, `cancelJob`) each have to
+    /// reap all of them, and a dictionary added to one and not the other is
+    /// how a job cancelled mid-stage came to leak its entries once before.
+    private func forgetStageBookkeeping(for id: UUID) {
+        stageStartByJob.removeValue(forKey: id)
+        excludedSubStageSecondsByJob.removeValue(forKey: id)
+        jobAudioSeconds.removeValue(forKey: id)
+    }
+
+    /// Record one echo-cancellation run on `micURL`: logged as its own stage
+    /// event, remembered so leaving `.transcribing` can take it back out of
+    /// that stage's event, and written to the job as `echo.cancellationSeconds`.
+    /// One clock reading for all three, so the per-job record a driver reads
+    /// over the API and the average Settings shows never disagree about what
+    /// a run cost. The clock is read before anything else so the file's
+    /// header read below is not inside the measured span.
+    ///
+    /// Called only for a run that processed the track, whatever the
+    /// self-check then made of it; which runs that includes and why is on
+    /// `EchoDetectionDTO.cancellationSeconds`. Dropped for a job that is no
+    /// longer in the list, the same guard `recordEchoRemoved` applies, so a
+    /// run finishing after its job was cancelled leaves no entry behind.
+    /// Internal (not private) because `PipelineQueue+EchoCancellation.swift`
+    /// calls it.
+    func recordEchoCancellationTiming(jobID: UUID, startedAt: ContinuousClock.Instant, micURL: URL) {
+        let wallClock = (ContinuousClock.now - startedAt).inSeconds
+        guard let index = jobs.firstIndex(where: { $0.id == jobID }) else { return }
+        // Excluded from the enclosing stage only if there is one and the run
+        // started inside it; a run outside any timed stage has nothing to be
+        // taken out of, and charging it to whatever stage comes next would
+        // shorten an unrelated event.
+        if let stageStart = stageStartByJob[jobID], startedAt >= stageStart {
+            excludedSubStageSecondsByJob[jobID, default: 0] += wallClock
+        }
+        // Same optional chain as `recordEchoRemoved`, for the same reason: a
+        // nil `echo` means this number belongs to no measurement.
+        jobs[index].echo?.cancellationSeconds = wallClock
+        // Normalised by the track the run processed, not by `jobAudioSeconds`:
+        // transcription stamps that later, after this run.
+        logStageTiming(
+            stage: .echoCancelling, wallClock: wallClock, jobID: jobID,
+            audioSeconds: Double(AudioMixer.frameCount(of: micURL)) / Double(AudioConstants.targetSampleRate),
+        )
+    }
+
     /// Append one stage-timing event, then refresh the cached averages from the
     /// log so the menu reflects the new data point. Append and reload run in one
     /// Task so the reload is ordered strictly after the append (no race that
-    /// could miss the just-logged event).
-    private func logStageTiming(stage: StageKind, wallClock: Double, jobID: UUID) {
+    /// could miss the just-logged event). `audioSeconds` is evaluated only
+    /// when there is a log to write to, since one caller reads a file for it.
+    private func logStageTiming(
+        stage: StageKind, wallClock: Double, jobID: UUID, audioSeconds: @autoclosure () -> Double,
+    ) {
         guard let stageTimingLog else { return }
-        // audioSeconds is 0 for stages with no known audio length (e.g. a late
-        // re-diarization with no transcription this session); aggregate() then
-        // excludes it from the RTF but still counts its wall-clock.
         let event = StageTimingEvent(
             ts: Date(), jobID: jobID, stage: stage,
-            wallClockSeconds: wallClock, audioSeconds: jobAudioSeconds[jobID] ?? 0,
-            engine: activeEngineTag,
-            diarizerMode: usedDiarizerMode(forJobID: jobID)?.rawValue,
+            wallClockSeconds: wallClock, audioSeconds: audioSeconds(),
+            engine: stage.isEngineScoped ? activeEngineTag : nil,
+            diarizerMode: stage.isEngineScoped ? usedDiarizerMode(forJobID: jobID)?.rawValue : nil,
         )
         Task { [weak self] in
             await stageTimingLog.append([event])
@@ -913,11 +1245,19 @@ class PipelineQueue {
 
     // MARK: - Speaker Naming forwarders
 
-    /// Auto-resolve pending naming items older than maxAge (default: 24h).
+    /// Auto-resolve pending naming items older than the user's
+    /// `staleNamingTimeout` (one day unless changed); does nothing when it is
+    /// `.never`. Runs on snapshot restore.
+    func cleanupStalePending() {
+        guard let maxAge = staleNamingMaxAge else { return }
+        cleanupStalePending(maxAge: maxAge)
+    }
+
+    /// Auto-resolve pending naming items older than `maxAge`.
     /// Thin forwarder passing the queue's already-filtered
     /// `.speakerNamingPending` list to the session, which generates the protocol
     /// with auto-names, transitions them to .done, and deletes sidecar files.
-    func cleanupStalePending(maxAge: TimeInterval = 86400) {
+    func cleanupStalePending(maxAge: TimeInterval) {
         naming.cleanupStalePending(pendingJobs: pendingSpeakerNamingJobs, maxAge: maxAge)
     }
 
@@ -982,6 +1322,14 @@ extension PipelineQueue: SpeakerNamingSessionDelegate {
     /// A value copy of the tracked job, addressed by id (never by a stale index).
     func job(withID id: UUID) -> PipelineJob? {
         jobs.first { $0.id == id }
+    }
+
+    /// The naming session accepted the auto-names (a skip, or the wait running
+    /// out) and there is no protocol to generate: the transcript carrying them
+    /// is the output.
+    func finishWithAcceptedAutoNames(jobID: UUID) {
+        markOutputWritten(jobID: jobID, output: job(withID: jobID)?.transcriptPath)
+        updateJobState(id: jobID, to: .done)
     }
 
     /// Persist the per-job naming metadata on the (queue-owned) job. `nil` for

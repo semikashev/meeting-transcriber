@@ -90,23 +90,31 @@ jobs:
   smoke:
     runs-on: xcode-27
     env:
-      # Xcode 27.0 by its own path rather than /Applications/Xcode.app: the image also
-      # ships 27.1 and a 27.2 beta, and a moved default must never reach a build here.
-      DEVELOPER_DIR: /Applications/Xcode_27.0.app/Contents/Developer
+      # Xcode 27.2 by its own path rather than /Applications/Xcode.app: the image also
+      # ships 27.0 and 27.1, and a moved default must never reach a build here.
+      DEVELOPER_DIR: /Applications/Xcode_27.2.app/Contents/Developer
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - uses: ./.github/actions/verify-xcode
         with:
           developer-dir: ${{ env.DEVELOPER_DIR }}
+
+      # The same Homebrew release build as release.yml's `build (homebrew)`
+      # leg, so it shares that leg's cache (see the comment there).
+      - uses: ./.github/actions/setup-swift-test
+        with:
+          cache-key-suffix: release-homebrew
+          cache-restore-fallback: "false"
+          cache-models: "false"
 
       - name: UI smoke — drive /ui/* against the live app
         run: ./scripts/e2e-settings-smoke.sh
 
       - name: Upload crash reports on failure
         if: failure()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: ui-smoke-crash-reports
           path: ~/Library/Logs/DiagnosticReports/MeetingTranscriber-*.ips

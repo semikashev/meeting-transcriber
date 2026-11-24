@@ -4,7 +4,7 @@ import XCTest
 /// Regression coverage for the Stop-Watching-mid-recording data-loss bug
 /// (issue #84, amit-math): cancelling the watch task while `handleMeeting` is
 /// recording an auto-detected meeting must finalize the recording
-/// (`recorder.stop()` + `enqueueRecording()`) instead of discarding it. Both
+/// (`stopAndEnqueue`) instead of discarding it. Both
 /// `AppState.toggleWatching` and `startManualRecording` call `loop.stop()` →
 /// `watchTask.cancel()` while a meeting may be in flight; previously
 /// `waitForMeetingEnd` threw `CancellationError`, so the finalization lines
@@ -49,7 +49,7 @@ final class WatchLoopCancellationTests: XCTestCase {
             pollInterval: 0.01,
             endGracePeriod: 100, // never ends naturally during the test window
             maxDuration: 100,
-            noMic: true,
+            noMic: { true },
             sleepProvider: sleepProvider,
         )
         loop.permissionChecker = {
@@ -122,7 +122,7 @@ final class WatchLoopCancellationTests: XCTestCase {
             pollInterval: 0.01,
             endGracePeriod: 100,
             maxDuration: 100,
-            noMic: true,
+            noMic: { true },
             sleepProvider: sleepProvider,
         )
         loop.permissionChecker = {

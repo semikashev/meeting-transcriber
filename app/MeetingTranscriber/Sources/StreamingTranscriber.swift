@@ -29,6 +29,8 @@ actor StreamingTranscriber: LiveCaptionPipeline {
         /// 1–5 seconds of float32 mono = 64–320 KB per event, emitted at
         /// most once per ~5 s — small enough to ship by value.
         case finalized(text: String, audio: [Float])
+        /// Another enrolled voice took over the channel; the line before it was cut there.
+        case voiceChanged(String)
     }
 
     typealias EventSink = @Sendable (Event) -> Void
@@ -39,13 +41,19 @@ actor StreamingTranscriber: LiveCaptionPipeline {
 
     private let transcribe: TranscribeFunction
     private let channelLabel: String
-    private let vad: FluidVAD
-    private var vadState: FluidVAD.StreamState?
+    private let detector: any UtteranceBoundaryDetecting
     private var inputAccumulator: [Float] = []
     private var speechSamples: [Float] = []
     private var isSpeaking = false
     private var lastPartialAt: Date = .distantPast
     private let onEvent: EventSink
+
+    /// Whether a failed transcription is worth a warning. A cancellation is
+    /// the session stopping, for instance while the engine still loads its
+    /// model, which throws `CancellationError` at once: nothing went wrong.
+    static func isReportable(_ error: any Error) -> Bool {
+        !(error is CancellationError)
+    }
 
     /// Silero v6 chunk size at 16 kHz — what FluidVAD expects per call.
     private static let chunkSize = 4096
@@ -58,7 +66,7 @@ actor StreamingTranscriber: LiveCaptionPipeline {
     private static let partialIntervalSeconds: TimeInterval = 0.8
     /// 5 seconds at 16 kHz — force a final when speech keeps going without an end event.
     private static let forceFlushSamples = 16000 * 5
-    /// Below 1 second of accumulated speech, drop instead of transcribing (noise).
+    /// Finals below 1 second are dropped as noise, including at flush.
     private static let minFinalSamples = 16000
 
     init(
@@ -68,9 +76,30 @@ actor StreamingTranscriber: LiveCaptionPipeline {
         onEvent: @escaping EventSink,
     ) {
         self.channelLabel = channelLabel
-        self.vad = vad
+        detector = FluidVADBoundaryDetector(vad: vad)
         self.transcribe = transcribe
         self.onEvent = onEvent
+    }
+
+    init(
+        channelLabel: String,
+        detector: any UtteranceBoundaryDetecting,
+        transcribe: @escaping TranscribeFunction,
+        onEvent: @escaping EventSink,
+    ) {
+        self.channelLabel = channelLabel
+        self.detector = detector
+        self.transcribe = transcribe
+        self.onEvent = onEvent
+    }
+
+    func reset() async {
+        inputAccumulator = []
+        speechSamples = []
+        isSpeaking = false
+        lastPartialAt = .distantPast
+        await detector.reset()
+        onEvent(.partial(""))
     }
 
     /// Feed a captured buffer into the streaming pipeline. Buffers that don't
@@ -78,58 +107,46 @@ actor StreamingTranscriber: LiveCaptionPipeline {
     /// app channels are normalized to that shape upstream (mic via
     /// `MicCaptureHandler`, app via `LiveAudioResampler` in
     /// `LiveTranscriptionController`) before reaching here.
-    func ingest(_ buffer: LiveAudioBuffer) async {
+    func ingest(_ buffer: LiveAudioBuffer, backlog: @Sendable () -> TimeInterval) async {
         guard buffer.channelCount == 1, buffer.sampleRate == 16000 else { return }
         inputAccumulator.append(contentsOf: buffer.samples)
-        await drainChunks()
+        await drainChunks(backlog: backlog)
     }
 
-    /// Recording stopped — commit any pending speech as a final so the last
-    /// utterance isn't dropped when the recorder stops mid-speech (no VAD
-    /// `speechEnd` event ever arrives for the tail). `commitFinal()` keeps the
-    /// ≥1 s `minFinalSamples` guard, so sub-second pending speech is still
-    /// dropped as noise. Reset `isSpeaking` afterwards so the actor returns to
-    /// a clean idle state (the controller recreates pipelines per recording, so
-    /// this is belt-and-suspenders against any reuse).
+    /// Recording stop — include any incomplete VAD chunk in active
+    /// speech, then decode the pending tail if it meets the one-second noise
+    /// cutoff. No subsequent audio will reach this pipeline.
     func flush() async {
-        // The driver retires the channel feed before flushing, so every
-        // buffer delivered before the stop has already been ingested — only
-        // a sub-chunk remainder can still sit in the accumulator.
         if !inputAccumulator.isEmpty { await drainChunks() }
+        // drainChunks only consumes full VAD chunks. Preserve the original
+        // unpadded remainder when speech is active instead of abandoning it.
+        if isSpeaking { speechSamples.append(contentsOf: inputAccumulator) }
+        inputAccumulator = []
         await commitFinal()
         isSpeaking = false
     }
 
-    private func drainChunks() async {
-        if vadState == nil {
-            do {
-                vadState = try await vad.makeStreamState()
-            } catch {
-                logger.error(
-                    "[\(self.channelLabel, privacy: .public)] vad init failed: \(error.localizedDescription, privacy: .public)",
-                )
-                return
-            }
-        }
-
+    private func drainChunks(backlog: @Sendable () -> TimeInterval = { 0 }) async {
         while inputAccumulator.count >= Self.chunkSize {
             let chunk = Array(inputAccumulator.prefix(Self.chunkSize))
             inputAccumulator.removeFirst(Self.chunkSize)
-            guard let state = vadState else { return }
             do {
-                let result = try await vad.processStreamingChunk(chunk, state: state)
-                vadState = result.state
-                await handleEvent(result.event, chunk: chunk)
+                let event = try await detector.boundaryWithRetries(in: chunk)
+                await handleEvent(event, chunk: chunk, backlog: backlog)
             } catch {
                 logger.warning(
-                    "[\(self.channelLabel, privacy: .public)] vad chunk error: \(error.localizedDescription, privacy: .public)",
+                    "[\(self.channelLabel, privacy: .public)] dropping chunk after \(vadAttemptsPerChunk) VAD failures: \(error.localizedDescription, privacy: .public)",
                 )
             }
         }
     }
 
-    private func handleEvent(_ event: FluidVAD.StreamEvent?, chunk: [Float]) async {
-        switch event?.kind {
+    private func handleEvent(
+        _ event: FluidVAD.StreamEvent.Kind?,
+        chunk: [Float],
+        backlog: @Sendable () -> TimeInterval,
+    ) async {
+        switch event {
         case .speechStart:
             isSpeaking = true
             speechSamples.append(contentsOf: chunk)
@@ -142,7 +159,7 @@ actor StreamingTranscriber: LiveCaptionPipeline {
         case .none:
             if isSpeaking {
                 speechSamples.append(contentsOf: chunk)
-                await maybeEmitPartial()
+                await maybeEmitPartial(backlog: backlog)
                 if speechSamples.count >= Self.forceFlushSamples {
                     await commitFinal()
                 }
@@ -150,7 +167,9 @@ actor StreamingTranscriber: LiveCaptionPipeline {
         }
     }
 
-    private func maybeEmitPartial() async {
+    private func maybeEmitPartial(backlog: @Sendable () -> TimeInterval) async {
+        let pendingSeconds = backlog() + Double(inputAccumulator.count) / 16000
+        guard pendingSeconds <= Self.partialIntervalSeconds else { return }
         let now = Date()
         guard now.timeIntervalSince(lastPartialAt) >= Self.partialIntervalSeconds else { return }
         guard !speechSamples.isEmpty else { return }
@@ -161,11 +180,11 @@ actor StreamingTranscriber: LiveCaptionPipeline {
             if !text.isEmpty {
                 onEvent(.partial(text))
             }
-        } catch {
+        } catch where Self.isReportable(error) {
             logger.warning(
                 "[\(self.channelLabel, privacy: .public)] partial transcribe error: \(error.localizedDescription, privacy: .public)",
             )
-        }
+        } catch {}
     }
 
     private func commitFinal() async {
@@ -189,10 +208,10 @@ actor StreamingTranscriber: LiveCaptionPipeline {
             if !text.isEmpty {
                 onEvent(.finalized(text: text, audio: buffer))
             }
-        } catch {
+        } catch where Self.isReportable(error) {
             logger.warning(
                 "[\(self.channelLabel, privacy: .public)] final transcribe error: \(error.localizedDescription, privacy: .public)",
             )
-        }
+        } catch {}
     }
 }

@@ -36,19 +36,7 @@ final class SilentTrackWatchdogWiringTests: XCTestCase {
         hold: Bool = false,
         readAges: @escaping @Sendable () -> ChannelSignalAges = { ages(energy: 65) },
     ) throws -> Rig {
-        let rig = makeRig(watchdog: watchdog, running: running, hold: hold, readAges: readAges)
-        try rig.capture.start()
-        XCTAssertEqual(rig.attempts.starts, 1, "precondition: start() ran one attempt")
-        return rig
-    }
-
-    /// Let queued main-queue and diagnostics work run, long enough for the
-    /// restart path's 0.5 s initial wait to have fired had anything been
-    /// scheduled. Used only to show that something did NOT happen.
-    private func settle(_ seconds: TimeInterval = 1.0) {
-        let settled = expectation(description: "settled")
-        DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { settled.fulfill() }
-        wait(for: [settled], timeout: seconds + 5)
+        try Rig.started(watchdog: watchdog, running: running, hold: hold, readAges: readAges)
     }
 
     // MARK: - The restart path
@@ -184,21 +172,34 @@ final class SilentTrackWatchdogWiringTests: XCTestCase {
 
     /// The real tick entry reads the track's ages once and hands them to both
     /// the observer and the watchdog, and the watchdog reads its clock once.
+    ///
+    /// The observer's zero-run probe is held, so its in-flight read makes the
+    /// watchdog skip its own. A check of its own would read outside the tick:
+    /// concluding it reads the clock, and a rebuild's main-queue re-check reads
+    /// the ages and the clock again, neither of which is what is counted here.
     func testTheTickReadsTheAgesOnceForBothConsumers() {
         let reads = CallCounter()
-        let rig = makeRig {
+        let rig = makeRig(hold: true) {
             reads.increment()
             return ages(energy: 61)
+        }
+        defer {
+            rig.state.hold = false
+            rig.state.release.signal()
         }
         _ = rig.capture.debugRMS.tick(intervalSeconds: 0)
 
         rig.capture.maybeReportDebugRMS(processes: processes)
-        settle(0.3)
+        XCTAssertEqual(rig.state.entered.wait(timeout: .now() + 2), .success, "precondition: the observer's read is stuck")
 
         XCTAssertEqual(reads.value, 1)
         XCTAssertEqual(rig.clock.reads, 1)
         XCTAssertEqual(rig.capture.silentTrackDiagnostics.watchdogCounters?.checks, 1, "the watchdog acted on them")
         XCTAssertEqual(rig.capture.silentTrackDiagnostics.counters.zeroRuns, 1, "and so did the observer")
+        // The held read is the observer's: the watchdog's check found it in
+        // flight and was dropped without asking the processes itself.
+        XCTAssertEqual(rig.capture.silentTrackDiagnostics.watchdogCounters?.dropped, 1)
+        XCTAssertEqual(rig.state.readCount, 1)
     }
 
     /// Off, the tick still reads the ages once, for the observer, and the
@@ -355,7 +356,7 @@ final class SilentTrackWatchdogWiringTests: XCTestCase {
         settle(0.3)
         XCTAssertEqual(
             rig.capture.silentTrackWatchdogSummary,
-            "watchdogChecks=1 watchdogDeclined=1 watchdogDropped=0 watchdogRebuilds=0 "
+            "watchdogChecks=1 watchdogNoFirstBufferChecks=0 watchdogDeclined=1 watchdogDropped=0 watchdogRebuilds=0 "
                 + "watchdogRecoveries=0 watchdogGaveUp=false watchdogCapped=false watchdogEndedChannel=false "
                 + "watchdogRebuiltTapStalled=0 watchdogSuperseded=0",
         )
@@ -385,6 +386,28 @@ final class SilentTrackWatchdogWiringTests: XCTestCase {
             pids: [], appOutputURL: nil, micOutputURL: nil, sampleRate: 48000, channels: 2,
         )
         XCTAssertFalse(configuration.silentTrackWatchdog)
+    }
+
+    /// A stood-in attempt keeps the rigs above deaf to the host's device
+    /// changes, which would otherwise taint the rebuild a test tracks and
+    /// start a restart of its own. Both public ways to build a capture must
+    /// keep listening: the session's public init, through what it hands
+    /// `makeAppCapture`, and the capture's own public init. Installing the
+    /// listener needs real hardware, so what is pinned here is the gate
+    /// `start()` consults.
+    func testThePublicInitsBuildCapturesThatListenForOutputDeviceChanges() {
+        let configuration = AudioCaptureConfiguration(
+            pids: [], appOutputURL: nil, micOutputURL: nil, sampleRate: 48000, channels: 2,
+        )
+        let session = AudioCaptureSession(configuration)
+        let sessionCapture = AudioCaptureSession.makeAppCapture(
+            configuration, fileDescriptor: FileHandle.nullDevice.fileDescriptor,
+            attemptBody: session.appAttemptBody,
+        )
+        XCTAssertTrue(sessionCapture.listensForOutputDeviceChanges, "the session's capture")
+
+        let directCapture = AppAudioCapture(pids: [], outputFileDescriptor: FileHandle.nullDevice.fileDescriptor)
+        XCTAssertTrue(directCapture.listensForOutputDeviceChanges, "a capture built through its public init")
     }
 
     // MARK: - The probe's second consumer

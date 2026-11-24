@@ -1,5 +1,6 @@
 // swiftlint:disable file_length
 @testable import MeetingTranscriber
+import os
 import XCTest
 
 final class OpenAIProtocolGeneratorTests: XCTestCase { // swiftlint:disable:this balanced_xctest_lifecycle type_body_length
@@ -169,6 +170,7 @@ final class OpenAIProtocolGeneratorTests: XCTestCase { // swiftlint:disable:this
         MockURLProtocol.errorHandler = nil
         MockURLProtocol.rawResponseHandler = nil
         MockURLProtocol.hangHandler = nil
+        MockURLProtocol.redirectHandler = nil
         super.tearDown()
     }
 
@@ -178,12 +180,19 @@ final class OpenAIProtocolGeneratorTests: XCTestCase { // swiftlint:disable:this
         return URLSession(configuration: config)
     }
 
-    private func makeGenerator(session: URLSession, apiKey: String? = nil) -> OpenAIProtocolGenerator {
+    private func makeGenerator(
+        session: URLSession,
+        apiKey: String? = nil,
+        apiKeyPlacement: OpenAIAPIKeyPlacement = .bearerToken,
+        apiKeyHeaderName: String = "api-key",
+    ) -> OpenAIProtocolGenerator {
         OpenAIProtocolGenerator(
             endpoint: Self.testEndpoint,
             model: "test-model",
             language: "German",
             apiKey: apiKey,
+            apiKeyPlacement: apiKeyPlacement,
+            apiKeyHeaderName: apiKeyHeaderName,
             session: session,
         )
     }
@@ -347,14 +356,113 @@ final class OpenAIProtocolGeneratorTests: XCTestCase { // swiftlint:disable:this
         _ = try await gen.generate(transcript: "Test", title: "Test", diarized: false)
     }
 
+    func testGenerateSetsCustomAPIKeyHeaderWithoutBearerPrefix() async throws {
+        MockURLProtocol.handler = { request in
+            XCTAssertEqual(request.value(forHTTPHeaderField: "x-api-key"), "secret-value")
+            XCTAssertNil(request.value(forHTTPHeaderField: "api-key"))
+            XCTAssertNil(request.value(forHTTPHeaderField: "Authorization"))
+            return self.mockResponse(request, body: Data(Self.okSSE.utf8))
+        }
+
+        // A name other than the default, so the configured name is what reaches the wire.
+        let gen = makeGenerator(
+            session: makeMockSession(),
+            apiKey: "secret-value",
+            apiKeyPlacement: .customHeader,
+            apiKeyHeaderName: "x-api-key",
+        )
+        _ = try await gen.generate(transcript: "Test", title: "Test", diarized: false)
+    }
+
+    func testGenerateTrimsWhitespaceAroundCustomAPIKeyHeaderName() async throws {
+        MockURLProtocol.handler = { request in
+            XCTAssertEqual(request.value(forHTTPHeaderField: "x-api-key"), "secret-value")
+            return self.mockResponse(request, body: Data(Self.okSSE.utf8))
+        }
+
+        let gen = makeGenerator(
+            session: makeMockSession(),
+            apiKey: "secret-value",
+            apiKeyPlacement: .customHeader,
+            apiKeyHeaderName: " x-api-key \n",
+        )
+        _ = try await gen.generate(transcript: "Test", title: "Test", diarized: false)
+    }
+
+    func testGenerateRejectsInvalidCustomAPIKeyHeaderNameBeforeSending() async {
+        let requests = OSAllocatedUnfairLock<Int>(initialState: 0)
+        MockURLProtocol.handler = { request in
+            requests.withLock { $0 += 1 }
+            return self.mockResponse(request, body: Data(Self.okSSE.utf8))
+        }
+
+        let gen = makeGenerator(
+            session: makeMockSession(),
+            apiKey: "secret-value",
+            apiKeyPlacement: .customHeader,
+            apiKeyHeaderName: "Content-Length",
+        )
+        do {
+            _ = try await gen.generate(transcript: "Test", title: "Test", diarized: false)
+            XCTFail("Expected an invalid-header failure")
+        } catch let ProtocolError.connectionFailed(message) {
+            XCTAssertTrue(message.contains("Invalid API key header name"), message)
+        } catch {
+            XCTFail("Expected ProtocolError.connectionFailed, got \(error)")
+        }
+        XCTAssertEqual(requests.withLock { $0 }, 0, "no request may leave with an unusable header name")
+    }
+
+    func testGenerateSendsNoKeyHeaderForCustomHeaderWithoutKey() async throws {
+        for apiKey in [nil, ""] as [String?] {
+            MockURLProtocol.handler = { request in
+                XCTAssertNil(request.value(forHTTPHeaderField: "x-api-key"))
+                XCTAssertNil(request.value(forHTTPHeaderField: "Authorization"))
+                return self.mockResponse(request, body: Data(Self.okSSE.utf8))
+            }
+
+            let gen = makeGenerator(
+                session: makeMockSession(),
+                apiKey: apiKey,
+                apiKeyPlacement: .customHeader,
+                apiKeyHeaderName: "x-api-key",
+            )
+            _ = try await gen.generate(transcript: "Test", title: "Test", diarized: false)
+        }
+    }
+
     func testGenerateNoAuthHeaderWhenKeyNil() async throws {
         MockURLProtocol.handler = { request in
             XCTAssertNil(request.value(forHTTPHeaderField: "Authorization"))
+            XCTAssertNil(request.value(forHTTPHeaderField: "api-key"))
             return self.mockResponse(request, body: Data(Self.okSSE.utf8))
         }
 
         let gen = makeGenerator(session: makeMockSession())
         _ = try await gen.generate(transcript: "Test", title: "Test", diarized: false)
+    }
+
+    func testCustomAPIKeyHeaderNameRejectsHeadersURLSessionOrTheConnectionOwns() {
+        // URLSession overwrites or drops some of these, so the key never leaves;
+        // the rest are sent verbatim and break the request itself.
+        let reserved = ["Content-Type", "Content-Length", "Transfer-Encoding", "Host", "Connection", "Expect", "Upgrade"]
+        for name in reserved {
+            for variant in [name, name.lowercased(), name.uppercased()] {
+                XCTAssertFalse(OpenAIProtocolGenerator.isValidAPIKeyHeaderName(variant), variant)
+            }
+        }
+    }
+
+    func testCustomAPIKeyHeaderNameAcceptsOrdinaryRequestHeaders() {
+        for name in ["Authorization", "Cookie", "User-Agent", "Accept", "X-Custom", "X-API_Key", "api-key", "x-api-key"] {
+            XCTAssertTrue(OpenAIProtocolGenerator.isValidAPIKeyHeaderName(name), name)
+        }
+    }
+
+    func testCustomAPIKeyHeaderNameRejectsMalformedNames() {
+        for name in ["", " ", "x api", "x\tapi", "x:api", "schl\u{00FC}ssel"] {
+            XCTAssertFalse(OpenAIProtocolGenerator.isValidAPIKeyHeaderName(name), name)
+        }
     }
 
     // MARK: - max_tokens / max_completion_tokens negotiation
@@ -418,12 +526,425 @@ final class OpenAIProtocolGeneratorTests: XCTestCase { // swiftlint:disable:this
         XCTAssertEqual(recorder.keys, ["max_tokens", "max_completion_tokens"])
     }
 
-    func testGenerateDoesNotRetryOnUnrelated400() async throws {
-        final class Recorder: @unchecked Sendable { var count = 0 }
-        let recorder = Recorder()
+    // MARK: - Sampling overrides
+
+    private func makeSamplingGenerator(temperature: Double?, topP: Double?) -> OpenAIProtocolGenerator {
+        OpenAIProtocolGenerator(
+            endpoint: Self.testEndpoint,
+            model: "test-model",
+            language: "German",
+            temperature: temperature,
+            topP: topP,
+            session: makeMockSession(),
+        )
+    }
+
+    func testRequestBodyOmitsSamplingKeysWhenUnset() {
+        let body = makeSamplingGenerator(temperature: nil, topP: nil)
+            .requestBody(messages: [], shape: .init(tokenLimit: .maxTokens, includesSampling: true))
+
+        XCTAssertNil(body["temperature"], "an unset override must leave the server default in place")
+        XCTAssertNil(body["top_p"])
+        XCTAssertEqual(body["max_tokens"] as? Int, 16000)
+    }
+
+    func testRequestBodyCarriesSamplingKeysWhenSet() {
+        let body = makeSamplingGenerator(temperature: 0.3, topP: 0.9)
+            .requestBody(messages: [], shape: .init(tokenLimit: .maxTokens, includesSampling: true))
+
+        XCTAssertEqual(body["temperature"] as? Double, 0.3)
+        XCTAssertEqual(body["top_p"] as? Double, 0.9)
+    }
+
+    func testRequestBodyCarriesOnlyTheOverrideThatIsSet() {
+        let body = makeSamplingGenerator(temperature: nil, topP: 0.5)
+            .requestBody(messages: [], shape: .init(tokenLimit: .maxTokens, includesSampling: true))
+
+        XCTAssertNil(body["temperature"])
+        XCTAssertEqual(body["top_p"] as? Double, 0.5)
+    }
+
+    func testRetryWithMaxCompletionTokensKeepsSamplingOverrides() async throws {
+        let recorder = RequestRecorder()
 
         MockURLProtocol.handler = { request in
-            recorder.count += 1
+            let body = self.requestBody(request)
+            recorder.bodies.append(body)
+            if body["max_tokens"] != nil {
+                return self.mockResponse(
+                    request, status: 400, body: Data(Self.unsupportedMaxTokensBody.utf8),
+                )
+            }
+            return self.mockResponse(request, body: Data(Self.okSSE.utf8))
+        }
+
+        _ = try await makeSamplingGenerator(temperature: 0.2, topP: 0.8)
+            .generate(transcript: "x", title: "t", diarized: false)
+
+        XCTAssertEqual(recorder.bodies.count, 2)
+        for body in recorder.bodies {
+            XCTAssertEqual(body["temperature"] as? Double, 0.2)
+            XCTAssertEqual(body["top_p"] as? Double, 0.8)
+        }
+    }
+
+    func testSamplingParameterNormalizationClampsAndRounds() {
+        XCTAssertEqual(OpenAISamplingParameter.temperature.normalized(2.5), 2)
+        XCTAssertEqual(OpenAISamplingParameter.temperature.normalized(-1), 0)
+        XCTAssertEqual(OpenAISamplingParameter.topP.normalized(1.2), 1)
+        XCTAssertEqual(OpenAISamplingParameter.topP.normalized(0.1 + 0.2), 0.3)
+        XCTAssertNil(OpenAISamplingParameter.temperature.normalized(.nan))
+        XCTAssertNil(OpenAISamplingParameter.topP.normalized(.infinity))
+    }
+
+    func testRequestBodyLeavesSamplingOutWhenShapeDropsIt() {
+        let body = makeSamplingGenerator(temperature: 0.3, topP: 0.9)
+            .requestBody(messages: [], shape: .init(tokenLimit: .maxCompletionTokens, includesSampling: false))
+
+        XCTAssertNil(body["temperature"])
+        XCTAssertNil(body["top_p"])
+        XCTAssertEqual(body["max_completion_tokens"] as? Int, 16000)
+    }
+
+    // MARK: - Rejected sampling overrides
+
+    /// 400 body the OpenAI API returns for a reasoning model (o-series, GPT-5)
+    /// sent a non-default temperature.
+    private static let unsupportedTemperatureValueBody = """
+    {"error":{"message":"Unsupported value: 'temperature' does not support 0.2 \
+    with this model. Only the default (1) value is supported.",\
+    "type":"invalid_request_error","param":"temperature","code":"unsupported_value"}}
+    """
+
+    func testRejectsSamplingParameterMatchesRealRefusals() {
+        let refusals = [
+            Self.unsupportedTemperatureValueBody,
+            // The key refused outright, named only in `param`.
+            #"{"error":{"message":"Unsupported parameter for this model.","param":"top_p","code":"unsupported_parameter"}}"#,
+            // Both keys refused together, Anthropic-style envelope.
+            #"{"type":"error","error":{"type":"invalid_request_error","#
+                + #""message":"`temperature` and `top_p` cannot both be specified for this model."}}"#,
+            // The error as a bare string, the top-level `message` and `detail` shapes.
+            #"{"error":"temperature is not supported"}"#,
+            #"{"message":"top_p must be at most 0.99"}"#,
+            #"{"detail":"Unsupported parameter: temperature"}"#,
+            // Not JSON at all.
+            "Bad Request: invalid temperature",
+            // A proxy wrapping the upstream refusal (OpenRouter), and a list of details.
+            #"{"error":{"message":"Provider returned error","code":400,"#
+                + #""metadata":{"raw":"Unsupported value: 'temperature' does not support 0.2"}}}"#,
+            #"{"error":{"message":"Invalid request","details":["top_p is not supported"]}}"#,
+            // Any case.
+            #"{"error":{"message":"Temperature is not supported with this model."}}"#,
+            "TOP_P out of range",
+            // A top-level array of errors (Gemini's OpenAI-compatible endpoint).
+            #"[{"error":{"code":400,"message":"Unsupported parameter: temperature"}}]"#,
+            // The upstream body embedded as a JSON string is searched as JSON.
+            #"{"error":{"message":"Provider returned error","metadata":{"raw":"#
+                + #""{\"error\":{\"message\":\"'temperature' does not support 0.2\"}}"}}}"#,
+        ]
+        for body in refusals {
+            XCTAssertTrue(OpenAIProtocolGenerator.rejectsSamplingParameter(body), body)
+        }
+    }
+
+    func testRejectsSamplingParameterIgnoresUnrelatedErrors() {
+        let unrelated = [
+            "",
+            #"{"error":{"message":"Incorrect API key provided","code":"invalid_api_key"}}"#,
+            Self.unsupportedMaxTokensBody,
+            // Only whole names count.
+            #"{"error":{"message":"top_probs must be an integer","param":"top_probs"}}"#,
+            #"{"error":{"message":"temperature_scale is not a valid field"}}"#,
+            // A validation error echoing the request: the overrides appear,
+            // but outside the error or only as object keys.
+            #"{"error":{"message":"Input validation error"},"input":{"temperature":0.2,"top_p":0.9}}"#,
+            #"{"error":{"message":"Input validation error","input":{"temperature":0.2}}}"#,
+            // The same echo cut off at the read cap: no longer JSON, still not searched.
+            "{\n  \"error\": {\n    \"message\": \"Input validation error\",\n    \"input\": {\"temperature\": 0.2,",
+            "[{\"error\": {\"message\": \"Input validation error\", \"input\": \"temperature",
+            // An array whose error is unrelated, the echo in another element.
+            #"[{"error":{"message":"Invalid model"}},{"input":{"temperature":0.2}}]"#,
+            // An upstream body embedded as a JSON string: its echo is not searched as text.
+            #"{"error":{"message":"Provider returned error","metadata":{"raw":"#
+                + #""{\"error\":{\"message\":\"bad request\"},\"input\":{\"temperature\":0.2}}"}}}"#,
+        ]
+        for body in unrelated {
+            XCTAssertFalse(OpenAIProtocolGenerator.rejectsSamplingParameter(body), body)
+        }
+    }
+
+    func testRequestShapeFallbackAppliesEachFallbackOnceAndOnlyWhenNamed() {
+        typealias Shape = OpenAIProtocolGenerator.RequestShape
+        let initial = Shape(tokenLimit: .maxTokens, includesSampling: true)
+        let bothNamed = #"{"error":{"message":"Unsupported parameter: 'max_tokens'; use 'max_completion_tokens'. 'temperature' is not supported either."}}"#
+
+        XCTAssertEqual(
+            initial.fallback(status: 400, after: Self.unsupportedMaxTokensBody),
+            Shape(tokenLimit: .maxCompletionTokens, includesSampling: true),
+        )
+        XCTAssertEqual(
+            initial.fallback(status: 400, after: Self.unsupportedTemperatureValueBody),
+            Shape(tokenLimit: .maxTokens, includesSampling: false),
+        )
+        XCTAssertEqual(
+            initial.fallback(status: 400, after: bothNamed),
+            Shape(tokenLimit: .maxCompletionTokens, includesSampling: false),
+            "one 400 naming both applies both fallbacks at once",
+        )
+        XCTAssertNil(initial.fallback(status: 400, after: #"{"error":{"message":"Incorrect API key provided"}}"#))
+        // Nothing left to change: a fallback already applied, or no overrides sent.
+        XCTAssertNil(
+            Shape(tokenLimit: .maxCompletionTokens, includesSampling: true)
+                .fallback(status: 400, after: Self.unsupportedMaxTokensBody),
+        )
+        XCTAssertNil(
+            Shape(tokenLimit: .maxTokens, includesSampling: false)
+                .fallback(status: 400, after: Self.unsupportedTemperatureValueBody),
+        )
+    }
+
+    func testRequestShapeFallbackAcceptsSamplingRefusalOn422Only() {
+        typealias Shape = OpenAIProtocolGenerator.RequestShape
+        let initial = Shape(tokenLimit: .maxTokens, includesSampling: true)
+        let validationError = #"{"error":"Input validation error: `temperature` must be strictly positive"}"#
+
+        XCTAssertEqual(
+            initial.fallback(status: 422, after: validationError),
+            Shape(tokenLimit: .maxTokens, includesSampling: false),
+        )
+        XCTAssertNil(
+            initial.fallback(status: 422, after: Self.unsupportedMaxTokensBody),
+            "the max_tokens rename is only answered with a 400",
+        )
+        XCTAssertNil(initial.fallback(status: 500, after: validationError))
+    }
+
+    func testShownErrorBodyKeepsTheBoundAndSeparatesLines() {
+        let lines = (0 ..< 20).map { String(repeating: Character(String($0 % 10)), count: 100) }
+
+        // Cut at the bound, newlines included, never at a whole line past it.
+        XCTAssertEqual(
+            OpenAIProtocolGenerator.shownErrorBody(lines),
+            String(lines.joined(separator: "\n").prefix(OpenAIProtocolGenerator.errorBodyShownCap)),
+        )
+        XCTAssertEqual(OpenAIProtocolGenerator.shownErrorBody(["Bad Request", "x"]), "Bad Request\nx")
+    }
+
+    /// A compact JSON error arrives as one line. Some servers echo the
+    /// request, transcript included, in a validation error, so the shown
+    /// body must stay bounded however long that line is.
+    func testShownErrorBodyBoundsASingleLongLine() {
+        let line = #"{"detail":[{"msg":"bad","input":""# + String(repeating: "z", count: 5000) + #""}]}"#
+        let shown = OpenAIProtocolGenerator.shownErrorBody([line])
+        XCTAssertEqual(shown.count, OpenAIProtocolGenerator.errorBodyShownCap)
+        XCTAssertTrue(line.hasPrefix(shown))
+    }
+
+    /// The read loop keeps at most the read cap, also when the body is one
+    /// line, and still keeps a multi-line body under the cap whole.
+    func testErrorBodyLinesKeepsAtMostTheReadCap() async throws {
+        let cap = OpenAIProtocolGenerator.errorBodyReadCap
+        let long = String(repeating: "q", count: cap * 3)
+        let kept = try await OpenAIProtocolGenerator.errorBodyLines(from: Self.lineStream(["head", long, "tail"]))
+        // Compared by length so a failure does not print the long line.
+        XCTAssertEqual(kept.map(\.count), [4, cap - 4])
+        XCTAssertEqual(kept.first, "head")
+
+        let short = ["{", #"  "error": "temperature""#, "}"]
+        let whole = try await OpenAIProtocolGenerator.errorBodyLines(from: Self.lineStream(short))
+        XCTAssertEqual(whole, short)
+    }
+
+    private static func lineStream(_ lines: [String]) -> AsyncStream<String> {
+        AsyncStream { continuation in
+            lines.forEach { continuation.yield($0) }
+            continuation.finish()
+        }
+    }
+
+    func testGenerateRetriesSamplingRefusalSpreadOverLines() async throws {
+        // Plain text over two lines: joined without a separator, "Request" and
+        // "temperature" would fuse into one word.
+        let recorder = try await recordSamplingRetry(status: 400, body: "Bad Request\ntemperature is not supported")
+        XCTAssertEqual(recorder.bodies.count, 2)
+    }
+
+    func testGenerateRetriesSamplingRefusalAnsweredWith422() async throws {
+        let recorder = try await recordSamplingRetry(
+            status: 422, body: #"{"error":"Input validation error: `temperature` must be strictly positive"}"#,
+        )
+        XCTAssertEqual(recorder.bodies.count, 2)
+    }
+
+    func testGenerateRetriesPrettyPrintedRefusalLongerThanTheShownBound() async throws {
+        // A LiteLLM-style refusal, pretty-printed and well past 500 characters,
+        // still arrives whole and parses.
+        let padding = String(repeating: "x", count: 80)
+        let notes = (0 ..< 10).map { "    \"note\($0)\": \"\(padding)\"," }.joined(separator: "\n")
+        let body = """
+        {
+          "error": {
+            "message": "litellm.UnsupportedParamsError: openai does not support parameters: ['temperature'], for model=o3.",
+            "type": "None",
+            "param": null,
+            "code": "400",
+        \(notes)
+            "end": true
+          }
+        }
+        """
+        XCTAssertGreaterThan(body.count, 1000)
+        let recorder = try await recordSamplingRetry(status: 400, body: body)
+        XCTAssertEqual(recorder.bodies.count, 2)
+    }
+
+    func testGenerateShowsOnlyTheBoundedErrorBody() async throws {
+        let lines = (0 ..< 20).map { "line \($0) " + String(repeating: "y", count: 92) }
+        MockURLProtocol.handler = { request in
+            self.mockResponse(request, status: 400, body: Data(lines.joined(separator: "\n").utf8))
+        }
+
+        do {
+            _ = try await makeGenerator(session: makeMockSession())
+                .generate(transcript: "x", title: "t", diarized: false)
+            XCTFail("expected the 400 to propagate")
+        } catch let ProtocolError.httpError(_, body) {
+            XCTAssertEqual(body, OpenAIProtocolGenerator.shownErrorBody(lines))
+            XCTAssertLessThan(body.count, 700)
+        }
+    }
+
+    /// Run a generation with both overrides set against an endpoint that
+    /// answers `status` with `body` while temperature is sent, and record the
+    /// requests.
+    private func recordSamplingRetry(status: Int, body: String) async throws -> RequestRecorder {
+        let recorder = RequestRecorder()
+        MockURLProtocol.handler = { request in
+            let sent = self.requestBody(request)
+            recorder.bodies.append(sent)
+            if sent["temperature"] != nil {
+                return self.mockResponse(request, status: status, body: Data(body.utf8))
+            }
+            return self.mockResponse(request, body: Data(Self.okSSE.utf8))
+        }
+        let result = try await makeSamplingGenerator(temperature: 0.2, topP: 0.8)
+            .generate(transcript: "x", title: "t", diarized: false)
+        XCTAssertEqual(result, "OK")
+        return recorder
+    }
+
+    func testGenerateRetriesWithoutSamplingOverridesWhenRejected() async throws {
+        let recorder = RequestRecorder()
+
+        MockURLProtocol.handler = { request in
+            let body = self.requestBody(request)
+            recorder.bodies.append(body)
+            if body["temperature"] != nil {
+                return self.mockResponse(
+                    request, status: 400, body: Data(Self.unsupportedTemperatureValueBody.utf8),
+                )
+            }
+            return self.mockResponse(request, body: Data(Self.okSSE.utf8))
+        }
+
+        let result = try await makeSamplingGenerator(temperature: 0.2, topP: 0.8)
+            .generate(transcript: "x", title: "t", diarized: false)
+
+        XCTAssertEqual(result, "OK")
+        XCTAssertEqual(recorder.bodies.count, 2)
+        let retry = try XCTUnwrap(recorder.bodies.last)
+        XCTAssertNil(retry["temperature"])
+        XCTAssertNil(retry["top_p"], "both overrides are dropped, not only the one named")
+        XCTAssertEqual(retry["max_tokens"] as? Int, 16000, "the cap is left as it was")
+    }
+
+    func testGenerateDoesNotRetrySamplingRefusalWhenNoOverrideWasSent() async throws {
+        let recorder = RequestRecorder()
+
+        MockURLProtocol.handler = { request in
+            recorder.bodies.append(self.requestBody(request))
+            return self.mockResponse(
+                request, status: 400, body: Data(Self.unsupportedTemperatureValueBody.utf8),
+            )
+        }
+
+        do {
+            _ = try await makeSamplingGenerator(temperature: nil, topP: nil)
+                .generate(transcript: "x", title: "t", diarized: false)
+            XCTFail("expected the 400 to propagate")
+        } catch let ProtocolError.httpError(status, _) {
+            XCTAssertEqual(status, 400)
+        }
+        XCTAssertEqual(recorder.bodies.count, 1, "nothing was sent that dropping could change")
+    }
+
+    /// The two fallbacks compose in either order and end on a body that
+    /// carries `max_completion_tokens` and no overrides.
+    private func assertBothFallbacksCompose(maxTokensRefusedFirst: Bool) async throws {
+        let recorder = RequestRecorder()
+
+        MockURLProtocol.handler = { request in
+            let body = self.requestBody(request)
+            recorder.bodies.append(body)
+            let maxTokensRefusal = body["max_tokens"] != nil ? Self.unsupportedMaxTokensBody : nil
+            let temperatureRefusal = body["temperature"] != nil ? Self.unsupportedTemperatureValueBody : nil
+            let refusal = maxTokensRefusedFirst
+                ? maxTokensRefusal ?? temperatureRefusal
+                : temperatureRefusal ?? maxTokensRefusal
+            if let refusal {
+                return self.mockResponse(request, status: 400, body: Data(refusal.utf8))
+            }
+            return self.mockResponse(request, body: Data(Self.okSSE.utf8))
+        }
+
+        let result = try await makeSamplingGenerator(temperature: 0.2, topP: nil)
+            .generate(transcript: "x", title: "t", diarized: false)
+
+        XCTAssertEqual(result, "OK")
+        XCTAssertEqual(recorder.bodies.count, 3)
+        let final = try XCTUnwrap(recorder.bodies.last)
+        XCTAssertEqual(final["max_completion_tokens"] as? Int, 16000)
+        XCTAssertNil(final["max_tokens"])
+        XCTAssertNil(final["temperature"])
+    }
+
+    func testGenerateComposesMaxTokensThenSamplingFallback() async throws {
+        try await assertBothFallbacksCompose(maxTokensRefusedFirst: true)
+    }
+
+    func testGenerateComposesSamplingThenMaxTokensFallback() async throws {
+        try await assertBothFallbacksCompose(maxTokensRefusedFirst: false)
+    }
+
+    func testGenerateStopsAfterThreeAttemptsWhenRefusalsPersist() async throws {
+        let recorder = RequestRecorder()
+
+        // Refuses the cap while it is `max_tokens`, then refuses temperature
+        // forever, even once it is no longer sent.
+        MockURLProtocol.handler = { request in
+            recorder.bodies.append(self.requestBody(request))
+            let refusal = self.requestBody(request)["max_tokens"] != nil
+                ? Self.unsupportedMaxTokensBody : Self.unsupportedTemperatureValueBody
+            return self.mockResponse(request, status: 400, body: Data(refusal.utf8))
+        }
+
+        do {
+            _ = try await makeSamplingGenerator(temperature: 0.2, topP: 0.8)
+                .generate(transcript: "x", title: "t", diarized: false)
+            XCTFail("expected the last 400 to propagate")
+        } catch let ProtocolError.httpError(status, body) {
+            XCTAssertEqual(status, 400)
+            XCTAssertEqual(body, Self.unsupportedTemperatureValueBody)
+        }
+        XCTAssertEqual(recorder.bodies.count, 3, "one attempt plus at most one retry per fallback")
+    }
+
+    func testGenerateDoesNotRetryOnUnrelated400() async throws {
+        let recorder = RequestRecorder()
+
+        MockURLProtocol.handler = { request in
+            recorder.bodies.append(self.requestBody(request))
             return self.mockResponse(
                 request, status: 400,
                 body: Data(#"{"error":{"message":"Incorrect API key provided"}}"#.utf8),
@@ -437,15 +958,14 @@ final class OpenAIProtocolGeneratorTests: XCTestCase { // swiftlint:disable:this
         } catch let ProtocolError.httpError(status, _) {
             XCTAssertEqual(status, 400)
         }
-        XCTAssertEqual(recorder.count, 1, "an unrelated 400 must not trigger a retry")
+        XCTAssertEqual(recorder.bodies.count, 1, "an unrelated 400 must not trigger a retry")
     }
 
     func testGenerateDoesNotRetryOnNon400NamingBothParameters() async throws {
-        final class Recorder: @unchecked Sendable { var count = 0 }
-        let recorder = Recorder()
+        let recorder = RequestRecorder()
 
         MockURLProtocol.handler = { request in
-            recorder.count += 1
+            recorder.bodies.append(self.requestBody(request))
             return self.mockResponse(
                 request, status: 502, body: Data(Self.unsupportedMaxTokensBody.utf8),
             )
@@ -458,7 +978,7 @@ final class OpenAIProtocolGeneratorTests: XCTestCase { // swiftlint:disable:this
         } catch let ProtocolError.httpError(status, _) {
             XCTAssertEqual(status, 502)
         }
-        XCTAssertEqual(recorder.count, 1, "only an explicit 400 refusal may retry")
+        XCTAssertEqual(recorder.bodies.count, 1, "only an explicit 400 refusal may retry")
     }
 
     func testGenerateDiarizedDoesNotThrow() async throws {
@@ -543,6 +1063,188 @@ final class OpenAIProtocolGeneratorTests: XCTestCase { // swiftlint:disable:this
         } else {
             XCTFail("Expected success")
         }
+    }
+
+    func testTestConnectionSetsCustomAPIKeyHeaderWithoutBearerPrefix() async {
+        MockURLProtocol.handler = { request in
+            XCTAssertEqual(request.url?.absoluteString, "http://test.local/v1/models")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "x-api-key"), "secret-value")
+            XCTAssertNil(request.value(forHTTPHeaderField: "api-key"))
+            XCTAssertNil(request.value(forHTTPHeaderField: "Authorization"))
+            return self.mockResponse(request, body: Data(#"{"data":[]}"#.utf8))
+        }
+
+        let result = await OpenAIProtocolGenerator.testConnection(
+            endpoint: "http://test.local/v1/chat/completions",
+            model: "test",
+            apiKey: "secret-value",
+            apiKeyPlacement: .customHeader,
+            apiKeyHeaderName: "x-api-key",
+            session: makeMockSession(),
+        )
+        guard case .success = result else {
+            XCTFail("Expected custom-header model request to succeed, got \(result)")
+            return
+        }
+    }
+
+    func testTestConnectionRejectsInvalidCustomAPIKeyHeaderName() async {
+        let result = await OpenAIProtocolGenerator.testConnection(
+            endpoint: "http://test.local/v1",
+            model: "test",
+            apiKey: "secret-value",
+            apiKeyPlacement: .customHeader,
+            apiKeyHeaderName: "Content-Type",
+            session: makeMockSession(),
+        )
+        guard case let .failure(error) = result else {
+            XCTFail("Expected an invalid-header failure")
+            return
+        }
+        XCTAssertTrue(error.localizedDescription.contains("Invalid API key header name"))
+    }
+
+    // MARK: - Custom API key header across redirects
+
+    /// Redirect every request that does not already target `location` there with
+    /// `status`, answer the follow-up with `body`, and record each request that
+    /// reaches the answering handler.
+    private func redirectOnce(status: Int, to location: String, body: String) -> OSAllocatedUnfairLock<[URLRequest]> {
+        let received = OSAllocatedUnfairLock<[URLRequest]>(initialState: [])
+        // swiftlint:disable:next force_unwrapping
+        let target = URL(string: location)!
+        MockURLProtocol.redirectHandler = { request in
+            request.url == target ? nil : (status, target)
+        }
+        MockURLProtocol.handler = { request in
+            received.withLock { $0.append(request) }
+            return self.mockResponse(request, body: Data(body.utf8))
+        }
+        return received
+    }
+
+    private func makeCustomHeaderGenerator() -> OpenAIProtocolGenerator {
+        makeGenerator(
+            session: makeMockSession(),
+            apiKey: "secret-value",
+            apiKeyPlacement: .customHeader,
+            apiKeyHeaderName: "x-api-key",
+        )
+    }
+
+    private func customHeaderTestConnection(
+        endpoint: String = "http://test.local/v1",
+    ) async -> Result<[String], any Error> {
+        await OpenAIProtocolGenerator.testConnection(
+            endpoint: endpoint,
+            model: "test",
+            apiKey: "secret-value",
+            apiKeyPlacement: .customHeader,
+            apiKeyHeaderName: "x-api-key",
+            session: makeMockSession(),
+        )
+    }
+
+    /// Run generate() and require it to fail with the redirect's own status,
+    /// which is what URLSession returns once the hop is refused.
+    private func assertGenerateFailsWithRedirectStatus(
+        _ expected: Int, file: StaticString = #filePath, line: UInt = #line,
+    ) async {
+        do {
+            _ = try await makeCustomHeaderGenerator().generate(transcript: "Test", title: "Test", diarized: false)
+            XCTFail("Expected the refused redirect to fail the call", file: file, line: line)
+        } catch let ProtocolError.httpError(status, _) {
+            XCTAssertEqual(status, expected, file: file, line: line)
+        } catch {
+            XCTFail("Expected HTTP \(expected), got \(error)", file: file, line: line)
+        }
+    }
+
+    func testGenerateRefusesRedirectToAnotherHostWithCustomAPIKeyHeader() async {
+        // A 307 would replay the POST body, the whole transcript, to the new host.
+        let received = redirectOnce(status: 307, to: "http://elsewhere.test/v1/chat/completions", body: Self.okSSE)
+
+        await assertGenerateFailsWithRedirectStatus(307)
+
+        XCTAssertEqual(received.withLock { $0 }.map(\.url), [], "nothing may reach the other host")
+    }
+
+    func testGenerateRefusesRedirectToAnotherSchemeWithCustomAPIKeyHeader() async {
+        // Same host and port as the endpoint, so only the scheme differs.
+        let received = redirectOnce(status: 308, to: "https://test.local:80/v1/chat/completions", body: Self.okSSE)
+
+        await assertGenerateFailsWithRedirectStatus(308)
+
+        XCTAssertEqual(received.withLock { $0 }.map(\.url), [], "nothing may reach the other scheme")
+    }
+
+    func testGenerateKeepsCustomAPIKeyHeaderOnSameOriginRedirect() async throws {
+        let received = redirectOnce(status: 307, to: "http://test.local/v2/chat/completions", body: Self.okSSE)
+
+        _ = try await makeCustomHeaderGenerator().generate(transcript: "Test", title: "Test", diarized: false)
+
+        let followUp = try XCTUnwrap(received.withLock { $0 }.first)
+        XCTAssertEqual(followUp.url?.path, "/v2/chat/completions")
+        XCTAssertEqual(followUp.value(forHTTPHeaderField: "x-api-key"), "secret-value")
+    }
+
+    func testTestConnectionRefusesRedirectToAnotherPortWithCustomAPIKeyHeader() async {
+        let received = redirectOnce(status: 302, to: "http://test.local:8080/v1/models", body: #"{"data":[]}"#)
+
+        let result = await customHeaderTestConnection()
+
+        guard case let .failure(error) = result else {
+            XCTFail("Expected the refused redirect to fail, got \(result)")
+            return
+        }
+        guard case let ProtocolError.httpError(status, _) = error else {
+            XCTFail("Expected HTTP 302, got \(error)")
+            return
+        }
+        XCTAssertEqual(status, 302)
+        XCTAssertEqual(received.withLock { $0 }.map(\.url), [], "nothing may reach the other port")
+    }
+
+    func testTestConnectionKeepsCustomAPIKeyHeaderOnSameOriginRedirect() async throws {
+        let received = redirectOnce(status: 301, to: "http://test.local/v2/models", body: #"{"data":[]}"#)
+
+        let result = await customHeaderTestConnection()
+
+        guard case .success = result else {
+            XCTFail("Expected success, got \(result)")
+            return
+        }
+        let followUp = try XCTUnwrap(received.withLock { $0 }.first)
+        XCTAssertEqual(followUp.url?.path, "/v2/models")
+        XCTAssertEqual(followUp.value(forHTTPHeaderField: "x-api-key"), "secret-value")
+    }
+
+    func testGenerateKeepsCustomAPIKeyHeaderOnRedirectToSameHostInOtherCase() async throws {
+        // Host names are case-insensitive, so this hop stays on the origin.
+        let received = redirectOnce(status: 307, to: "http://TEST.LOCAL/v2/chat/completions", body: Self.okSSE)
+
+        _ = try await makeCustomHeaderGenerator().generate(transcript: "Test", title: "Test", diarized: false)
+
+        let followUp = try XCTUnwrap(received.withLock { $0 }.first)
+        XCTAssertEqual(followUp.url?.host, "TEST.LOCAL")
+        XCTAssertEqual(followUp.url?.path, "/v2/chat/completions")
+        XCTAssertEqual(followUp.value(forHTTPHeaderField: "x-api-key"), "secret-value")
+    }
+
+    func testTestConnectionKeepsCustomAPIKeyHeaderOnRedirectToExplicitDefaultPort() async throws {
+        // An https endpoint, so the omitted port means 443 and not 80.
+        let received = redirectOnce(status: 302, to: "https://test.local:443/v2/models", body: #"{"data":[]}"#)
+
+        let result = await customHeaderTestConnection(endpoint: "https://test.local/v1")
+
+        guard case .success = result else {
+            XCTFail("Expected success, got \(result)")
+            return
+        }
+        let followUp = try XCTUnwrap(received.withLock { $0 }.first)
+        XCTAssertEqual(followUp.url?.port, 443)
+        XCTAssertEqual(followUp.url?.path, "/v2/models")
+        XCTAssertEqual(followUp.value(forHTTPHeaderField: "x-api-key"), "secret-value")
     }
 
     func testTestConnectionHTTPError() async {
@@ -769,4 +1471,9 @@ final class OpenAIProtocolGeneratorTests: XCTestCase { // swiftlint:disable:this
         XCTAssertTrue(result.contains("Ä Ö Ü ß"))
         XCTAssertTrue(result.contains("\"quotes\""))
     }
+}
+
+/// The decoded request bodies a `MockURLProtocol` handler saw, in order.
+private final class RequestRecorder: @unchecked Sendable {
+    var bodies: [[String: Any]] = []
 }

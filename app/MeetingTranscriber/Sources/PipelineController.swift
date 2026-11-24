@@ -1,3 +1,4 @@
+// swiftlint:disable file_length
 import Foundation
 import Observation
 import os.log
@@ -29,7 +30,8 @@ final class PipelineController {
     /// by `installQueueForTesting`.
     private(set) var queue: PipelineQueue
 
-    private let settings: AppSettings
+    // Internal, not private: the `+MeetingNotes` extension reads both.
+    let settings: AppSettings
     let notifier: any AppNotifying
 
     /// Decides the folder a new queue writes into, and tells the user when it is
@@ -43,6 +45,8 @@ final class PipelineController {
     /// Durable finished-job record store, shared across queue rebuilds and read
     /// by `jobStatus(forID:)` for the automation API. Test-injectable.
     let terminalJobStore: TerminalJobStore
+    /// Shared across queue rebuilds; see `PipelineController+Retention.swift`.
+    let recordingRetention: RecordingRetention
 
     /// Where the queues this controller builds keep their data and how they
     /// reach the output folder, beyond the settings: the logs and snapshot, the
@@ -50,23 +54,45 @@ final class PipelineController {
     /// scope is opened, the recovery of that staging folder a new queue runs,
     /// and how the output folder is resolved. Production uses `.production`,
     /// the app's own data directories; a test passes temp folders so a queue it
-    /// builds never reads or writes the installed app's data.
+    /// builds never reads or writes the installed app's data. Required wherever
+    /// it is taken, never defaulted, so leaving it out cannot silently mean the
+    /// app's own folders.
     struct QueueEnvironment {
-        var logDir: URL?
+        var logDir: URL
         var stagingDir: URL
+        /// The speaker database and the two history logs a queue appends to as
+        /// jobs run. Files, not folders; production names the app's own.
+        var speakersDB: URL
+        var recognitionStatsLog: URL
+        var stageTimingLog: URL
         var securityScope: SecurityScopeAccess = .live
         /// Rescues crashed recordings from the staging folder and enqueues
         /// orphans into the queue it is handed; nil skips it.
         var recoverStagedRecordings: (@MainActor (PipelineQueue) -> Void)?
 
         var resolveOutputDir: @MainActor (OutputDirectoryResolver) -> URL = { $0.resolve() }
+        /// Where the queues hand each saved protocol on to; nil for nowhere.
+        var deliverProtocol: ProtocolWebhook.Delivery?
         /// The queue the controller starts with; nil builds a bare one on this
         /// environment's folders. A test passes one wired to mocks, so the
         /// controller never holds a queue the test did not choose.
         var initialQueue: PipelineQueue?
     }
 
-    @ObservationIgnored private let queueEnvironment: QueueEnvironment
+    @ObservationIgnored let queueEnvironment: QueueEnvironment
+
+    /// The speaker database this controller's queues use, for the rest of the
+    /// app state that reads or changes it alongside them (the RPC snapshot and
+    /// speaker actions), so all of them agree on one file.
+    var speakersDB: URL {
+        queueEnvironment.speakersDB
+    }
+
+    /// How the queues this controller builds open the output folder's scope,
+    /// for a retention pass that runs before any of them is built.
+    var queueSecurityScope: SecurityScopeAccess {
+        queueEnvironment.securityScope
+    }
 
     /// Called with the new queue whenever `rebuild()` replaces it, so a holder
     /// of the old one can follow. The active `WatchLoop` is one: it enqueues
@@ -110,8 +136,8 @@ final class PipelineController {
     init(
         settings: AppSettings,
         notifier: any AppNotifying,
+        queueEnvironment: QueueEnvironment,
         terminalJobStore: TerminalJobStore? = nil,
-        queueEnvironment: QueueEnvironment = .production,
     ) {
         self.settings = settings
         self.notifier = notifier
@@ -119,12 +145,13 @@ final class PipelineController {
         self.outputDirectory = OutputDirectoryResolver(settings: settings, notifier: notifier)
         self.terminalJobStore = terminalJobStore
             ?? TerminalJobStore(
-                path: (queueEnvironment.logDir ?? AppPaths.ipcDir).appendingPathComponent("terminal_jobs.json"),
+                path: queueEnvironment.logDir.appendingPathComponent("terminal_jobs.json"),
             )
         self.queue = queueEnvironment.initialQueue
             ?? PipelineQueue(
                 logDir: queueEnvironment.logDir, stagingDir: queueEnvironment.stagingDir,
             )
+        recordingRetention = Self.makeRecordingRetention(logDir: queueEnvironment.logDir, settings: settings)
     }
 
     /// Wire the active-engine source. Called once from `AppState.init` after its
@@ -132,6 +159,7 @@ final class PipelineController {
     func activate(engineProvider: @escaping () -> (any TranscribingEngine)?) {
         self.engineProvider = engineProvider
         observeOutputFolder()
+        startRecordingRetention()
     }
 
     // MARK: - Queue lifecycle
@@ -181,6 +209,8 @@ final class PipelineController {
         // says what reading the identity afterwards would cost.
         let replaced = queueWasBuiltHere ? queue : nil
         guard let built = makeQueue() else { return }
+        // Before the restore, which at once announces a job waiting for names and reports one it finishes.
+        configureCallbacks(on: built)
         if let replaced {
             built.adoptJobs(of: replaced)
             replaced.retire()
@@ -195,8 +225,8 @@ final class PipelineController {
         // `testAQueueBuiltWithoutBeingInstalledDoesNotDisarmTheFolderChange`.
         queueBuiltFromBookmark = settings.customOutputDirBookmark
         builtQueue = built
-        configureCallbacks()
         onQueueReplaced?(queue)
+        Task { [weak self] in await self?.sweepRetainedRecordings() }
     }
 
     /// Whether the installed queue is one this controller built, as opposed to
@@ -209,6 +239,7 @@ final class PipelineController {
     /// every job done or failed (a job parked for naming is neither).
     private var canReplaceQueue: Bool {
         !queue.isProcessing && queue.jobs.allSatisfy(\.state.isTerminal)
+            && queue.canHandOverNotionExports(builtHere: queueWasBuiltHere)
     }
 
     /// Rebuild the queue when the output folder has changed since it was built,
@@ -285,25 +316,25 @@ final class PipelineController {
     ///
     /// Wiring only; `rebuild` owns the steps that make a queue live.
     ///
-    /// Not free of effect even so: a `PipelineQueue` takes the output folder's
-    /// security scope in its initialiser and holds it for its lifetime, so a
-    /// queue built and dropped takes and releases one.
+    /// Not free of effect even so: a `PipelineQueue` takes the output folder's security scope
+    /// in its initialiser and holds it for its lifetime, so a queue built and dropped takes and releases one.
     func makeQueue() -> PipelineQueue? {
         guard let engine = engineProvider?() else { return nil }
-        return PipelineQueue(
+        let queue = PipelineQueue(
             engine: engine,
             diarizationFactory: { [self] in makeFluidDiarizer(mode: settings.diarizerMode) },
             diarizationFactoryWithMode: { [self] mode in makeFluidDiarizer(mode: mode) },
             protocolGeneratorFactory: { [self] in makeProtocolGenerator() },
-            // Captured by value: this is the moment the destination of every job
-            // this queue will run is decided, so a fallback is reported here and
-            // not from `effectiveOutputDir`, which `body` reads on every render.
+            // Captured by value: this is the moment the destination of every job this queue will run is
+            // decided, so a fallback is reported here and not from `effectiveOutputDir`, which `body` reads on every render.
             outputDir: queueEnvironment.resolveOutputDir(outputDirectory),
             logDir: queueEnvironment.logDir,
             stagingDir: queueEnvironment.stagingDir,
             diarizeEnabled: settings.diarize,
+            staleNamingMaxAge: { [settings] in settings.staleNamingTimeout.maxAge },
             echoDedupEnabled: settings.echoDedupEnabled,
             echoCancellationEnabled: { [settings] in settings.echoCancellationEnabled },
+            autoOpenSpeakerNaming: { [settings] in settings.autoOpenSpeakerNaming },
             numSpeakers: settings.numSpeakers,
             micLabel: settings.micName,
             includeFullTranscriptInProtocol: settings.includeFullTranscriptInProtocol,
@@ -316,22 +347,26 @@ final class PipelineController {
                     useAITitleForFilenames: settings.useAITitleForFilenames,
                 )
             },
-            speakerMatcherFactory: { SpeakerMatcher() },
+            speakerMatcherFactory: SpeakerMatcher.factory(dbPath: speakersDB, notifier: notifier),
             vadConfig: settings.vadEnabled ? VADConfig(threshold: settings.vadThreshold) : nil,
-            recognitionStatsLog: RecognitionStatsLog(),
+            recognitionStatsLog: RecognitionStatsLog(path: queueEnvironment.recognitionStatsLog),
             terminologyNormalizer: { [weak settings] in
-                TerminologyNormalizer(rulesText: settings?.terminologyRulesText ?? "")
+                settings?.terminologyNormalizerForJob() ?? TerminologyNormalizer()
             },
-            stageTimingLog: StageTimingLog(),
+            stageTimingLog: StageTimingLog(path: queueEnvironment.stageTimingLog),
+            notionExportConfigurationProvider: { [settings] in NotionExportConfiguration.resolve(settings: settings) },
             terminalJobStore: terminalJobStore,
             securityScope: queueEnvironment.securityScope,
+            recordingRetention: recordingRetention,
         )
+        queue.deliverProtocol = queueEnvironment.deliverProtocol
+        return queue
     }
 
     /// One-stop FluidDiarizer instantiation. Captures the current tuning fields
     /// from settings so both the global-mode factory and the per-job
     /// mode-override factory stay in sync. Tuning only affects `.offline` mode,
-    /// but is harmless when passed to `.sortformer`.
+    /// but is harmless when passed to the other modes.
     private func makeFluidDiarizer(mode: DiarizerMode) -> FluidDiarizer {
         FluidDiarizer(
             mode: mode,
@@ -370,6 +405,10 @@ final class PipelineController {
                 model: settings.openAIModel,
                 language: settings.protocolLanguage,
                 apiKey: settings.openAIAPIKey.isEmpty ? nil : settings.openAIAPIKey,
+                apiKeyPlacement: settings.openAIAPIKeyPlacement,
+                apiKeyHeaderName: settings.openAIAPIKeyHeaderName,
+                temperature: settings.openAITemperature,
+                topP: settings.openAITopP,
             )
 
         case .none:
@@ -377,12 +416,14 @@ final class PipelineController {
         }
     }
 
-    func configureCallbacks() {
-        queue.onJobStateChange = { [notifier, weak self] job, _, newState in
+    func configureCallbacks(on target: PipelineQueue? = nil) {
+        let queue = target ?? queue
+        queue.onNotionExportFinished = { [notifier] in notifier.notifyNotionExport(job: $0, failureReason: $1) }
+        queue.onJobStateChange = { [notifier, settings, weak self] job, _, newState in
             switch newState {
             case .done:
-                let title = job.protocolPath != nil ? "Protocol Ready" : "Transcript Saved"
-                notifier.notify(title: title, body: job.meetingTitle)
+                let note = PipelineQueue.doneNotification(for: job, announceNotesFailure: settings.notifyOnMeetingNotesFailure)
+                notifier.notify(title: note.title, body: note.body)
                 self?.finishMerge(job: job, succeeded: true)
 
             case .error:
@@ -394,6 +435,10 @@ final class PipelineController {
             default:
                 break
             }
+        }
+        queue.onSpeakerNamesWaiting = { [notifier] in notifier.notify(title: "Name Speakers", body: PipelineQueue.speakerNamesWaitingMessage($0)) }
+        queue.onUnusableVoices = { [notifier] job, names in
+            notifier.notify(title: "Voice not saved", body: PipelineQueue.unusableVoicesMessage(names, in: job))
         }
     }
 
@@ -433,7 +478,7 @@ final class PipelineController {
         var ids: [UUID] = []
 
         for group in resolution.paired {
-            let sidecar = RecordingSidecar.read(
+            let sidecar = RecordingSidecar.readForReimport(
                 fromDirectory: group.directory,
                 basename: group.stem,
             )
@@ -449,7 +494,7 @@ final class PipelineController {
             let job = PipelineJob(
                 meetingTitle: title, appName: appName,
                 mixPath: group.mix, appPath: group.app, micPath: group.mic,
-                micDelay: micDelay, participants: participants,
+                micDelay: micDelay, micMuteIntervals: sidecar?.micMuteIntervals(app: group.app, mic: group.mic) ?? [], participants: participants,
                 // Record-only fleet flow: a separate host reprocesses recordings
                 // captured elsewhere. Anchor the output basename on the sidecar's
                 // real meeting-start time, not this reprocessing moment.
@@ -538,11 +583,11 @@ final class PipelineController {
     /// Shared guard + dispatch for confirm/skip: act only on a job actually
     /// awaiting naming, returning whether it did (false → 404).
     private func resolveNaming(jobID: UUID, result: PipelineQueue.SpeakerNamingResult) -> Bool {
-        guard pendingNamingData(forID: jobID) != nil else { return false }
         // Tagged `.rpc`: nobody was looking at a dialog, so a row from here must
-        // not read as a human decision in the recognition log.
-        queue.completeSpeakerNaming(jobID: jobID, result: result, source: .rpc)
-        return true
+        // not read as a human decision in the recognition log. Whether the job
+        // was awaiting naming is the session's answer, so a refused answer can
+        // never read as taken.
+        queue.completeSpeakerNaming(jobID: jobID, result: result, source: .rpc) == nil
     }
 
     // MARK: - Blocking transcribe (one-call automation API)
@@ -553,14 +598,17 @@ final class PipelineController {
     /// state. Returns `.noFile` when the path doesn't exist, `.timedOut` with
     /// the in-flight status once `maxWaitSeconds` elapses (the job keeps running
     /// and will still finish on its own), else `.completed` with the terminal
-    /// status.
+    /// status. A Notion export is not waited for: `export` says if it is pending.
+    /// `onEnqueued` gets the job id as soon as the job exists, before the wait.
     func transcribeAndWait(
         path: URL,
         maxWaitSeconds: Double,
         pollInterval: Duration = .milliseconds(200),
+        onEnqueued: @MainActor (UUID) -> Void = { _ in },
     ) async -> BlockingTranscribeResult {
         guard let jobID = enqueueExistingFilesReturningIDs([path], autoSkipNaming: true).first
         else { return .noFile }
+        onEnqueued(jobID)
         let deadline = ContinuousClock.now.advanced(by: .seconds(maxWaitSeconds))
         while ContinuousClock.now < deadline {
             if let job = queue.jobs.first(where: { $0.id == jobID }) {
@@ -570,14 +618,17 @@ final class PipelineController {
             }
             try? await Task.sleep(for: pollInterval)
         }
-        // Final read: a job that went terminal in the last sub-interval window
-        // (or while we were enqueuing with maxWaitSeconds==0) is completed, not
-        // timed out.
+        // Final read: a job that went terminal in the last sub-interval window (or
+        // while enqueuing with maxWaitSeconds==0) is completed, not timed out.
         let final = jobStatus(forID: jobID)
         if let final, final.state.isTerminal { return .completed(final) }
         return .timedOut(final)
     }
 }
+
+/// The blocking-transcribe seam behind `POST /v1/transcribe`: file, wait in
+/// seconds, and a callback the job id is handed to once the job exists.
+typealias BlockingTranscribe = (URL, Double, @MainActor (UUID) -> Void) async -> BlockingTranscribeResult
 
 /// Outcome of a blocking `transcribeAndWait`. The RPC layer maps `noFile` → 400,
 /// `completed` → 200, `timedOut` → 202.
@@ -585,14 +636,4 @@ enum BlockingTranscribeResult {
     case noFile
     case completed(JobStatusDTO)
     case timedOut(JobStatusDTO?)
-
-    /// The job this result refers to, if any (nil only for `.noFile`). Lets the
-    /// RPC layer record the created job under an Idempotency-Key.
-    var jobID: UUID? {
-        switch self {
-        case .noFile: nil
-        case let .completed(dto): UUID(uuidString: dto.jobID)
-        case let .timedOut(dto): dto.flatMap { UUID(uuidString: $0.jobID) }
-        }
-    }
 }

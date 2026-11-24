@@ -18,6 +18,7 @@ machen" / "ist das im Menü sichtbar".
 - You want to drive a control (press a toggle/button) and check the effect → `mt-cli ui-press <identifier> --window settings`, then `mt-cli state`. A Settings sidebar tab row (e.g. `settings-tab-about`) needs `--via click` — a plain press reports success without actually selecting the row
 - You want to start or stop meeting watching without touching the menu bar → `mt-cli watch start` / `mt-cli watch stop` (prefer these over `toggle`, which flips blind)
 - You want to record the microphone for an in-person meeting → `mt-cli record start` / `mt-cli record stop`. A `412` means nothing would be recorded ("No Microphone" is set, or the mic permission is denied), and it will not clear by retrying; a `409` means something else is being recorded and the request refused rather than clobber it
+- You want the app's own recent log lines → `mt-cli log --since 120`, then filter with `jq` on `.entries[].subsystem` / `.category` / `.message`. A `429` means another log read is still running in the app; wait and retry. A `503` means the app cannot read its own log store; observed once on the self-hosted CI runner (non-admin account, under AddressSanitizer, Quality & Safety run 44952578295); the cause is not isolated
 - You're debugging a UI bug and would otherwise have to ask the user to describe state
 - You're verifying a fix end-to-end after editing code
 
@@ -46,9 +47,16 @@ The app writes a 64-hex bearer token to
 | ------------------- | ------------------- | ---------------------------------- |
 | `GET /healthz`      | `mt-cli healthz`    | "ok"                               |
 | `GET /state`        | `mt-cli state`      | Pipeline + speaker DB JSON         |
-| `GET /screenshot`   | `mt-cli screenshot` | PNG of frontmost window            |
+| `GET /log`          | `mt-cli log`        | The app's own recent log entries JSON (`?since=<seconds>&limit=<n>`) |
+| `GET /screenshot`   | `mt-cli screenshot` | PNG of the largest visible app window (Settings only) |
 | `GET /ui/tree`      | `mt-cli ui-tree`    | Accessibility tree JSON (allowlisted windows) |
 | `POST /ui/press`    | `mt-cli ui-press`   | Press a control by identifier (allowlisted windows); assert via `state` |
+| `POST /ui/type`     | (curl)              | Type text into an allowlisted plain text field; assert via `state`. Plain text only; what gets 400 is listed in `docs/architecture/debug-rpc.md` |
+| `POST /action/openSettings` / `closeSettings` | `mt-cli open-settings` / `close-settings` | Show or hide the Settings window |
+| `POST /action/confirmBrowserConsent` | `mt-cli confirm-browser-consent` | Answer a parked browser-meeting consent prompt |
+| `POST /action/skipNaming` | (curl)         | Skip every pending speaker-naming job |
+| `POST /action/enqueueFile` / `enqueueFiles` | (curl) | Enqueue recorded file(s) into the pipeline |
+| `POST /action/seedSpeaker` / `renameSpeaker` / `deleteSpeaker` / `mergeSpeakers` | `mt-cli seed-speaker` / `rename-speaker` / `delete-speaker` / `merge-speakers` | Edit the speaker database |
 | `GET /v1/watch`     | `mt-cli watch`      | Whether the app is watching for meetings (`WatchStatusDTO`) |
 | `POST /v1/watch`    | `mt-cli watch start\|stop\|toggle` | Control watching; returns the resulting `WatchStatusDTO` |
 | `GET /v1/record`    | `mt-cli record`     | Whether a microphone-only recording is running (`RecordStatusDTO`) |
@@ -69,9 +77,10 @@ cd tools/mt-cli && swift build
   isn't running, or the toggle / env flag was off when it launched. Ask the
   user to enable Settings → Advanced → Local Automation API, or relaunch with
   `MEETINGTRANSCRIBER_DEBUG_RPC=1 ./scripts/run_app.sh`.
-- **"RPC token not found"** → same as above; the token is created on first
-  successful start.
-- **HTTP 401** → token rotated. Restart the app or delete the token file.
+- **"RPC token not found"** → same as above; the app writes a new token each
+  time its server starts listening.
+- **HTTP 401** → token rotated: the app restarted (it writes a new token at
+  every start) between reading the file and sending. Run the command again.
 - **HTTP 403 with Origin header** → You're hitting it from a browser. Use curl
   or `mt-cli` instead.
 

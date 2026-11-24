@@ -56,6 +56,8 @@ struct SpeakersSettingsView: View {
                 .accessibilityIdentifier(A11yID.diarizationSection)
                 .recordOnlyDisabled(settings.recordOnly)
 
+            speakerNamingSection
+
             if !settings.noMic {
                 Section("Speaker Identity") {
                     HStack {
@@ -66,7 +68,7 @@ struct SpeakersSettingsView: View {
                             .multilineTextAlignment(.trailing)
                             .accessibilityIdentifier(A11yID.micNameField)
                     }
-                    Text("Your name for dual-source mode. Leave empty to diarize mic track (multi-person room).")
+                    Text("Your name for dual-source mode.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -100,18 +102,25 @@ struct SpeakersSettingsView: View {
 
     // MARK: - Diarization Section
 
+    /// Hint under the mode picker. The cap holds per diarized input, not per
+    /// meeting: a dual-source recording diarizes the app track and the
+    /// microphone track separately and merges the results. With "No
+    /// Microphone" set, or for an imported file, there is one input.
+    static func speakerCapHint(for mode: DiarizerMode) -> String {
+        "\(mode.shortLabel) supports up to \(mode.speakerCap) speakers per input. "
+            + "A call recorded with your microphone has two inputs, the call audio and the microphone, each with this limit. "
+            + "Switch to Offline mode for meetings with more participants."
+    }
+
     private var diarizationSection: some View {
         Section("Diarization") {
             Toggle("Speaker Diarization", isOn: $settings.diarize)
             if settings.diarize {
                 diarizationModePicker
-                if settings.diarizerMode == .sortformer {
-                    Label(
-                        "Sortformer supports up to \(DiarizerMode.sortformer.speakerCap) speakers per meeting. Switch to Offline mode for meetings with more participants.",
-                        systemImage: "info.circle",
-                    )
-                    .foregroundStyle(.secondary)
-                    .font(.caption)
+                if settings.diarizerMode != .offline {
+                    Label(Self.speakerCapHint(for: settings.diarizerMode), systemImage: "info.circle")
+                        .foregroundStyle(.secondary)
+                        .font(.caption)
                 }
                 expectedSpeakersRow
                 Label(
@@ -124,6 +133,41 @@ struct SpeakersSettingsView: View {
                     experimentalTuningDisclosure
                 }
             }
+        }
+    }
+
+    // MARK: - Speaker Naming Section
+
+    /// Only shown with diarization on: without it no job waits for naming.
+    @ViewBuilder private var speakerNamingSection: some View {
+        if settings.diarize {
+            Section("Speaker Naming") {
+                Toggle("Open naming window automatically", isOn: $settings.autoOpenSpeakerNaming)
+                    .accessibilityIdentifier(A11yID.autoOpenSpeakerNamingToggle)
+                Text("When off, a notification says a meeting is waiting, and you name speakers from the menu bar (Name Speakers...).")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Picker("Keep unnamed meetings for", selection: $settings.staleNamingTimeout) {
+                    ForEach(StaleNamingTimeout.allCases) { timeout in
+                        Text(timeout.label).tag(timeout)
+                    }
+                }
+                .pickerStyle(.menu)
+                .accessibilityIdentifier(A11yID.staleNamingTimeoutPicker)
+                Text(settings.staleNamingTimeout.caption)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                // A waiting meeting keeps `PipelineController.canReplaceQueue`
+                // false, so these changes wait for it; with "Forever" nothing
+                // else bounds that wait.
+                Text(
+                    "While a meeting waits for names, changes to the transcription engine, diarization or output folder "
+                        + "apply to new meetings only after it is named or skipped, or after the app restarts.",
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+            .recordOnlyDisabled(settings.recordOnly)
         }
     }
 

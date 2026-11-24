@@ -4,7 +4,7 @@
     import XCTest
 
     /// `AppSettings.claudeAPIKey`: the user-supplied, explicit-opt-in key for
-    /// the Claude CLI protocol generator (Settings → Protocol Generation). In
+    /// the Claude CLI protocol generator (Settings → Output → AI Provider). In
     /// its own file because `AppSettingsTests` sits at the 600-line cap; same
     /// per-test defaults suite and Keychain account convention as
     /// `AppSettingsOutputDirectoryTests` so `--parallel` runs never share
@@ -23,7 +23,7 @@
             testSuiteName = "AppSettingsClaudeAPIKeyTests-\(getpid())-\(UUID().uuidString)"
             apiKeyAccount = "AppSettingsClaudeAPIKeyTests-openAIAPIKey-\(getpid())-\(UUID().uuidString)"
             claudeAPIKeyAccount = "AppSettingsClaudeAPIKeyTests-claudeAPIKey-\(getpid())-\(UUID().uuidString)"
-            guard let suite = UserDefaults(suiteName: testSuiteName) else {
+            guard let suite = DefaultsSuite.open(testSuiteName) else {
                 XCTFail("Could not create test UserDefaults suite")
                 return
             }

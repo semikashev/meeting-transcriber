@@ -4,58 +4,9 @@ import XCTest
 /// The cancellation stage: what it does to the microphone track, and what it
 /// tells the user when it cannot.
 ///
-/// Driven with a stub canceller rather than the real model. The model is a
-/// separate ~3 MB download that no CI job has, and what is under test here is
-/// the stage's decisions — replace or keep, warn or stay quiet — not the
-/// quality of the audio, which `LocalVQECancellerFileTests` covers.
+/// Driven with `StubCanceller` rather than the real model; see there for why.
 @MainActor
 final class PipelineEchoCancellationTests: XCTestCase {
-    private struct StubCanceller: EchoCancelling {
-        let report: EchoCancellationReport
-        let failure: (any Error)?
-        /// Written by the stub so a test can tell "produced silence" from
-        /// "never ran", which an assertion on the file's contents alone cannot.
-        let marker: Float
-        let writesOutput: Bool
-
-        init(
-            medianReduction: Float,
-            failure: (any Error)? = nil,
-            marker: Float = 0.25,
-            quietWindows: Int = 20,
-            writesOutput: Bool = true,
-        ) {
-            self.writesOutput = writesOutput
-            // Both populations, because the self-check is a difference: the
-            // windows carrying echo AND the ones carrying none, which a healthy
-            // run leaves alone. A stub that emitted only the first would be
-            // asking a question the check refuses to answer.
-            report = EchoCancellationReport(
-                windows: (0 ..< 30).map { _ in
-                    EchoCancellationWindow(referenceDBFS: -20, reductionDb: medianReduction)
-                } + (0 ..< quietWindows).map { _ in
-                    EchoCancellationWindow(referenceDBFS: -80, reductionDb: 0.2)
-                },
-            )
-            self.failure = failure
-            self.marker = marker
-        }
-
-        func cancelEcho(
-            micURL: URL, referenceURL _: URL, outputURL: URL, referenceLead _: TimeInterval,
-        ) throws -> EchoCancellationReport {
-            if let failure { throw failure }
-            guard writesOutput else { return report }
-            let samples = try AudioMixer.loadAudioFileAsFloat32(url: micURL)
-            try AudioMixer.saveWAV(
-                samples: samples.map { _ in marker },
-                sampleRate: AudioConstants.targetSampleRate,
-                url: outputURL,
-            )
-            return report
-        }
-    }
-
     private var dir = FileManager.default.temporaryDirectory
 
     @MainActor
@@ -76,30 +27,11 @@ final class PipelineEchoCancellationTests: XCTestCase {
     }
 
     private func makeTracks() throws -> (app: URL, mic: URL) {
-        let app = dir.appendingPathComponent("app_16k.wav")
-        let mic = dir.appendingPathComponent("mic_16k.wav")
-        try AudioMixer.saveWAV(
-            samples: EchoTestAudio.speechLike(seconds: 2, seed: 1),
-            sampleRate: AudioConstants.targetSampleRate, url: app,
-        )
-        try AudioMixer.saveWAV(
-            samples: EchoTestAudio.speechLike(seconds: 2, seed: 2),
-            sampleRate: AudioConstants.targetSampleRate, url: mic,
-        )
-        return (app, mic)
+        try EchoTestAudio.writeTrackPair(into: dir)
     }
 
     private func makeQueue(_ canceller: StubCanceller?) -> (PipelineQueue, UUID) {
-        // A factory that returns nil is "no model could be resolved", which is a
-        // different branch from a canceller that fails once it runs. Bound to a
-        // local first: as a trailing argument the formatter detaches it from
-        // the call.
-        let factory: () -> (any EchoCancelling)? = { canceller }
-        let queue = PipelineQueue(
-            logDir: dir.appendingPathComponent("logs"),
-            echoCancellationEnabled: { true },
-            echoCancellerFactory: factory,
-        )
+        let queue = PipelineQueue.withEchoCanceller(canceller, logDir: dir.appendingPathComponent("logs"))
         let job = PipelineJob(
             meetingTitle: "meeting", appName: "File",
             mixPath: nil, appPath: nil, micPath: nil, micDelay: 0,
@@ -297,9 +229,7 @@ final class PipelineEchoCancellationTests: XCTestCase {
     /// stage only reaches cancellation on an `.affected` verdict, which is
     /// recorded before it runs.
     private func seedVerdict(_ queue: PipelineQueue, _ jobID: UUID) {
-        queue.recordEchoVerdict(jobID: jobID, EchoDetectionDTO(EchoBleedDetector.Result(
-            windowScores: [EchoBleedDetector.WindowScore(correlation: 0.9, lagSeconds: 0.015)],
-        )))
+        queue.seedAffectedEchoVerdict(jobID: jobID)
     }
 
     /// A confirmed run says so on the job. Why the field exists at all, and why
@@ -356,6 +286,54 @@ final class PipelineEchoCancellationTests: XCTestCase {
             )
 
             XCTAssertEqual(queue.jobs.first?.echo?.removed, false, "\(name) has to read as a decline")
+        }
+    }
+
+    /// The run's wall clock sits beside its outcome, for a confirmed run and
+    /// for a declined one: a decline cost the same minutes, and it is the
+    /// population the overhead question is hardest on, time spent for nothing.
+    /// Why the job carries it at all is on `EchoDetectionDTO.cancellationSeconds`.
+    func testAConfirmedAndADeclinedRunAreBothTimed() async throws {
+        let cases: [(String, Float, Bool)] = [
+            ("confirmed", 30, true),
+            ("declined by the self-check", 0.2, false),
+        ]
+        for (name, reduction, removed) in cases {
+            let tracks = try makeTracks()
+            let (queue, jobID) = makeQueue(StubCanceller(medianReduction: reduction))
+            seedVerdict(queue, jobID)
+            XCTAssertNil(queue.jobs.first?.echo?.cancellationSeconds, "\(name): nothing has run yet")
+
+            _ = try await queue.cancelEchoOnMicTrack(
+                jobID: jobID, appURL: tracks.app, micURL: tracks.mic, micDelay: 0,
+            )
+
+            XCTAssertEqual(queue.jobs.first?.echo?.removed, removed, name)
+            XCTAssertNotNil(queue.jobs.first?.echo?.cancellationSeconds, "\(name) cost time")
+        }
+    }
+
+    /// The two ways the stage ends without the canceller processing anything
+    /// are declines for `removed`, since the feature was on and did not
+    /// deliver, but they are not runs that cost time, so the key stays absent:
+    /// `removed: false` without it is how a reader tells a run that never got
+    /// going from one that was turned down.
+    func testARunThatNeverProcessedTheTrackIsNotTimed() async throws {
+        let cases: [(String, StubCanceller?)] = [
+            ("no resolvable model", nil),
+            ("the run threw", StubCanceller(medianReduction: 30, failure: EchoCancellationError.modelLoadFailed("x"))),
+        ]
+        for (name, canceller) in cases {
+            let tracks = try makeTracks()
+            let (queue, jobID) = makeQueue(canceller)
+            seedVerdict(queue, jobID)
+
+            _ = try await queue.cancelEchoOnMicTrack(
+                jobID: jobID, appURL: tracks.app, micURL: tracks.mic, micDelay: 0,
+            )
+
+            XCTAssertEqual(queue.jobs.first?.echo?.removed, false, "\(name) is still a decline")
+            XCTAssertNil(queue.jobs.first?.echo?.cancellationSeconds, "\(name) processed nothing, so it has no cost")
         }
     }
 }

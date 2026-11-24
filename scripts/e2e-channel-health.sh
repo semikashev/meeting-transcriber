@@ -13,20 +13,23 @@
 #   - Pixel-level visual regression: with --screenshot, asserts the
 #     menubar actually renders red-tinted pixels via assert-red-pixels.swift
 #
-# What this does NOT cover (see docs/plans/.local/open/2026-05-17-channel-health-live-e2e.md):
+# What this does NOT cover:
 #   - The polling task lifecycle (start/cancel on `.recording` transitions)
 #   - `.recovered` event path (flag clears back to false on channel unmute)
-#
-# The first two of those gaps are now covered by scripts/e2e-channel-fault.sh,
-# which drives the real CATapDescription tap → LevelPublisher → polling task
-# chain and asserts on what is notified. Note that as of issue #614 a latched
-# episode does NOT notify by itself: the notification follows the capture
-# fault, not the silence episode.
 #   - Real-world false-positive resistance during legitimate recordings
+#
+# The first two are covered by scripts/e2e-channel-fault.sh, which drives the
+# real CATapDescription tap → LevelPublisher → polling task chain and asserts
+# on what is notified. Note that as of issue #614 a latched episode does NOT
+# notify by itself: the notification follows the capture fault, not the
+# silence episode.
 #
 # Runs on:
 #   - Any macOS host with Xcode + zsh + jq
-#   - Local dev (no permissions needed beyond what a fresh build needs)
+#   - Local dev (no permissions needed beyond what a fresh build needs;
+#     --screenshot additionally needs every permission the app checks to
+#     report healthy, since the red permission badge would satisfy the
+#     pixel check on its own, and fails otherwise)
 #   - CI: GitHub-hosted macos-26 runner or the self-hosted Mac mini
 #
 # Usage: bash scripts/e2e-channel-health.sh [--no-build] [--screenshot]
@@ -52,14 +55,19 @@ done
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=lib/e2e-helpers.sh
 source "$ROOT/scripts/lib/e2e-helpers.sh"
+# Ends what a timed-out earlier step left running, then records this
+# driver for the next (see e2e_register_driver).
+e2e_register_driver
 APP="$ROOT/app/MeetingTranscriber/.build/MeetingTranscriber-Dev.app"
 BIN="$APP/Contents/MacOS/MeetingTranscriber"
 MTCLI="$ROOT/tools/mt-cli/.build/debug/mt-cli"
 
 cleanup() {
-    if [ -n "${APP_PID:-}" ] && kill -0 "$APP_PID" 2>/dev/null; then
-        kill -9 "$APP_PID" 2>/dev/null || true
-    fi
+    # Started through `open`, so it is no child of this shell and has no PID
+    # here; found by the pattern assert_app_alive uses and ended by PID. Only
+    # once this lane launched it, so an early exit leaves alone an instance it
+    # never started. Quiet: an app that already exited is no failure here.
+    [ -z "${APP_LAUNCHED:-}" ] || kill_and_verify_gone "MeetingTranscriber-Dev.app/Contents/MacOS/MeetingTranscriber" 5 2>/dev/null || true
     bootout_stale_launchctl
 }
 trap cleanup EXIT
@@ -88,11 +96,20 @@ bootout_stale_launchctl
 # `_SUPPRESS_AUTOWATCH=1` prevents the +3 s auto-watch trigger from running
 # `stopChannelHealthMonitoring()` which would clear the forced flag before
 # we can observe it.
-env MEETINGTRANSCRIBER_DEBUG_RPC=1 \
-    MEETINGTRANSCRIBER_DEBUG_FORCE_MIC_SILENT=1 \
-    MEETINGTRANSCRIBER_DEBUG_SUPPRESS_AUTOWATCH=1 \
-    "$BIN" &
-APP_PID=$!
+#
+# `open --env`, not the binary directly: TCC answers for the process launchd
+# knows, and an executable started from this shell is asked about an identity
+# the grants were never made against. The app then reports a permission
+# problem and draws its red badge, which the pixel check below would count as
+# the channel tint.
+assert_console_user
+# Set before the launch: an `open` that fails after the app already started
+# must still be cleaned up.
+APP_LAUNCHED=1
+open --env MEETINGTRANSCRIBER_DEBUG_RPC=1 \
+    --env MEETINGTRANSCRIBER_DEBUG_FORCE_MIC_SILENT=1 \
+    --env MEETINGTRANSCRIBER_DEBUG_SUPPRESS_AUTOWATCH=1 \
+    "$APP"
 
 # --- 4. Wait for RPC server to come up (max 30 s) ------------------------
 
@@ -102,7 +119,7 @@ echo "  RPC up"
 
 # --- 5. Assert channelHealth state ---------------------------------------
 
-STATE_JSON="$("$MTCLI" state)"
+STATE_JSON="$(state_query .)" || die "$(state_why $? "the channelHealth assertions")"
 read -r MIC_SILENT APP_SILENT < <(
     echo "$STATE_JSON" | jq -r '"\(.channelHealth.micSilent) \(.channelHealth.appSilent)"'
 )
@@ -120,6 +137,25 @@ fi
 # --- 6. Optional visual proof --------------------------------------------
 
 if [ "$TAKE_SCREENSHOT" = true ]; then
+    # The permission badge is red too, and on its own it clears the pixel
+    # threshold, so red pixels prove the channel tint only while no permission
+    # problem is shown. Wait for the app's check to report, then require it
+    # healthy. Not ruled out here: the other red marks the icon can carry (the
+    # record-only dot, the error badge) and red elsewhere in the captured strip.
+    echo "▸ Waiting for the app's permission health check…"
+    status=0
+    poll_state --each assert_app_alive 20 0.5 permission_health_reported || status=$?
+    case "$status" in
+        0) ;;
+        1) die "the app answered /state but its permission health check reported nothing within 20 s, so whether the red permission badge is drawn is unknown and the pixel check cannot be read" ;;
+        *) die "$(state_why "$status" "whether the app reports a permission problem")" ;;
+    esac
+    if [ "$(jq -r '.permissionHealth.isHealthy' <<<"$STATE_BODY")" != "true" ]; then
+        echo "permissionHealth:" >&2
+        jq .permissionHealth <<<"$STATE_BODY" >&2 || true
+        die "the app reports a permission problem, so its menu bar icon carries the red permission badge and the red-pixel check would pass on the badge alone. Fix: $(tcc_fix_hint 'the pane named above' "$APP")"
+    fi
+
     OUT="/tmp/e2e-channel-health-menubar.png"
     # `screencapture` can fail on headless GUI sessions (rare; Mac mini CI
     # runner has an Aqua session via auto-login so it works there). When it
@@ -130,8 +166,16 @@ if [ "$TAKE_SCREENSHOT" = true ]; then
     # SwiftUI's MenuBarExtra → NSStatusItem composite can trail RPC readiness
     # by 1-2 frames, so the assertion is polled rather than run once. Cold
     # `swift` invocation per attempt provides the natural pacing.
-    if ! screencapture -R 0,0,3000,30 "$OUT" 2>/dev/null || [ ! -s "$OUT" ]; then
-        echo "▸ Menubar screenshot skipped (no display rect available — pixel assertion skipped)"
+    #
+    # A locked screen is asked first: screencapture then writes no image, and
+    # the arm below would blame the Screen Recording grant. Whether that grant
+    # is given cannot be told while the screen is locked.
+    if host_skip_if_screen_locked channel-health "the red-pixel assertion"; then
+        rm -f "$OUT"
+    elif ! screencapture -R 0,0,3000,30 "$OUT" 2>/dev/null || [ ! -s "$OUT" ]; then
+        # Through host_skip, so a scheduled run that asked for the pixel
+        # assertion does not read a skipped one as a pass.
+        host_skip channel-health "screencapture produced no image of the menu bar (no display, or this process may not record the screen), so the red-pixel assertion did not run. Fix: $(tcc_fix_hint 'Screen & System Audio Recording')"
         rm -f "$OUT"
     else
         attempt=1
@@ -144,8 +188,11 @@ if [ "$TAKE_SCREENSHOT" = true ]; then
                 "$ROOT/scripts/assert-red-pixels.swift" "$OUT"
                 break
             fi
-            if "$ROOT/scripts/assert-red-pixels.swift" "$OUT" >/dev/null 2>&1; then
+            # Captured rather than discarded: a pass prints the count it
+            # measured, so the log shows how far above the threshold it was.
+            if check_output="$("$ROOT/scripts/assert-red-pixels.swift" "$OUT" 2>&1)"; then
                 echo "▸ Menubar screenshot saved to $OUT (attempt $attempt/$max_attempts)"
+                echo "$check_output"
                 break
             fi
             attempt=$((attempt + 1))

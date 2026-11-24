@@ -1,6 +1,8 @@
 # Third-party notices
 
-Meeting Transcriber itself is MIT licensed (see `LICENSE`).
+Meeting Transcriber itself is MIT licensed (see `LICENSE`). That text ships
+inside the app as `Contents/Resources/LICENSE`, so a build distributed from this
+repository or from a fork of it carries the notice MIT asks for.
 
 **Scope:** this file covers every third-party component redistributed in the
 shipped application, whether statically linked into the app binary or bundled as
@@ -70,9 +72,12 @@ redistributes as well, so those notices ship too:
 
 ### NVIDIA NeMo
 
-FluidAudio's Sortformer diarization is ported from NeMo's implementation, which
-its own source files state. That is the same relationship its VBx entry above
-records, and it is user-reachable through the Sortformer diarization mode.
+FluidAudio's Sortformer and Nemotron 3 diarization are ported from NeMo's
+implementation, which its own source files state. That is the same relationship
+its VBx entry above records, and it is user-reachable through the Sortformer and
+Nemotron 3 diarization modes. The Nemotron 3 model weights themselves (OpenMDW
+License 1.1) are downloaded on first use rather than shipped, like the other
+WhisperKit and FluidAudio models, so they are not listed here.
 
 - **Project:** <https://github.com/NVIDIA/NeMo>
 - **Copyright:** NVIDIA Corporation

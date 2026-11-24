@@ -57,6 +57,12 @@ final class OutputDirectoryResolver {
         }
     }
 
+    /// The directory `resolve()` would return, without reporting anything:
+    /// for a caller that writes nothing there, such as a retention pass.
+    var current: URL {
+        settings.outputDirectoryResolution.url
+    }
+
     private func reportIfNew(configuredPath: String?, fallback: URL) {
         let bookmark = settings.customOutputDirBookmark
         guard bookmark != reportedUnavailableBookmark else { return }
@@ -72,7 +78,7 @@ final class OutputDirectoryResolver {
         logger.error("Chosen output folder cannot be reached; output goes to the default folder instead")
         notifier.notify(
             title: Self.unavailableTitle,
-            body: "\(chosen) cannot be reached right now. Recordings and protocols are going to \(standIn) instead. "
+            body: "\(chosen) cannot be reached right now. Recordings and meeting notes are going to \(standIn) instead. "
                 + "Reconnect it, or choose another folder in Settings.",
         )
     }

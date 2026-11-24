@@ -56,6 +56,9 @@ done
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=lib/e2e-helpers.sh
 source "$ROOT/scripts/lib/e2e-helpers.sh"
+# Ends what a timed-out earlier step left running, then records this
+# driver for the next (see e2e_register_driver).
+e2e_register_driver
 DEV_BUNDLE_BUILD="$ROOT/app/MeetingTranscriber/.build/MeetingTranscriber-Dev.app"
 # Deploy to a stable path so the dev .app's TCC permissions (granted once
 # manually on the self-hosted runner, keyed on bundle path + cert SHA)
@@ -78,36 +81,27 @@ REC_DIR="$HOME/Library/Application Support/MeetingTranscriber/recordings"
 # every file this run produces is newer than it (see sweep_run_artifacts).
 RUN_START_MARKER="$(mktemp "${TMPDIR:-/tmp}/e2e-silent-rec-start.XXXXXX")"
 
-# Defaults to restore after the test — empty string means "key wasn't set".
-# Empty until the snapshot below runs. `cleanup` is trapped before that point
-# and keys on this being set: an empty snapshot means "delete the key", which
-# is right after this lane wrote it and destructive before it ever read it.
-_STANDARD_PLIST=""
-SAVED_AUTOWATCH=""
-SAVED_THRESHOLD=""
-SAVED_INDICATOR=""
+# The record of the settings this lane overrides, taken below. Empty until
+# then: `cleanup` is trapped before that point and restores only a record that
+# exists, so it can never delete settings this lane never read.
+DEFAULTS_RECORD=""
 
 cleanup() {
     if [ -n "${SIM_PID:-}" ] && kill -0 "$SIM_PID" 2>/dev/null; then
         kill -TERM "$SIM_PID" 2>/dev/null || true
     fi
-    if [ -n "${APP_PID:-}" ] && kill -0 "$APP_PID" 2>/dev/null; then
-        kill -9 "$APP_PID" 2>/dev/null || true
-    fi
+    # Started through `open`, so it is no child of this shell and has no PID
+    # here; found by the pattern assert_app_alive uses and ended by PID. Only
+    # once this lane launched it, so an early exit leaves alone an instance it
+    # never started. Quiet: an app that already exited is no failure here.
+    [ -z "${APP_LAUNCHED:-}" ] || kill_and_verify_gone "MeetingTranscriber-Dev.app/Contents/MacOS/MeetingTranscriber" 5 2>/dev/null || true
     # The app was kill -9'd mid-recording above, orphaning a raw temp; sweep
     # this run's artifacts so the next run doesn't crash-recover a stale temp.
     sweep_run_artifacts "$REC_DIR" "$RUN_START_MARKER"
     rm -f "${RUN_START_MARKER:-}" 2>/dev/null || true
     # Restore defaults to whatever they were before we ran (or delete the
     # keys if they didn't exist).
-    # Only restore what was actually snapshotted. An empty snapshot means
-    # "delete the key", which is right after this lane set it and catastrophic
-    # if the lane exited before the snapshot ran.
-    if [ -n "$_STANDARD_PLIST" ]; then
-        restore_bool_default  "$_STANDARD_PLIST" autoWatch                       "$SAVED_AUTOWATCH"
-        restore_float_default "$_STANDARD_PLIST" asymmetricSilenceWarningSeconds "$SAVED_THRESHOLD"
-        restore_bool_default  "$_STANDARD_PLIST" perChannelIndicatorEnabled      "$SAVED_INDICATOR"
-    fi
+    [ -z "$DEFAULTS_RECORD" ] || defaults_restore_record "$DEFAULTS_RECORD" || true
     bootout_stale_launchctl
 }
 trap cleanup EXIT
@@ -189,28 +183,22 @@ done
 
 # --- 2. Snapshot the defaults this lane overrides ---------------------------
 
-# Address the standard-domain plist directly. `defaults <bundle-id>` is
+# Recorded from both plists write_dev_default writes (see dev_defaults_record
+# in scripts/lib/e2e-helpers.sh), not through `defaults <bundle-id>`: that is
 # redirected into the app's container once containermanagerd has registered
 # one for the identifier, and the dev .app is not sandboxed, so it resolves
 # the standard domain. Reading and restoring the wrong one silently leaks this
 # lane's 30 s threshold into whatever runs next, or leaves the app on its
 # built-in 90 s while the lane waits 50 s for a flag that cannot flip in time.
 #
-# The snapshot runs BEFORE the quit below for a reason that has nothing to do
-# with preferences and everything to do with the exit trap. `quit_running_app`
-# is bare under `set -e`, so an exhausted quit ladder exits the script straight
-# into `cleanup` with every SAVED_* still empty, and an empty snapshot restores
-# by DELETING the key. Snapshotting first means the trap can never delete a
-# developer's real settings that this lane never read.
-#
 # The writes still run after the quit, which is defensive rather than measured:
 # a live instance owning the same domain did NOT clobber an external write in
 # testing on macOS 26, but nothing is gained by writing underneath a process
 # that is about to be killed anyway.
-_STANDARD_PLIST="$(dev_standard_plist "$BUNDLE_ID")"
-SAVED_AUTOWATCH="$(snapshot_default "$_STANDARD_PLIST" autoWatch)"
-SAVED_THRESHOLD="$(snapshot_default "$_STANDARD_PLIST" asymmetricSilenceWarningSeconds)"
-SAVED_INDICATOR="$(snapshot_default "$_STANDARD_PLIST" perChannelIndicatorEnabled)"
+DEFAULTS_RECORD="$(mktemp "${TMPDIR:-/tmp}/e2e-silent-rec-defaults.XXXXXX")"
+dev_defaults_record "$DEFAULTS_RECORD" "$BUNDLE_ID" \
+    autoWatch asymmetricSilenceWarningSeconds perChannelIndicatorEnabled \
+    || die "could not record the dev bundle's settings; nothing was changed"
 
 # --- 3. Kill any running instance, then override ----------------------------
 
@@ -222,12 +210,43 @@ write_dev_default "$BUNDLE_ID" perChannelIndicatorEnabled true bool
 
 # --- 4. Launch app with RPC enabled -----------------------------------------
 
-env MEETINGTRANSCRIBER_DEBUG_RPC=1 "$BIN" &
-APP_PID=$!
+# `open`, not the binary directly. TCC answers for the process launchd knows:
+# an executable started from this shell is attributed to whatever started the
+# lane (the runner agent under CI), whose grants are not the app's, and a
+# capture refused that way delivers zeroes without an error. That is exactly
+# the silence this lane asserts, so a direct launch could pass for the wrong
+# reason.
+assert_console_user
+# Set before the launch: an `open` that fails after the app already started
+# must still be cleaned up.
+APP_LAUNCHED=1
+open --env MEETINGTRANSCRIBER_DEBUG_RPC=1 "$DEV_BUNDLE_DEPLOY"
 
 echo "▸ Waiting for RPC on 127.0.0.1:9876…"
 wait_for_rpc "$MTCLI" 30 || die "RPC server did not start within 30 s"
 echo "  RPC up"
+
+# The capture must be allowed before its silence can mean anything, so a host
+# whose grant lapsed fails here, named, instead of passing on zeroes.
+# Microphone covers the mic track. Screen Recording is one of the two grants
+# the app-audio tap accepts; the other, Audio Recording, is not reported in
+# /state, so this lane insists on the one it can read. A host that granted
+# only Audio Recording is refused here although its tap would work.
+echo "▸ Waiting for the app's permission health check…"
+status=0
+poll_state --each assert_app_alive 20 0.5 permission_health_reported || status=$?
+case "$status" in
+    0) ;;
+    1) die "the app answered /state but its permission health check reported nothing within 20 s, so whether its capture is allowed is unknown" ;;
+    *) die "$(state_why "$status" "what the app's permission health check reports")" ;;
+esac
+read -r APP_MIC_STATE APP_SR_STATE < <(
+    jq -r '"\(.permissionHealth.microphone // "unknown") \(.permissionHealth.screenRecording // "unknown")"' <<<"$STATE_BODY"
+)
+echo "  microphone=$APP_MIC_STATE screenRecording=$APP_SR_STATE"
+if [ "$APP_MIC_STATE" != "healthy" ] || [ "$APP_SR_STATE" != "healthy" ]; then
+    die "the app reports microphone=$APP_MIC_STATE screenRecording=$APP_SR_STATE, so its capture may be zeroed by TCC and silence on both tracks would prove nothing about the detector. This lane needs both to read healthy, because /state does not report the Audio Recording grant that would also allow the app-audio tap. Fix: $(tcc_fix_hint 'Microphone and Screen & System Audio Recording' "$DEV_BUNDLE_DEPLOY")"
+fi
 
 # --- 5. Trigger a "silent meeting" via meeting-simulator --------------------
 
@@ -246,17 +265,20 @@ SIM_PID=$!
 
 # --- 6. Wait for WatchLoop to enter recording state ------------------------
 
-echo "▸ Waiting for app to detect + start recording (max 30 s)…"
-# `isProcessing` flips true while a job is in the queue. It's informational
-# only — if it never flips we still let step 7 run and time out there,
-# which gives a clearer "recordingSilent never went true" failure than
-# bailing here would. Hence `|| true`: a timeout here is non-fatal.
-_processing_started() {
-    assert_app_alive
-    local state; state="$("$MTCLI" state 2>/dev/null || echo '{}')"
-    [ "$(echo "$state" | jq -r '.pipeline.isProcessing // false')" = "true" ]
-}
-poll_until 30 1 _processing_started || true
+# /state is read through poll_state (scripts/lib/e2e-helpers.sh), which keeps
+# "the flag is false" apart from "the app did not answer". That keeps the
+# verdict honest: an app that does not answer used to read as "flag false" on
+# every poll, and this lane once blamed the detector, with an empty state dump,
+# while the app was blocked behind a TCC consent prompt.
+
+echo "▸ Waiting for app to detect + start recording (max 40 s)…"
+# The watch state, not `pipeline.isProcessing`: that is true only while a job
+# is processed, and a recording is no job, so polling it waited out its whole
+# window on every run. 40 s is the latest start that still leaves the 30 s
+# threshold plus slack inside the simulator's 75 s; a recording that has not
+# started by then cannot raise the flag before the meeting ends.
+poll_state --each assert_app_alive 40 1 state_is '.watchState == "recording"' \
+    || die "$(state_why $? "the app never started recording the simulator's meeting within 40 s, so the silence detector had nothing to watch")"
 
 # --- 7. Poll for recordingSilent flag -----------------------------------------
 
@@ -268,21 +290,26 @@ echo "▸ Polling for channelHealth.recordingSilent (threshold 30 s + 20 s slack
 # `|`-join (see `_poll_for_new_lastjob_terminal` in e2e-app.sh). MIC_SILENT
 # and APP_SILENT leak to caller scope for the success log line below.
 _recording_silent() {
-    assert_app_alive
-    local state; state="$("$MTCLI" state 2>/dev/null || echo '{}')"
     IFS=$'\t' read -r RECORDING_SILENT MIC_SILENT APP_SILENT < <(
-        echo "$state" \
-            | jq -r '[.channelHealth.recordingSilent // false, .channelHealth.micSilent // false, .channelHealth.appSilent // false] | @tsv'
+        jq -r '[.channelHealth.recordingSilent // false, .channelHealth.micSilent // false, .channelHealth.appSilent // false] | @tsv' <<<"$STATE_BODY"
     )
     [ "$RECORDING_SILENT" = "true" ]
 }
-if poll_until 50 2 _recording_silent; then
-    echo "  recordingSilent=true (mic=$MIC_SILENT app=$APP_SILENT)"
-else
-    echo "Final state:" >&2
-    "$MTCLI" state 2>/dev/null | jq . >&2 || true
-    die "channelHealth.recordingSilent never went true within 50 s"
-fi
+status=0
+poll_state --each assert_app_alive 50 2 _recording_silent || status=$?
+case "$status" in
+    0) echo "  recordingSilent=true (mic=$MIC_SILENT app=$APP_SILENT)" ;;
+    2)
+        assert_app_alive
+        die "the app did not answer /state through the end of the 50 s window, so whether recordingSilent went true is unknown (last error: ${STATE_ERR:-<none>}). The app process is alive. If mt-cli timed out rather than being refused, the app is blocked, and on the runner the likeliest cause is a TCC consent prompt waiting on its screen. Fix: $(tcc_fix_hint 'the pane the prompt names' "$DEV_BUNDLE_DEPLOY")"
+        ;;
+    *)
+        # STATE_BODY is the last answer the app gave, not a later empty read.
+        echo "Last state the app answered:" >&2
+        jq . <<<"$STATE_BODY" >&2 || true
+        die "channelHealth.recordingSilent never went true within 50 s"
+        ;;
+esac
 
 echo
 echo "OK — production chain verified:"

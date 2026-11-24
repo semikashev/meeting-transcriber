@@ -63,9 +63,9 @@ jobs:
       # Needed so dorny/paths-filter can read .github/filters.yml from the
       # workspace; see ci.yml for the same dance.
       - if: github.event_name == 'pull_request'
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - if: github.event_name == 'pull_request'
-        uses: dorny/paths-filter@v4
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d  # v4.0.3
         id: filter
         with:
           # `every` is required for the exclusion-style filter — without it,
@@ -80,9 +80,9 @@ jobs:
     if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true') }}
     runs-on: xcode-27
     env:
-      # Xcode 27.0 by its own path rather than /Applications/Xcode.app: the image also
-      # ships 27.1 and a 27.2 beta, and a moved default must never reach a build here.
-      DEVELOPER_DIR: /Applications/Xcode_27.0.app/Contents/Developer
+      # Xcode 27.2 by its own path rather than /Applications/Xcode.app: the image also
+      # ships 27.0 and 27.1, and a moved default must never reach a build here.
+      DEVELOPER_DIR: /Applications/Xcode_27.2.app/Contents/Developer
     timeout-minutes: 30
     strategy:
       matrix:
@@ -92,26 +92,37 @@ jobs:
             build-flags: ""
             dmg-prefix: "MeetingTranscriber"
           - variant: appstore
-            build-flags: "--appstore --no-notarize"
+            build-flags: "--appstore"
             dmg-prefix: "MeetingTranscriber-AppStore"
     name: build (${{ matrix.variant }})
     permissions:
       contents: write  # For creating GitHub releases
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           fetch-tags: true
 
-      # Same SPM cache key as ci.yml — release builds reuse the test
-      # matrix's resolved artifacts. The transcription/diarization models are
-      # neither loaded nor bundled by build_release.sh, so skip the model
-      # cache + prewarm. (It does fetch the 2.9 MB LocalVQE AEC model to bundle
-      # it, deliberately outside that cache: the fetch is checksum-pinned and
-      # small enough that a cache round-trip would save nothing.)
+      # A release cache of its own. It used to share the test matrix's key, so
+      # a release build restored a debug build tree it could not reuse and
+      # compiled every dependency again. Restored only for the exact
+      # manifests, `Package.resolved` and compiler build (no fallback to an older
+      # cache); the app's own sources are newer than the cache and are always
+      # recompiled.
+      # build_release.sh builds the App Store variant in `.build-appstore`.
+      # A `v*` tag build, the one that is published, always builds cold: it
+      # neither restores nor saves this cache.
+      # The transcription/diarization models are neither loaded nor bundled by
+      # build_release.sh, so skip the model cache + prewarm. (It does fetch the
+      # 2.9 MB LocalVQE AEC model to bundle it, deliberately outside that cache:
+      # the fetch is checksum-pinned and small enough that a cache round-trip
+      # would save nothing.)
       - uses: ./.github/actions/setup-swift-test
         with:
-          cache-key-suffix: ${{ matrix.variant }}
+          cache-key-suffix: release-${{ matrix.variant }}
+          cache-path: app/MeetingTranscriber/.build${{ matrix.variant == 'appstore' && '-appstore' || '' }}
+          cache-restore-fallback: "false"
+          cache-spm: ${{ !startsWith(github.ref, 'refs/tags/v') }}
           cache-models: "false"
 
       - name: Install Developer ID certificate
@@ -269,7 +280,7 @@ jobs:
           echo "DMG SHA256: $SHA"
 
       - name: Upload DMG as artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: ${{ matrix.dmg-prefix }}-${{ steps.version.outputs.version }}.dmg
           path: .build/release/${{ matrix.dmg-prefix }}-${{ steps.version.outputs.version }}.dmg
@@ -278,26 +289,34 @@ jobs:
       - name: Find previous release tag for changelog
         if: matrix.variant == 'homebrew' && startsWith(github.ref, 'refs/tags/v')
         id: prev
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           CURRENT_TAG="${GITHUB_REF_NAME}"
-          if [[ "$CURRENT_TAG" == *-* ]]; then
-            # Prerelease (RC): find the immediately preceding tag (RC or stable)
-            TAG=$(git tag --sort=-v:refname | awk -v cur="$CURRENT_TAG" 'found {print; exit} $0 == cur {found=1}')
-          else
-            # Stable release: find previous stable release only
-            TAG=$(gh release list --exclude-pre-releases --limit 1 --json tagName --jq '.[0].tagName // empty' 2>/dev/null || echo "")
-          fi
+          # The tag after the current one in version order, so the current tag
+          # is skipped by construction. Do not look this up from the release
+          # list: on a `--failed` re-run the release for the current tag already
+          # exists and is the newest, which yields an empty CURRENT...CURRENT
+          # changelog that overwrites the release body. An RC diffs against the
+          # preceding tag of any kind, a stable release against the preceding
+          # stable tag only (no `-` suffix). `versionsort.suffix=-` ranks
+          # v1.0.0-rc1 below v1.0.0; git's default ranks it above. If the
+          # current tag is missing from the list, fail rather than output an
+          # empty tag, since release-action would then fall back to the newest
+          # release, which on a re-run is the current one again.
+          STABLE_ONLY=0
+          if [[ "$CURRENT_TAG" != *-* ]]; then STABLE_ONLY=1; fi
+          TAG=$(git -c versionsort.suffix=- tag -l 'v*' --sort=-v:refname \
+            | awk -v cur="$CURRENT_TAG" -v stable="$STABLE_ONLY" \
+              'found && !(stable && /-/) {print; exit} $0 == cur {found=1} END {if (!found) exit 2}')
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub Release
         if: matrix.variant == 'homebrew' && startsWith(github.ref, 'refs/tags/v')
-        # SHA-pinned: this is the highest-privilege third-party action in
-        # release.yml — runs with DEVELOPER_ID_CERT, APP_PASSWORD,
-        # TAP_REPO_TOKEN, APPLE_ID. SHA pin (vs tag pin) means a hijacked
-        # v1 tag cannot retarget us to a malicious commit. Dependabot
-        # bumps the SHA + comment in lockstep.
+        # Every remote action is SHA-pinned (scripts/tests/
+        # test_actions_sha_pinned.sh), and this one matters most: it is the
+        # highest-privilege third-party action in release.yml, running with
+        # DEVELOPER_ID_CERT, APP_PASSWORD, TAP_REPO_TOKEN and APPLE_ID in the
+        # job. A hijacked v1 tag cannot retarget us to a malicious commit.
+        # Dependabot bumps the SHA and the version comment in lockstep.
         uses: ncipollo/release-action@339a81892b84b4eeb0f6e744e4574d79d0d9b8dd  # v1.21.0
         with:
           # Idempotent re-runs: a partially-succeeded release job (e.g. the
@@ -337,7 +356,6 @@ jobs:
       # Gate stays loud: tap-update failure must fail the release —
       # otherwise `brew upgrade` silently keeps users on the prior version.
       - name: Update Homebrew tap with new version and SHA256
-        id: tap-update
         if: matrix.variant == 'homebrew' && startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ secrets.TAP_REPO_TOKEN }}

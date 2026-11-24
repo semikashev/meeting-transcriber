@@ -101,6 +101,15 @@ struct VoiceSample: Codable, Equatable, Identifiable {
         )
     }
 
+    /// Copy that stays a match anchor but no longer counts toward the centroid.
+    func anchorOnly() -> Self {
+        Self(
+            embedding: embedding, origin: origin, centroidWeight: 0,
+            addedAt: addedAt, duration: duration, track: track, jobID: jobID,
+            meetingTitle: meetingTitle, pinned: pinned, id: id,
+        )
+    }
+
     private enum CodingKeys: String, CodingKey {
         case id, embedding, origin, centroidWeight, addedAt, duration, track, jobID, meetingTitle, pinned
     }

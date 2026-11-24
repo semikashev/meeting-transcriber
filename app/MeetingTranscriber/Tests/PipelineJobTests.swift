@@ -65,6 +65,60 @@ final class PipelineJobTests: XCTestCase {
         XCTAssertEqual(decoded.transcriptPath, job.transcriptPath)
     }
 
+    func testNotionPageSurvivesEncodingAndRetry() throws {
+        var job = PipelineJob(
+            meetingTitle: "Notion",
+            appName: "Teams",
+            mixPath: URL(fileURLWithPath: "/tmp/mix.wav"),
+            appPath: nil,
+            micPath: nil,
+            micDelay: 0,
+        )
+        job.recordNotionPage(
+            NotionPageResult(pageID: "page-1", url: "https://www.notion.so/page-1"),
+            databaseID: "database-1",
+        )
+
+        let data = try JSONEncoder().encode(job)
+        let decoded = try JSONDecoder().decode(PipelineJob.self, from: data)
+        XCTAssertEqual(decoded.notionPageID, "page-1")
+        XCTAssertEqual(decoded.notionPageURL?.absoluteString, "https://www.notion.so/page-1")
+        XCTAssertEqual(decoded.notionDatabaseID, "database-1")
+
+        var retried = decoded
+        retried.prepareForRetry()
+        XCTAssertEqual(retried.notionPageID, "page-1")
+        XCTAssertEqual(retried.notionDatabaseID, "database-1")
+    }
+
+    func testNotionExportProgressAndSpeakerNamesSurviveSnapshot() throws {
+        var job = PipelineJob(
+            meetingTitle: "Notion", appName: "Teams", mixPath: nil,
+            appPath: nil, micPath: nil, micDelay: 0,
+        )
+        job.beginNotionExport(speakerNames: ["Alice", "Bob"])
+        job.recordNotionPage(
+            NotionPageResult(pageID: "page-1", url: "https://www.notion.so/page-1"),
+            databaseID: "database-1",
+        )
+
+        let restored = try JSONDecoder().decode(PipelineJob.self, from: JSONEncoder().encode(job))
+        XCTAssertEqual(restored.notionExportStatus, .inProgress)
+        XCTAssertEqual(restored.notionExportSpeakerNames, ["Alice", "Bob"])
+        XCTAssertTrue(restored.hasPendingNotionExport)
+        XCTAssertFalse(restored.hasCompletedNotionExport)
+
+        var failed = restored
+        failed.finishNotionExport(succeeded: false)
+        XCTAssertEqual(failed.notionExportStatus, .failed)
+        XCTAssertTrue(failed.hasPendingNotionExport)
+
+        failed.finishNotionExport(succeeded: true)
+        XCTAssertEqual(failed.notionExportStatus, .completed)
+        XCTAssertTrue(failed.hasCompletedNotionExport)
+        XCTAssertFalse(failed.hasPendingNotionExport)
+    }
+
     func testJobStateIsCodable() throws {
         for state in [
             JobState.waiting,
@@ -216,6 +270,30 @@ final class PipelineJobTests: XCTestCase {
         let decoded = try JSONDecoder().decode(PipelineJob.self, from: older)
 
         XCTAssertEqual(decoded.sidecarOutputDirs.map(\.path), ["/tmp/second"])
+    }
+
+    func testRetryableNotionBackupNeedsAFailedExportOnADoneJobWithABackupPath() {
+        var job = Self.makeJob()
+        job.state = .done
+        job.protocolPath = URL(fileURLWithPath: "/nonexistent-volume/protocol.md")
+        XCTAssertFalse(job.hasRetryableNotionBackup, "no export was attempted")
+
+        job.beginNotionExport(speakerNames: [])
+        XCTAssertFalse(job.hasRetryableNotionBackup, "still running")
+
+        job.finishNotionExport(succeeded: false)
+        XCTAssertTrue(job.hasRetryableNotionBackup)
+
+        job.protocolPath = nil
+        XCTAssertFalse(job.hasRetryableNotionBackup, "nothing to retry from")
+
+        job.protocolPath = URL(fileURLWithPath: "/nonexistent-volume/protocol.md")
+        job.state = .error
+        XCTAssertFalse(job.hasRetryableNotionBackup, "not a finished job")
+
+        job.state = .done
+        job.finishNotionExport(succeeded: true)
+        XCTAssertFalse(job.hasRetryableNotionBackup, "already exported")
     }
 
     /// A job's encoded form as a mutable dictionary, so a test can produce a

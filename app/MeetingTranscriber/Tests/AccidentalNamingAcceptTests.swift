@@ -1,3 +1,4 @@
+import AudioTapLib
 @testable import MeetingTranscriber
 import SwiftUI
 import ViewInspector
@@ -39,6 +40,10 @@ final class AccidentalNamingAcceptTests: XCTestCase {
             jobs[id]?.state = newState
         }
 
+        func finishWithAcceptedAutoNames(jobID: UUID) {
+            updateJobState(id: jobID, to: .done, error: nil)
+        }
+
         func addWarning(id _: UUID, _ message: String) {
             warnings.append(message)
         }
@@ -66,7 +71,7 @@ final class AccidentalNamingAcceptTests: XCTestCase {
         /// early returns before the flip (a missing transcript file, and a
         /// protocol factory that turned nil after the probe). Both are handled
         /// by the session rather than here — see the missing-transcript test.
-        func generateProtocol(jobID: UUID, transcript _: String, title _: String, protocolsDir _: URL) async {
+        func generateProtocol(jobID: UUID, transcript _: String, title _: String, protocolsDir _: URL, speakerNames _: [String]) async {
             generateProtocolCallCount += 1
             jobs[jobID]?.state = .generatingProtocol
             while holdProtocolGeneration {
@@ -82,9 +87,9 @@ final class AccidentalNamingAcceptTests: XCTestCase {
             throw DiarizationError.notAvailable
         }
 
-        func renderLabeledTranscript(
+        func renderLabeledTranscript( // swiftlint:disable:this function_parameter_count
             run _: DiarizationRun, cachedSegments _: [TimestampedSegment],
-            isDualSource _: Bool, autoNames _: [String: String], note _: String?,
+            isDualSource _: Bool, autoNames _: [String: String], note _: String?, micMuted _: [MicMuteInterval],
         ) -> String? {
             nil
         }
@@ -144,12 +149,14 @@ final class AccidentalNamingAcceptTests: XCTestCase {
 
     /// `loadSnapshot` runs `cleanupStalePending()` and *then* posts
     /// `.showSpeakerNaming` for whatever is still pending. Stale cleanup drops
-    /// the naming data synchronously but leaves the job in
-    /// `.speakerNamingPending` for the duration of the async protocol
-    /// generation. That combination is what opens the naming window on a job
-    /// that has no speaker data left to show — and closes it again, without any
-    /// user input, once generation lands.
-    func testStaleCleanupLeavesJobPendingWithNoNamingData() async throws {
+    /// the naming data synchronously. It used to leave the job in
+    /// `.speakerNamingPending` until the async protocol generation started,
+    /// and that combination opened the naming window on a job with no speaker
+    /// data left to show (and, after a Skip in the dialog, kept the window on
+    /// that empty job instead of moving on). Accepting the auto-names now moves
+    /// the job out of `.speakerNamingPending` before it returns, like a
+    /// confirm, so nothing awaiting naming is left without its data.
+    func testStaleCleanupLeavesNoPendingJobWithoutNamingData() async throws {
         let tmp = try makeTempDirectory(prefix: "AccidentalNamingAcceptTests")
         let transcriptPath = tmp.appendingPathComponent("transcript.txt")
         try "] SPEAKER_0: hello".write(to: transcriptPath, atomically: true, encoding: .utf8)
@@ -164,24 +171,16 @@ final class AccidentalNamingAcceptTests: XCTestCase {
 
         // maxAge: -1 makes every pending job stale, standing in for the 24 h
         // default without having to forge `enqueuedAt`.
+        mock.holdProtocolGeneration = true
         session.cleanupStalePending(pendingJobs: [job], maxAge: -1)
 
-        // This is the state `loadSnapshot` observes when it decides whether to
-        // post `.showSpeakerNaming`: still pending, but nothing left to show.
-        // The window therefore opens on the "No speaker data available."
-        // placeholder, with no user action involved.
-        XCTAssertEqual(mock.jobs[job.id]?.state, .speakerNamingPending)
+        // The state `loadSnapshot` observes when it decides whether to post
+        // `.showSpeakerNaming`: no longer pending, so no window on a
+        // placeholder.
+        XCTAssertEqual(mock.jobs[job.id]?.state, .generatingProtocol)
         XCTAssertNil(session.speakerNamingDataByJob[job.id])
 
-        // ...but the pending list drains as soon as generation *starts*, not
-        // when it finishes, because `generateProtocol` flips to
-        // `.generatingProtocol` before awaiting the LLM. The window's
-        // auto-close is wired to that list, so this path cannot hold a window
-        // open for the length of an LLM call. (The wiring itself lives in the
-        // scene and is not exercised here — this pins the state it keys off.)
-        mock.holdProtocolGeneration = true
-        await waitUntil { mock.jobs[job.id]?.state != .speakerNamingPending }
-        XCTAssertEqual(mock.jobs[job.id]?.state, .generatingProtocol)
+        await waitUntil { mock.generateProtocolCallCount == 1 }
         XCTAssertEqual(mock.generateProtocolCallCount, 1)
 
         mock.holdProtocolGeneration = false
@@ -376,6 +375,43 @@ final class AccidentalNamingAcceptTests: XCTestCase {
         }
         XCTAssertEqual(rows.count, 1)
         XCTAssertEqual(rows.first?.source, .headless)
+    }
+
+    // MARK: - Speaker samples
+
+    /// A dual-source job's naming data names both persisted tracks and the
+    /// job's microphone delay, so the dialog can play each speaker from their
+    /// own track.
+    func testDualSourceNamingDataRecordsTheTracks() throws {
+        let tmp = try makeTempDirectory(prefix: "AccidentalNamingAcceptTests")
+        let session = makeSession(outputDir: tmp, statsLog: RecognitionStatsLog(path: tmp.appendingPathComponent("log.jsonl")))
+        let mock = MockDelegate()
+        session.delegate = mock
+        var job = PipelineJob(
+            meetingTitle: "Standup", appName: "Test",
+            mixPath: nil, appPath: nil, micPath: nil, micDelay: 0.3,
+        )
+        job.state = .diarizing
+        mock.jobs[job.id] = job
+
+        let diarization = DiarizationResult(
+            segments: [.init(start: 0, end: 12, speaker: "M_SPEAKER_0")],
+            speakingTimes: ["M_SPEAKER_0": 12],
+            autoNames: ["M_SPEAKER_0": "M_SPEAKER_0"],
+            embeddings: ["M_SPEAKER_0": [0.1, 0.2, 0.3]],
+        )
+        _ = session.resolveSpeakerNames(
+            diarization: diarization,
+            job: (jobID: job.id, title: "Standup", slug: "standup_abcd1234", participants: []),
+            diarizeProcess: MockDiarization(),
+            isDualSource: true, outputDir: tmp,
+        )
+
+        let tracks = try XCTUnwrap(session.speakerNamingDataByJob[job.id]?.tracks)
+        let recordings = tmp.appendingPathComponent("recordings")
+        XCTAssertEqual(tracks.app, recordings.appendingPathComponent("standup_abcd1234_app_16k.wav"))
+        XCTAssertEqual(tracks.mic, recordings.appendingPathComponent("standup_abcd1234_mic_16k.wav"))
+        XCTAssertEqual(tracks.micDelay, 0.3)
     }
 
     // MARK: - Log schema stays backward compatible

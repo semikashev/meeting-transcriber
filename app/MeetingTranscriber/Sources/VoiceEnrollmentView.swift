@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 /// Three-stage sheet that seeds `speakers.json` from an existing audio file:
 /// 1. Pick file → 2. Diarize → 3. Name speakers (reuses `SpeakerNamingView`)
@@ -40,7 +41,8 @@ struct VoiceEnrollmentView: View {
         /// Snapshot of everything the naming stage needs — computed once on
         /// entry, NOT re-derived inside the view body on every render.
         case naming(NamingPayload)
-        case done(savedNames: [String])
+        /// `notice` explains confirmed names that were not stored.
+        case done(savedNames: [String], notice: String?)
         case error(String)
     }
 
@@ -67,7 +69,7 @@ struct VoiceEnrollmentView: View {
             case .pickFile: pickFileBody
             case let .diarizing(url): diarizingBody(url: url)
             case let .naming(payload): namingBody(payload: payload)
-            case let .done(names): doneBody(savedNames: names)
+            case let .done(names, notice): doneBody(savedNames: names, notice: notice)
             case let .error(message): errorBody(message: message)
             }
         }
@@ -145,13 +147,18 @@ struct VoiceEnrollmentView: View {
         }
     }
 
-    private func doneBody(savedNames: [String]) -> some View {
+    private func doneBody(savedNames: [String], notice: String?) -> some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Enrolled \(savedNames.count) speaker\(savedNames.count == 1 ? "" : "s")")
                 .font(.headline)
             if !savedNames.isEmpty {
                 Text(savedNames.joined(separator: ", "))
                     .foregroundStyle(.secondary)
+            }
+            if let notice {
+                Text(notice)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             HStack {
                 Spacer()
@@ -175,18 +182,19 @@ struct VoiceEnrollmentView: View {
 
     // MARK: - Actions
 
-    /// Builds the configured file panel. Split out of `pickFile` so a test can
-    /// assert what the panel actually offers — `runModal()` is a modal loop and
-    /// stays manual-QA-only, but its configuration does not have to be.
-    static func makeFilePanel() -> NSOpenPanel {
-        let panel = NSOpenPanel()
+    /// Builds the configured file panel from `make`. Split out of `pickFile` so a
+    /// test can assert it on a stand-in: a real `NSOpenPanel` under a
+    /// `CFFIXED_USER_HOME` with `//` in it starts a panel service that grows by
+    /// gigabytes (#1024).
+    static func makeFilePanel<P: FilePanelSettings>(_ make: () -> P) -> P {
+        let panel = make()
         panel.allowedContentTypes = AudioImportTypes.enrollmentTypes
         panel.allowsMultipleSelection = false
         return panel
     }
 
     private func pickFile(initialDirectory: URL?) {
-        let panel = Self.makeFilePanel()
+        let panel = Self.makeFilePanel { NSOpenPanel() }
         if let initialDirectory {
             try? FileManager.default.createDirectory(
                 at: initialDirectory, withIntermediateDirectories: true,
@@ -273,7 +281,7 @@ enum VoiceEnrollmentLogic {
             guard let embeddings = payload.diarization.embeddings else {
                 return .stage(.error("Diarization produced no embeddings; cannot enroll."))
             }
-            matcher.updateDB(
+            let outcome = matcher.updateDB(
                 mapping: mapping,
                 embeddings: embeddings,
                 speakingTimes: payload.diarization.speakingTimes,
@@ -281,11 +289,15 @@ enum VoiceEnrollmentLogic {
                     origin: .enrollment, meetingTitle: payload.url.lastPathComponent, pinned: asReference,
                 ),
             )
-            let saved = Set(mapping.values.filter { !$0.isEmpty }).sorted()
-            return .stage(.done(savedNames: saved))
+            // Only what reached the DB: a name whose sample was unusable, or a
+            // DB that could not be written, must not read as enrolled.
+            let confirmed = Set(mapping.compactMap { label, name in
+                name.isEmpty || name == label ? nil : name
+            })
+            return .stage(.done(savedNames: outcome.stored, notice: notice(for: outcome, confirmed: confirmed)))
 
         case .skipped:
-            return .stage(.done(savedNames: []))
+            return .stage(.done(savedNames: [], notice: nil))
 
         case let .rerun(count):
             return .rerun(url: payload.url, numSpeakers: count)
@@ -296,6 +308,27 @@ enum VoiceEnrollmentLogic {
             // semantics. The enrollment helper doesn't expose mode toggling,
             // so the mode component is ignored here.
             return .rerun(url: payload.url, numSpeakers: count)
+        }
+    }
+
+    /// Why `confirmed` names are missing from the enrolled list, or nil when
+    /// nothing is missing. A name is missing with the DB saved when its sample
+    /// had a NaN/Inf embedding or none at all; both mean the clip gave the
+    /// diarizer too little of that voice.
+    static func notice(for outcome: SpeakerMatcher.ConfirmationOutcome, confirmed: Set<String>) -> String? {
+        switch outcome.persistence {
+        case .dbUnavailable:
+            return "Nothing was saved: the existing voice profiles could not be read, "
+                + "so they were left unchanged."
+
+        case .writeFailed:
+            return "Nothing was saved: writing the voice profiles failed."
+
+        case .saved:
+            let missing = confirmed.subtracting(outcome.stored).sorted()
+            guard !missing.isEmpty else { return nil }
+            return "No usable voice sample for \(missing.joined(separator: ", ")): "
+                + "the clip is too short or too quiet. Try a longer clip of them speaking."
         }
     }
 
@@ -338,3 +371,12 @@ enum VoiceEnrollmentLogic {
         )
     }
 }
+
+/// The `NSOpenPanel` settings `VoiceEnrollmentView` applies.
+@MainActor
+protocol FilePanelSettings: AnyObject {
+    var allowedContentTypes: [UTType] { get set }
+    var allowsMultipleSelection: Bool { get set }
+}
+
+extension NSOpenPanel: FilePanelSettings {}

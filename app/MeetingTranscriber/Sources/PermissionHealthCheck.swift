@@ -14,6 +14,9 @@ enum PermissionStatus: Equatable {
     case denied
     case broken
     case notDetermined
+    /// This build cannot use the permission at all, so there is nothing for
+    /// the user to grant: no problem, no badge, no notification, no Settings row.
+    case notApplicable
 }
 
 enum PermissionProblem: Equatable {
@@ -65,12 +68,12 @@ enum PermissionProblem: Equatable {
     ///
     /// Accessibility never blocks: its only consumer is `ParticipantReader` (Teams
     /// participant names, read in `handleMeeting`), which a recording does not need.
-    /// Settings labels it optional too, via `PermissionRow(optional: true)`, but that
-    /// row is not independent corroboration: its wording promises a mute detection
-    /// that does not exist, since mute handling is sample-level in `AudioMixer` and
-    /// level-based in `ChannelHealthController`, neither of which touches
-    /// Accessibility. Nothing links the row to this switch either, so flipping one
-    /// leaves them disagreeing with no compile error and no failing test.
+    /// Settings labels it optional too, via `PermissionRow(optional: true)`, in a
+    /// build that shows the row at all (`accessibilityApplies`), but that
+    /// row is not independent corroboration: nothing links the row to this switch,
+    /// so flipping one leaves them disagreeing with no compile error and no failing
+    /// test. (Mute handling is sample-level in `AudioMixer` and level-based in
+    /// `ChannelHealthController`; neither touches Accessibility.)
     ///
     /// Screen Recording keeps blocking every recording that taps a process, even
     /// though it is only *one* of two sufficient grants for the app-audio tap, the
@@ -125,17 +128,17 @@ struct HealthCheckResult: Equatable {
         switch screenRecording {
         case .denied: result.append(.screenRecordingDenied)
         case .broken: result.append(.screenRecordingBroken)
-        default: break
+        case .healthy, .notDetermined, .notApplicable: break
         }
         switch microphone {
         case .denied: result.append(.microphoneDenied)
         case .broken: result.append(.microphoneBroken)
-        default: break
+        case .healthy, .notDetermined, .notApplicable: break
         }
         switch accessibility {
         case .denied: result.append(.accessibilityDenied)
         case .broken: result.append(.accessibilityBroken)
-        default: break
+        case .healthy, .notDetermined, .notApplicable: break
         }
         return result
     }
@@ -247,16 +250,16 @@ enum PermissionHealthCheck {
     ) -> PermissionStatus {
         switch authStatus {
         case .notDetermined:
-            return .notDetermined
+            .notDetermined
 
         case .denied, .restricted:
-            return .denied
+            .denied
 
         case .authorized:
-            return probeSucceeds ? .healthy : .broken
+            probeSucceeds ? .healthy : .broken
 
         @unknown default:
-            return .denied
+            .denied
         }
     }
 
@@ -302,90 +305,10 @@ enum PermissionHealthCheck {
         return 1.0
     }
 
-    /// Thread-safe mic probe stats (tap callback runs on audio thread).
-    private final class BufferCounter: @unchecked Sendable {
-        private let lock = NSLock()
-        private var count = 0
-        private var maxPeak: Float = 0
-        func record(buffer: AVAudioPCMBuffer) {
-            let peak = PermissionHealthCheck.peakAmplitude(of: buffer)
-            lock.lock()
-            count += 1
-            if peak > maxPeak { maxPeak = peak }
-            lock.unlock()
-        }
-
-        func snapshot() -> (count: Int, maxPeak: Float) {
-            lock.lock(); defer { lock.unlock() }
-            return (count, maxPeak)
-        }
-    }
-
     /// Maximum time to wait for the mic probe to observe the first audio buffer.
     static let probeTimeout: TimeInterval = 0.5
     /// Poll interval while waiting for the first buffer to arrive.
     static let probePollInterval: TimeInterval = 0.02
-
-    static func probeMicrophone() async -> Bool {
-        // No input device available (e.g. Mac Mini server without mic hardware) —
-        // accessing AVAudioEngine.inputNode would throw an uncatchable NSException.
-        guard AVCaptureDevice.default(for: .audio) != nil else {
-            debugLog("probeMicrophone: no input device available")
-            return false
-        }
-
-        let engine = AVAudioEngine()
-        let inputNode = engine.inputNode
-        // inputFormat reflects what the hardware actually delivers; outputFormat can report
-        // a degenerate (sampleRate=0) format when nothing is attached downstream, which
-        // would false-fail the guard below.
-        let format = inputNode.inputFormat(forBus: 0)
-
-        guard format.sampleRate > 0, format.channelCount > 0 else {
-            debugLog("probeMicrophone: invalid format sampleRate=\(format.sampleRate) " +
-                "channels=\(format.channelCount)")
-            return false
-        }
-
-        let counter = BufferCounter()
-        do {
-            // safeInstallTap: a device change mid-probe could make installTap
-            // raise an uncatchable NSException (issue #379); treat that as a
-            // failed probe rather than an abort.
-            try inputNode.safeInstallTap(onBus: 0, bufferSize: 1024, format: format) { buffer, _ in
-                if buffer.frameLength > 0 { counter.record(buffer: buffer) }
-            }
-        } catch {
-            debugLog("probeMicrophone: installTap failed: \(error.localizedDescription)")
-            return false
-        }
-
-        do {
-            try engine.start()
-        } catch {
-            inputNode.removeTap(onBus: 0)
-            debugLog("probeMicrophone: engine.start() threw: \(error.localizedDescription)")
-            return false
-        }
-
-        let (stats, elapsedMs) = await waitForProbeSignal(
-            deadline: Date().addingTimeInterval(probeTimeout),
-            pollInterval: Self.probePollInterval,
-            snapshot: counter.snapshot,
-        )
-
-        engine.stop()
-        inputNode.removeTap(onBus: 0)
-
-        // Diagnostic-only (issue #446): buffers flowing but below the noise floor means a
-        // likely muted/virtual input — healthy, not broken, but a useful breadcrumb.
-        let silentDespiteBuffers = micProbeSucceeds(bufferCount: stats.count)
-            && stats.maxPeak <= Self.silentMicPeakThreshold
-        debugLog("probeMicrophone: buffers=\(stats.count) peak=\(stats.maxPeak) " +
-            "silentDespiteBuffers=\(silentDespiteBuffers) elapsed=\(elapsedMs)ms " +
-            "sampleRate=\(format.sampleRate) channels=\(format.channelCount)")
-        return micProbeSucceeds(bufferCount: stats.count)
-    }
 
     /// Polls `snapshot` until the first audio buffer arrives (`count > 0`, healthy — the tap
     /// is delivering data) or `now()` passes `deadline` (broken — no buffers at all). A
@@ -415,12 +338,17 @@ enum PermissionHealthCheck {
     static func checkMicrophoneLive() async -> PermissionStatus {
         let status = AVCaptureDevice.authorizationStatus(for: .audio)
         if status != .authorized {
+            lastAnsweredMicrophoneVerdict.withLock { $0 = nil }
             let r = checkMicrophone(authStatus: status, probeSucceeds: false)
             debugLog("checkMicrophoneLive: authStatus=\(status.rawValue) probe=skipped → \(r)")
             return r
         }
         let probe = await probeMicrophone()
-        let r = checkMicrophone(authStatus: status, probeSucceeds: probe)
+        let r = microphoneVerdict(
+            afterAuthorizedProbe: probe,
+            lastAnswered: lastAnsweredMicrophoneVerdict.withLock { $0 },
+        )
+        if case .answered = probe { lastAnsweredMicrophoneVerdict.withLock { $0 = r } }
         debugLog("checkMicrophoneLive: authStatus=authorized probe=\(probe) → \(r)")
         return r
     }
@@ -514,7 +442,25 @@ enum PermissionHealthCheck {
         return classify(err)
     }
 
-    static func checkAccessibilityLive() -> PermissionStatus {
+    /// Whether this build uses the Accessibility grant at all, and the one
+    /// place that decides it. The sandboxed App Store build does not: it never
+    /// asks for the grant (`WatchingController`'s `requestAccessibility`
+    /// default), offers no way to fix a missing one, and does not read the
+    /// Teams roster (`ParticipantReader.readParticipants`), the grant's only
+    /// consumer. Reporting it as denied there raised the red menu-bar badge and
+    /// a notification about a permission the app itself never offers to fix.
+    ///
+    /// The compile-time flag only picks this production default; everything
+    /// downstream takes the value as a parameter, so the tests exercise both
+    /// answers in either variant of the suite.
+    #if APPSTORE
+        static let accessibilityApplies = false
+    #else
+        static let accessibilityApplies = true
+    #endif
+
+    static func checkAccessibilityLive(applies: Bool = accessibilityApplies) -> PermissionStatus {
+        guard applies else { return .notApplicable }
         let trusted = AXIsProcessTrusted()
         if !trusted {
             debugLog("checkAccessibilityLive: trusted=false → denied")

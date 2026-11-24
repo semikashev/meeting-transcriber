@@ -6,12 +6,45 @@ struct TranscriptionSettingsView: View {
     @Bindable var settings: AppSettings
     var whisperKitEngine: WhisperKitEngine
     var parakeetEngine: ParakeetEngine
+    var captionWarmup: LiveCaptionsWarmup = .idle
 
     /// Set when the user flips live captions on while a first-use Nemotron model
     /// download is pending — defers the actual enable to the consent alert.
     @State private var pendingCaptionEnable = false
 
-    private static let whisperKitModels: [(variant: String, label: String)] = [
+    /// What is being typed into the custom model fields. Kept out of `settings`
+    /// until the field commits (see `DraftTextField`), because the engine observer
+    /// acts on every settings write.
+    @State private var customModelDrafts: WhisperKitCustomModelDrafts
+
+    /// WhisperKit models earlier builds left in `Documents`. Nil leaves the row
+    /// out, so a view built without one (as most view tests do) is never bound
+    /// to the real `Documents` and Trash; `SettingsView` passes the live one.
+    @State private var legacyModels: LegacyWhisperModelsState?
+
+    init(
+        settings: AppSettings,
+        whisperKitEngine: WhisperKitEngine,
+        parakeetEngine: ParakeetEngine,
+        captionWarmup: LiveCaptionsWarmup = .idle,
+        legacyModels: LegacyWhisperModelsState? = nil,
+    ) {
+        self.settings = settings
+        self.whisperKitEngine = whisperKitEngine
+        self.parakeetEngine = parakeetEngine
+        self.captionWarmup = captionWarmup
+        // Created here, not as a default value: for an `@Observable` type the
+        // default-value form creates the object only once the view is installed,
+        // so a view inspected outside a hierarchy, as the view tests do, would get
+        // a new object on every read and lose each edit.
+        _customModelDrafts = State(initialValue: WhisperKitCustomModelDrafts())
+        _legacyModels = State(initialValue: legacyModels)
+    }
+
+    /// Also the variants `LegacyWhisperModelsState` may offer to remove from the
+    /// old location: the picker has offered exactly these since the app first
+    /// downloaded into `Documents`.
+    static let whisperKitModels: [(variant: String, label: String)] = [
         ("openai_whisper-large-v3-v20240930_turbo", "Large V3 Turbo (recommended)"),
         ("openai_whisper-large-v3-v20240930", "Large V3"),
         ("openai_whisper-large-v2", "Large V2"),
@@ -23,9 +56,22 @@ struct TranscriptionSettingsView: View {
     var body: some View {
         Form {
             transcriptionSection
+            vocabularySection
             liveTranscriptionSection
+            legacyModelsSection
         }
         .formStyle(.grouped)
+        // On appear, and again whenever the model settings change, so the list
+        // never offers what just became the selected or picked model.
+        .onAppear { legacyModels?.paneAppeared() }
+        .task(id: LegacyWhisperModelsState.ScopeInputs(settings)) { await legacyModels?.refresh() }
+    }
+
+    /// Last, so it moves no control the view tests reach by position.
+    @ViewBuilder private var legacyModelsSection: some View {
+        if let legacyModels {
+            LegacyWhisperModelsSection(state: legacyModels)
+        }
     }
 
     /// Each group of controls is a named property rather than inline in
@@ -40,14 +86,19 @@ struct TranscriptionSettingsView: View {
             enginePicker
             whisperKitPickers
             parakeetLanguagePicker
-            customVocabularyRow
-            customVocabularyValidation
-            whisperKitVocabularyPromptControls
-            terminologyRulesEditor
             engineStatusView
+            Toggle("Unload models when idle", isOn: $settings.unloadModelsWhenIdle)
+                .accessibilityIdentifier(A11yID.unloadModelsWhenIdleToggle)
+                .help(
+                    "Free transcription model memory while waiting for meetings. "
+                        + "Models load automatically for processing; live captions keep the models they need.",
+                )
         }
         .accessibilityIdentifier(A11yID.transcriptionSection)
         .recordOnlyDisabled(settings.recordOnly)
+        // Not while a removal runs: a model picked or loaded meanwhile could be
+        // one whose old copy is on its way to the Trash.
+        .disabled(legacyModels?.isRemoving == true)
     }
 
     private var enginePicker: some View {
@@ -61,17 +112,30 @@ struct TranscriptionSettingsView: View {
     @ViewBuilder
     private var whisperKitPickers: some View { // swiftlint:disable:this attributes
         if settings.transcriptionEngine == .whisperKit {
-            Picker("Model", selection: $settings.whisperKitModel) {
-                ForEach(Self.whisperKitModels, id: \.variant) { model in
-                    Text(model.label).tag(model.variant)
-                }
-            }
+            whisperKitModelPicker
 
             Picker("Language", selection: $settings.whisperLanguage) {
                 ForEach(PickerLanguages.whisperKit, id: \.code) { lang in
                     Text(lang.label).tag(lang.code)
                 }
             }
+        }
+    }
+
+    /// Its own property so that anything added next to the model choice grows
+    /// this body rather than `whisperKitPickers`.
+    @ViewBuilder
+    private var whisperKitModelPicker: some View { // swiftlint:disable:this attributes
+        Picker("Model", selection: whisperKitModelPickerSelection) {
+            ForEach(Self.whisperKitModels, id: \.variant) { model in
+                Text(model.label).tag(model.variant)
+            }
+            Text("Custom model\u{2026}").tag(Self.customModelTag)
+        }
+        .accessibilityIdentifier(A11yID.whisperKitModelPicker)
+
+        if settings.whisperKitCustomModelEnabled {
+            customWhisperKitModelFields
         }
     }
 
@@ -86,70 +150,84 @@ struct TranscriptionSettingsView: View {
         }
     }
 
-    private var customVocabularyRow: some View {
-        HStack {
-            TextField("Custom vocabulary file", text: Binding(
-                get: { settings.customVocabularyPath },
-                set: { settings.setCustomVocabularyPath($0) },
-            ))
+    /// Picker tag of the custom-model entry. Never stored: `whisperKitModel` keeps
+    /// the stock variant, which is what an unfinished custom model falls back to.
+    static let customModelTag = "custom"
+
+    private var whisperKitModelPickerSelection: Binding<String> {
+        Binding(
+            get: { settings.whisperKitCustomModelEnabled ? Self.customModelTag : settings.whisperKitModel },
+            set: { tag in
+                settings.whisperKitCustomModelEnabled = tag == Self.customModelTag
+                if tag != Self.customModelTag { settings.whisperKitModel = tag }
+            },
+        )
+    }
+
+    /// Hoisted out of `body` for the same type-check reason as
+    /// `liveTranscriptionSection`.
+    ///
+    /// The three text fields commit on Return or when they are left; the folder buttons
+    /// write at once, since a picked or cleared folder is a finished decision.
+    @ViewBuilder private var customWhisperKitModelFields: some View {
+        let drafts = Bindable(customModelDrafts)
+        DraftTextField(
+            "Hugging Face repository",
+            value: settings.whisperKitCustomRepo,
+            draft: drafts.repo,
+            prompt: Text("owner/name"),
+        ) { settings.whisperKitCustomRepo = $0 }
             .textFieldStyle(.roundedBorder)
-            .accessibilityIdentifier(A11yID.customVocabularyPathField)
+            .accessibilityIdentifier(A11yID.whisperKitCustomRepoField)
+        DraftTextField(
+            "Variant",
+            value: settings.whisperKitCustomVariant,
+            draft: drafts.variant,
+            prompt: Text("folder in the repository"),
+        ) { settings.whisperKitCustomVariant = $0 }
+            .textFieldStyle(.roundedBorder)
+            .accessibilityIdentifier(A11yID.whisperKitCustomVariantField)
+        HStack {
+            DraftTextField(
+                "Or model folder",
+                value: settings.whisperKitCustomModelFolderPath,
+                draft: drafts.folder,
+            ) { settings.setWhisperKitCustomModelFolderPath($0) }
+                .textFieldStyle(.roundedBorder)
+                .accessibilityIdentifier(A11yID.whisperKitCustomModelFolderField)
             Button("Choose\u{2026}") {
                 let panel = NSOpenPanel()
-                panel.allowedContentTypes = [.plainText]
+                panel.canChooseDirectories = true
+                panel.canChooseFiles = false
                 panel.allowsMultipleSelection = false
                 if panel.runModal() == .OK, let url = panel.url {
-                    settings.setCustomVocabularyFile(url)
+                    customModelDrafts.chooseFolder(url, in: settings)
                 }
             }
+            Button("Clear") {
+                customModelDrafts.clearFolder(in: settings)
+            }
+            .disabled(settings.whisperKitCustomModelFolderPath.isEmpty)
         }
-        .help(Self.vocabularyHelpText(for: settings.transcriptionEngine))
-    }
-
-    private var customVocabularyValidation: some View {
-        Text(settings.customVocabularyValidation.message)
+        .help(Self.customModelFolderHelpText)
+        Text(settings.whisperKitCustomModelValidation.message)
             .font(.caption)
             .foregroundStyle(.secondary)
-            .onAppear { settings.refreshCustomVocabularyValidation() }
-            .onChange(of: settings.customVocabularyPath) { _, _ in
-                settings.refreshCustomVocabularyValidation()
+            .onAppear { settings.refreshWhisperKitCustomModelValidation() }
+            // Here because this line exists only while the fields do. Closing the
+            // window hides it, so a pending edit would otherwise stay unapplied.
+            .onReceive(NotificationCenter.default.publisher(for: NSWindow.willCloseNotification)) { notification in
+                customModelDrafts.settingsWindowWillClose(notification, settings: settings)
             }
     }
 
-    @ViewBuilder
-    private var whisperKitVocabularyPromptControls: some View { // swiftlint:disable:this attributes
-        if settings.transcriptionEngine == .whisperKit {
-            Toggle("Use custom vocabulary prompt (experimental)", isOn: $settings.whisperKitVocabularyPromptEnabled)
-                .accessibilityIdentifier(A11yID.whisperKitVocabularyPromptToggle)
-                .help(Self.whisperKitVocabularyPromptHelpText)
-            Text("Experimental: dense audio can omit whole sentences. See help for measured results; prefer Parakeet for vocabulary boosting.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            Text("When enabled, WhisperKit uses a 32-token hint; earlier terms have priority.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        }
-    }
-
-    private var terminologyRulesEditor: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text("Canonical terminology")
-            TextEditor(text: $settings.terminologyRulesText)
-                .font(.body.monospaced())
-                .frame(minHeight: 72)
-                .accessibilityIdentifier(A11yID.terminologyRulesEditor)
-            Text(
-                "Applied to saved transcripts after ASR. One rule per line: "
-                    + "Canonical spelling => spoken variant | another variant. "
-                    + "Rules only replace whole words or phrases.",
-            )
-            .font(.caption)
-            .foregroundStyle(.secondary)
-            Text(settings.terminologyRulesValidation.message)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        }
-    }
+    static let customModelFolderHelpText =
+        "A WhisperKit model folder on disk, used instead of the repository when set. "
+            + "It must contain AudioEncoder.mlmodelc, TextDecoder.mlmodelc, MelSpectrogram.mlmodelc, "
+            + "tokenizer.json and tokenizer_config.json. The folder itself is never downloaded; "
+            + "WhisperKit prefers a stock tokenizer it has already cached and reads the folder's "
+            + "tokenizer otherwise, so the folder can load without a network. "
+            + "Use Choose\u{2026} to pick the folder; a typed path works only outside the sandbox."
 
     /// Hoisted out of `body` into a named property so the section's nesting
     /// doesn't grow the `body` type-check past the 300 ms hard limit on CI.
@@ -158,8 +236,8 @@ struct TranscriptionSettingsView: View {
             // The toggle stays enabled even for engines without the
             // re-transcribe hook, because the language-driven streaming
             // backends route captions through an engine-independent session.
-            // Enabling it for a Nemotron language whose model isn't downloaded
-            // yet defers to a consent alert (the ~0.6 GB first-use download).
+            // Enabling it for a language that routes to Nemotron, whose model isn't
+            // downloaded yet, defers to a consent alert (the ~0.6 GB first-use download).
             Toggle("Enable live transcription during recording", isOn: Binding(
                 get: { settings.liveTranscriptionEnabled },
                 set: { enabled in
@@ -180,6 +258,7 @@ struct TranscriptionSettingsView: View {
                 )
             }
 
+            if settings.liveTranscriptionEnabled { CaptionWarmupStatus(warmup: captionWarmup) }
             captionOverlayToggle
             captionSizePicker
 
@@ -222,12 +301,25 @@ struct TranscriptionSettingsView: View {
         .accessibilityIdentifier(A11yID.liveCaptionsSizePicker)
     }
 
+    /// The backend live captions would use if enabled, from the one routing rule.
+    static func captionStrategy(for settings: AppSettings) -> LiveCaptionsGate.Strategy {
+        LiveCaptionsGate.strategy(
+            liveEnabled: true,
+            engineLanguage: settings.activeEngineLanguageOrNil,
+            engineSupportsLive: settings.transcriptionEngine.supportsLiveTranscription,
+        )
+    }
+
     /// True when enabling captions would trigger the first-use Nemotron download:
-    /// the active language routes to Nemotron (set + non-English) and no model
-    /// variant is on disk yet.
+    /// the active language routes to Nemotron and no model variant is on disk yet.
+    static func needsCaptionModelConsent(strategy: LiveCaptionsGate.Strategy, modelDownloaded: Bool) -> Bool {
+        strategy == .nemotronStreaming && !modelDownloaded
+    }
+
     private var needsCaptionModelConsent: Bool {
-        guard let language = settings.activeEngineLanguageOrNil, language != "en" else { return false }
-        return !nemotronModelDownloaded
+        Self.needsCaptionModelConsent(
+            strategy: Self.captionStrategy(for: settings), modelDownloaded: nemotronModelDownloaded,
+        )
     }
 
     /// Engine-specific terminology behaviour is deliberately explained next to
@@ -240,17 +332,13 @@ struct TranscriptionSettingsView: View {
                 + "Live captions do not use CTC vocabulary rescoring."
 
         case .whisperKit:
-            "Text file with one term per line. Enable the experimental custom vocabulary prompt to pass a "
-                + "soft 32-token decoder hint to WhisperKit; it is not a guaranteed correction. "
+            "Text file with one term per line. WhisperKit gets the terms as an experimental, "
+                + "soft 32-token decoder hint; it is not a guaranteed correction. "
+                + "Earlier terms have priority: put the ones that matter most first. "
                 + "It applies to live captions only when they use "
                 + "WhisperKit; language-specific live backends do not use it."
         }
     }
-
-    static let whisperKitVocabularyPromptHelpText = "Experimental. WhisperKit treats the vocabulary as a decoder hint, "
-        + "not a correction. In a dense four-speaker English evaluation, a 25-content-token prompt "
-        + "from this 32-token budget raised word error rate from 29% to 77% and deletions from 73 to 241. "
-        + "It can omit whole sentences. Results vary by audio; prefer Parakeet for vocabulary boosting."
 
     /// Whether any Nemotron multilingual model variant is already on disk.
     private var nemotronModelDownloaded: Bool {
@@ -261,24 +349,43 @@ struct TranscriptionSettingsView: View {
         return FileManager.default.fileExists(atPath: dir.path)
     }
 
-    /// Describes which low-latency backend the current transcription language
-    /// selects. The backend follows the active engine's configured language (no
-    /// toggle): English → Parakeet EOU, any other set language → Nemotron
-    /// multilingual streaming, auto-detect → the standard re-transcribe engine.
     private var captionBackendFootnote: String {
-        switch settings.activeEngineLanguageOrNil {
-        case .none:
-            "Caption backend follows your transcription language. Auto-detect uses the "
-                + "standard re-transcribe engine; set a specific language for low-latency "
-                + "streaming captions."
+        Self.captionBackendFootnote(
+            strategy: Self.captionStrategy(for: settings),
+            languageIsSet: settings.activeEngineLanguageOrNil != nil,
+            detectsLanguage: activeEngine.supportsCaptionLanguageDetection,
+        )
+    }
 
-        case "en":
+    /// Describes the backend `LiveCaptionsGate` selects for the current transcription
+    /// language: English → Parakeet EOU, a language Nemotron was trained on → Nemotron
+    /// streaming, any other language → the standard re-transcribe engine; auto-detect too, unless the engine detects English first.
+    static func captionBackendFootnote(
+        strategy: LiveCaptionsGate.Strategy,
+        languageIsSet: Bool,
+        detectsLanguage: Bool,
+    ) -> String {
+        switch strategy {
+        case .englishStreaming:
             "Caption backend follows your transcription language. English uses the "
                 + "low-latency Parakeet streaming model."
 
-        default:
+        case .nemotronStreaming:
             "Caption backend follows your transcription language. It uses the low-latency "
                 + "Nemotron multilingual streaming model (~0.6-0.7 GB, downloads on first use)."
+
+        // `.none` cannot be reached with a language set: both engines support re-transcribe.
+        case .reTranscribe, .none:
+            if languageIsSet {
+                "Caption backend follows your transcription language. This language has no "
+                    + "low-latency streaming model, so captions use the standard re-transcribe engine."
+            } else if detectsLanguage {
+                "Caption backend follows your transcription language. Auto-detect listens to the first few seconds of speech: "
+                    + "English then streams through the low-latency Parakeet model; other languages use the standard re-transcribe engine."
+            } else {
+                "Caption backend follows your transcription language. Auto-detect uses the "
+                    + "standard re-transcribe engine; set a specific language for low-latency streaming captions."
+            }
         }
     }
 
@@ -292,7 +399,7 @@ struct TranscriptionSettingsView: View {
             + "click-through bar at the bottom of the screen; turn it off to hide "
             + "the bar without stopping transcription. Hold ⌥ (Option) "
             + "to drag it; the position is remembered across sessions. "
-            + "Caption text is **not** logged by default — enable "
+            + "Caption text is not logged by default — enable "
             + "\"Verbose Diagnostic Logging\" in Advanced to see "
             + "partials + finals in Console.app (subsystem "
             + "com.meetingtranscriber, category LiveTranscription). "
@@ -332,12 +439,162 @@ struct TranscriptionSettingsView: View {
                 .font(.caption)
 
         case .unloaded:
+            if settings.unloadModelsWhenIdle {
+                Text("Loads when needed")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
             Button("Load Model") {
                 if settings.transcriptionEngine == .whisperKit {
-                    whisperKitEngine.modelVariant = settings.whisperKitModel
+                    customModelDrafts.commitPending(to: settings)
+                    let model = settings.whisperKitModelSelection
+                    whisperKitEngine.applyModelVariant(model.variant, origin: model.origin)
                 }
                 Task { await engine.loadModel() }
             }
+        }
+
+        // Why the last load failed, next to the state it explains. The engine keeps
+        // no reason while a model is loaded (a failed reload that keeps its pipe
+        // keeps the requested model, since any model change drops the pipe), so
+        // this shows only beside "Load Model".
+        if settings.transcriptionEngine == .whisperKit, let reason = whisperKitEngine.loadFailureReason {
+            Text(reason)
+                .font(.caption)
+                .foregroundStyle(.red)
+        }
+    }
+}
+
+/// The Vocabulary section. An extension so the view's main body stays under
+/// the type-length limit.
+extension TranscriptionSettingsView {
+    private var vocabularySection: some View {
+        Section("Vocabulary") {
+            customVocabularyToggle
+            customVocabularyFileRows
+            terminologyRulesEditor
+        }
+        .accessibilityIdentifier(A11yID.vocabularySection)
+        .recordOnlyDisabled(settings.recordOnly)
+    }
+
+    /// WhisperKit's help adds the experimental warning: it is the engine where the
+    /// vocabulary can cost completeness.
+    private var customVocabularyToggle: some View {
+        HelpfulToggle(
+            title: "Use custom vocabulary",
+            help: settings.transcriptionEngine == .whisperKit
+                ? SettingsHelp.customVocabularyWhisperKit
+                : SettingsHelp.customVocabulary,
+            isOn: $settings.customVocabularyEnabled,
+        )
+        .accessibilityIdentifier(A11yID.customVocabularyToggle)
+    }
+
+    /// Hidden while the switch is off, since no engine reads the file then.
+    @ViewBuilder private var customVocabularyFileRows: some View {
+        if settings.customVocabularyEnabled {
+            customVocabularyRow
+            customVocabularyValidation
+        }
+    }
+
+    private var customVocabularyRow: some View {
+        HStack {
+            TextField("Custom vocabulary file", text: Binding(
+                get: { settings.customVocabularyPath },
+                set: { settings.setCustomVocabularyPath($0) },
+            ))
+            .textFieldStyle(.roundedBorder)
+            .accessibilityIdentifier(A11yID.customVocabularyPathField)
+            Button("Choose\u{2026}") {
+                let panel = NSOpenPanel()
+                panel.allowedContentTypes = [.plainText]
+                panel.allowsMultipleSelection = false
+                if panel.runModal() == .OK, let url = panel.url {
+                    settings.setCustomVocabularyFile(url)
+                }
+            }
+        }
+        .help(Self.vocabularyHelpText(for: settings.transcriptionEngine))
+    }
+
+    private var customVocabularyValidation: some View {
+        Text(settings.customVocabularyValidation.message)
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .onAppear { settings.refreshCustomVocabularyValidation() }
+            .onChange(of: settings.customVocabularyPath) { _, _ in
+                settings.refreshCustomVocabularyValidation()
+            }
+    }
+}
+
+// MARK: - Terminology rules
+
+private extension TranscriptionSettingsView {
+    var terminologyRulesEditor: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Canonical terminology")
+            terminologyRulesFileRow
+            terminologyRulesSource
+            Text(
+                "Applied to saved transcripts after ASR. One rule per line: "
+                    + "Canonical spelling => spoken variant | another variant. "
+                    + "Rules only replace whole words or phrases.",
+            )
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            Text(settings.terminologyRulesValidation.message)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .onAppear { settings.refreshTerminologyRulesValidation() }
+                .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+                    settings.refreshTerminologyRulesValidation()
+                }
+        }
+    }
+
+    var terminologyRulesFileRow: some View {
+        HStack {
+            TextField("Terminology rules file (optional)", text: Binding(
+                get: { settings.terminologyRulesFilePath },
+                set: { settings.setTerminologyRulesFilePath($0) },
+            ))
+            .textFieldStyle(.roundedBorder)
+            .accessibilityIdentifier(A11yID.terminologyRulesFilePathField)
+            Button("Choose\u{2026}") {
+                let panel = NSOpenPanel()
+                panel.allowedContentTypes = [.plainText]
+                panel.allowsMultipleSelection = false
+                if panel.runModal() == .OK, let url = panel.url {
+                    settings.setTerminologyRulesFile(url)
+                }
+            }
+        }
+        .help("When a file is set, its rules are used instead of the text area and are read again at the start of each job.")
+    }
+
+    /// The text area while no rules file is set; otherwise the file's contents,
+    /// read-only, as of the last read: on appearing, on a change of path, when
+    /// the app becomes active and at each job start.
+    @ViewBuilder
+    var terminologyRulesSource: some View { // swiftlint:disable:this attributes
+        if settings.usesTerminologyRulesFile {
+            ScrollView {
+                Text(settings.terminologyRulesFileContents)
+                    .font(.body.monospaced())
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(minHeight: 72)
+            .accessibilityIdentifier(A11yID.terminologyRulesFilePreview)
+        } else {
+            TextEditor(text: $settings.terminologyRulesText)
+                .font(.body.monospaced())
+                .frame(minHeight: 72)
+                .accessibilityIdentifier(A11yID.terminologyRulesEditor)
         }
     }
 }

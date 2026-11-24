@@ -1,7 +1,8 @@
 import Foundation
 
 /// Edits to a speaker's sample history. Each recomputes the derived centroid
-/// and recent samples from what remains (see `VoiceSample`).
+/// and recent samples from what remains (see `VoiceSample`), and reports
+/// nothing changed when the DB could not be written.
 extension SpeakerMatcher {
     /// Drop the given samples from one speaker; its centroid and recent
     /// samples are recomputed from what remains. A speaker left without
@@ -9,13 +10,14 @@ extension SpeakerMatcher {
     /// Returns the number of samples removed.
     @discardableResult
     func removeSamples(_ ids: Set<UUID>, from name: String) -> Int {
-        mutateDB { stored in
+        let mutation = mutateDB { stored -> Int in
             guard let idx = stored.firstIndex(where: { $0.name == name }) else { return 0 }
             let kept = stored[idx].samples.filter { !ids.contains($0.id) }
             let removed = stored[idx].samples.count - kept.count
             if removed > 0 { stored[idx] = stored[idx].withSamples(kept) }
             return removed
         }
+        return mutation.saved ? mutation.value : 0
     }
 
     /// Undo what one recording taught the database: every sample it
@@ -42,7 +44,7 @@ extension SpeakerMatcher {
     /// Drop every matching sample from every speaker; returns the names of
     /// the speakers that changed.
     private func removeSamples(where undone: (VoiceSample) -> Bool) -> [String] {
-        mutateDB { stored in
+        let mutation = mutateDB { stored -> [String] in
             var changed: [String] = []
             for idx in stored.indices where stored[idx].samples.contains(where: undone) {
                 stored[idx] = stored[idx].withSamples(stored[idx].samples.filter { !undone($0) })
@@ -50,12 +52,13 @@ extension SpeakerMatcher {
             }
             return changed
         }
+        return mutation.saved ? mutation.value : []
     }
 
     /// Pin or unpin one sample as a reference voice (see `VoiceSample.pinned`).
     @discardableResult
     func setPinned(_ pinned: Bool, sample id: UUID, of name: String) -> Bool {
-        mutateDB { stored in
+        let mutation = mutateDB { stored -> Bool in
             guard let idx = stored.firstIndex(where: { $0.name == name }),
                   let sampleIdx = stored[idx].samples.firstIndex(where: { $0.id == id }) else { return false }
             var samples = stored[idx].samples
@@ -63,5 +66,6 @@ extension SpeakerMatcher {
             stored[idx] = stored[idx].withSamples(samples)
             return true
         }
+        return mutation.saved && mutation.value
     }
 }

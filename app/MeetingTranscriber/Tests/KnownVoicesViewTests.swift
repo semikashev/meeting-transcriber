@@ -138,12 +138,48 @@ final class KnownVoicesViewTests: XCTestCase { // swiftlint:disable:this balance
         XCTAssertTrue(message.hasPrefix("3 suspect samples will be removed from A, B."))
     }
 
+    /// An edit that could not be saved changed nothing, so it must not read
+    /// as done: no cache refresh, and the caller keeps its selection.
+    func testEditsOnUnreadableDBReportNoChangeAndSkipOnMutate() throws {
+        let matcher = SpeakerMatcher(dbPath: dbPath) { _ in }
+        matcher.saveDB([
+            StoredSpeaker(name: "From", embeddings: [[1, 0, 0]]),
+            StoredSpeaker(name: "Into", embeddings: [[0, 1, 0]]),
+        ])
+        try makeUnreadable(dbPath)
+        var calls = 0
+        // swiftlint:disable:next trailing_closure
+        let view = KnownVoicesView(matcher: matcher, onMutate: { calls += 1 })
+
+        XCTAssertEqual(view.performRename(from: "From", to: "New"), .notSaved)
+        XCTAssertEqual(view.performMerge(from: "From", into: "Into"), .notSaved)
+        XCTAssertEqual(view.performDelete(name: "From"), .notSaved)
+        XCTAssertEqual(calls, 0)
+    }
+
+    /// An edit that found the DB undecodable replaced it with an empty one:
+    /// that is a change, so caches must refresh even though the edit itself
+    /// found nothing.
+    func testEditOnUndecodableDBReportsResetAndRefreshes() throws {
+        try Data("not json".utf8).write(to: dbPath)
+        let matcher = SpeakerMatcher(dbPath: dbPath, onDBProblem: { _ in }, settleBeforeReread: {})
+        var calls = 0
+        // swiftlint:disable:next trailing_closure
+        let view = KnownVoicesView(matcher: matcher, onMutate: { calls += 1 })
+
+        XCTAssertEqual(view.performDelete(name: "Alice"), .dbReset)
+        XCTAssertEqual(calls, 1)
+        XCTAssertEqual(view.performDelete(name: "Alice"), .unchanged, "the fresh DB is decodable")
+        XCTAssertEqual(calls, 1)
+    }
+
     func testMissingOnMutateIsHandledGracefully() {
         let matcher = SpeakerMatcher(dbPath: dbPath)
         matcher.saveDB([StoredSpeaker(name: "X", embeddings: [[1, 0, 0]])])
         let view = KnownVoicesView(matcher: matcher) // onMutate omitted
-        // Mutations without a callback must not crash.
+        // Mutations without a callback must not crash, and still apply.
         view.performRename(from: "X", to: "Y")
+        XCTAssertEqual(matcher.allSpeakerNames(), ["Y"])
     }
 
     // MARK: - Render

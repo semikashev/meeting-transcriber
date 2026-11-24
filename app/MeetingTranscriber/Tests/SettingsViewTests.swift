@@ -16,7 +16,7 @@ final class SettingsViewTests: XCTestCase { // swiftlint:disable:this type_body_
     override func setUp() async throws {
         try await super.setUp()
         testSuiteName = "SettingsViewTests-\(getpid())-\(UUID().uuidString)"
-        guard let suite = UserDefaults(suiteName: testSuiteName) else {
+        guard let suite = DefaultsSuite.open(testSuiteName) else {
             XCTFail("Could not create test UserDefaults suite")
             return
         }
@@ -125,6 +125,17 @@ final class SettingsViewTests: XCTestCase { // swiftlint:disable:this type_body_
         }
     }
 
+    func testAutoWatchToggleBindsToSettings() throws {
+        // The setting existed before it had a control; this pins the control.
+        let settings = makeSettings()
+        XCTAssertFalse(settings.autoWatch, "precondition: auto-watch defaults off")
+        let toggle = try makeGeneral(settings: settings).inspect()
+            .find(viewWithAccessibilityIdentifier: A11yID.autoWatchToggle)
+            .toggle()
+        try toggle.tap()
+        XCTAssertTrue(settings.autoWatch, "tapping the toggle must turn auto-watch on")
+    }
+
     func testPollIntervalFieldExists() throws {
         let body = try makeGeneral().inspect()
         XCTAssertNoThrow(try body.find(text: "Poll Interval"))
@@ -204,6 +215,7 @@ final class SettingsViewTests: XCTestCase { // swiftlint:disable:this type_body_
     func testParakeetShowsCustomVocabularyField() throws {
         let settings = makeSettings()
         settings.transcriptionEngine = .parakeet
+        settings.customVocabularyEnabled = true
         let body = try makeTranscription(settings: settings).inspect()
         XCTAssertNoThrow(try body.find(text: "Custom vocabulary file"))
     }
@@ -211,6 +223,7 @@ final class SettingsViewTests: XCTestCase { // swiftlint:disable:this type_body_
     func testWhisperKitShowsCustomVocabularyField() throws {
         let settings = makeSettings()
         settings.transcriptionEngine = .whisperKit
+        settings.customVocabularyEnabled = true
         let body = try makeTranscription(settings: settings).inspect()
         XCTAssertNoThrow(try body.find(text: "Custom vocabulary file"))
     }
@@ -220,6 +233,7 @@ final class SettingsViewTests: XCTestCase { // swiftlint:disable:this type_body_
         // field, but the WhisperKit-specific Model picker must not leak through.
         let settings = makeSettings()
         settings.transcriptionEngine = .parakeet
+        settings.customVocabularyEnabled = true
         let body = try makeTranscription(settings: settings).inspect()
         XCTAssertNoThrow(try body.find(text: "Custom vocabulary file"))
         XCTAssertNoThrow(try body.find(text: "Language"))
@@ -267,17 +281,34 @@ final class SettingsViewTests: XCTestCase { // swiftlint:disable:this type_body_
         settings.diarizerMode = .sortformer
         let body = try makeSpeakers(settings: settings).inspect()
         XCTAssertNoThrow(try body.find(
-            text: "Sortformer supports up to \(DiarizerMode.sortformer.speakerCap) speakers per meeting. Switch to Offline mode for meetings with more participants.",
+            text: SpeakersSettingsView.speakerCapHint(for: .sortformer),
         ))
     }
 
-    func testSortformerWarningHiddenForOfflineMode() throws {
+    /// Pins the caption text: the mic name only labels the mic lines, so it says nothing else.
+    func testMicNameCaptionIsOnlyTheNamePrompt() throws {
+        let body = try makeSpeakers(settings: makeSettings()).inspect()
+        XCTAssertNoThrow(try body.find(text: "Your name for dual-source mode."))
+    }
+
+    func testSpeakerCapHintHiddenForOfflineMode() throws {
         let settings = makeSettings()
         settings.diarize = true
         settings.diarizerMode = .offline
         let body = try makeSpeakers(settings: settings).inspect()
+        // Offline's own hint: the Sortformer text never renders here, guard or not.
         XCTAssertThrowsError(try body.find(
-            text: "Sortformer supports up to \(DiarizerMode.sortformer.speakerCap) speakers per meeting. Switch to Offline mode for meetings with more participants.",
+            text: SpeakersSettingsView.speakerCapHint(for: .offline),
+        ))
+    }
+
+    func testNemotronWarningShownWhenSelected() throws {
+        let settings = makeSettings()
+        settings.diarize = true
+        settings.diarizerMode = .nemotron
+        let body = try makeSpeakers(settings: settings).inspect()
+        XCTAssertNoThrow(try body.find(
+            text: SpeakersSettingsView.speakerCapHint(for: .nemotron),
         ))
     }
 
@@ -286,6 +317,14 @@ final class SettingsViewTests: XCTestCase { // swiftlint:disable:this type_body_
     func testSpeakerCountRangePerMode() {
         XCTAssertEqual(SpeakersSettingsView.speakerCountRange(for: .sortformer), 0 ... 4)
         XCTAssertEqual(SpeakersSettingsView.speakerCountRange(for: .offline), 0 ... 10)
+        XCTAssertEqual(SpeakersSettingsView.speakerCountRange(for: .nemotron), 0 ... 8)
+    }
+
+    func testClampSpeakerCountForNemotron() {
+        XCTAssertEqual(SpeakersSettingsView.clampSpeakerCount(0, for: .nemotron), 0)
+        XCTAssertEqual(SpeakersSettingsView.clampSpeakerCount(6, for: .nemotron), 6)
+        XCTAssertEqual(SpeakersSettingsView.clampSpeakerCount(8, for: .nemotron), 8)
+        XCTAssertEqual(SpeakersSettingsView.clampSpeakerCount(10, for: .nemotron), 8)
     }
 
     func testClampSpeakerCountPerMode() {
@@ -318,9 +357,12 @@ final class SettingsViewTests: XCTestCase { // swiftlint:disable:this type_body_
     // Companion: tapping "Manage…" invokes the factory exactly once.
     func testKnownVoicesMatcherCreatedOnManageTap() throws {
         var matcherInits = 0
+        // A temp DB: the tap really builds the matcher, and a default one opens
+        // (and may migrate) the user's own speakers.json.
+        let dbPath = try makeTempDirectory(prefix: "known-voices").appendingPathComponent("speakers.json")
         let view = makeSpeakers {
             matcherInits += 1
-            return SpeakerMatcher()
+            return SpeakerMatcher(dbPath: dbPath)
         }
         let button = try view.inspect().find(button: "Manage\u{2026}")
         try button.tap()
@@ -382,7 +424,7 @@ final class SettingsViewTests: XCTestCase { // swiftlint:disable:this type_body_
 
     func testProviderPickerExists() throws {
         let body = try makeOutput().inspect()
-        XCTAssertNoThrow(try body.find(text: "LLM Provider"))
+        XCTAssertNoThrow(try body.find(text: "Provider"))
     }
 
     #if !APPSTORE
@@ -400,7 +442,7 @@ final class SettingsViewTests: XCTestCase { // swiftlint:disable:this type_body_
         let body = try makeOutput(settings: settings).inspect()
         XCTAssertNoThrow(try body.find(text: "Endpoint"))
         XCTAssertNoThrow(try body.find(text: "API Key"))
-        XCTAssertNoThrow(try body.find(text: "Fetch Models"))
+        XCTAssertNoThrow(try body.find(viewWithAccessibilityIdentifier: A11yID.openAIRefreshModelsButton))
     }
 
     func testOpenAIModelFieldShown() throws {
@@ -414,9 +456,7 @@ final class SettingsViewTests: XCTestCase { // swiftlint:disable:this type_body_
         let settings = makeSettings()
         settings.protocolProvider = .none
         let body = try makeOutput(settings: settings).inspect()
-        XCTAssertNoThrow(
-            try body.find(text: "No LLM summarization will be generated. Raw transcripts are retained if no protocol is saved."),
-        )
+        XCTAssertNoThrow(try body.find(HelpBadge.self) { try $0.actualView().text == SettingsHelp.noProvider })
     }
 
     func testNoneProviderHidesEndpointField() throws {
@@ -428,7 +468,7 @@ final class SettingsViewTests: XCTestCase { // swiftlint:disable:this type_body_
 
     func testProtocolLanguagePickerExists() throws {
         let body = try makeOutput().inspect()
-        XCTAssertNoThrow(try body.find(text: "Protocol Language"))
+        XCTAssertNoThrow(try body.find(text: "Notes Language"))
     }
 
     func testOutputFolderSectionExists() throws {
@@ -446,29 +486,22 @@ final class SettingsViewTests: XCTestCase { // swiftlint:disable:this type_body_
 
     func testEditPromptButtonExists() throws {
         let body = try makeOutput().inspect()
-        XCTAssertNoThrow(try body.find(button: "Edit Prompt"))
+        XCTAssertNoThrow(try body.find(button: "Edit\u{2026}"))
     }
 
     func testImportPromptButtonExists() throws {
         let body = try makeOutput().inspect()
-        XCTAssertNoThrow(try body.find(button: "Import Prompt"))
+        XCTAssertNoThrow(try body.find(button: "Import Prompt\u{2026}"))
     }
 
     func testResetToDefaultButtonExists() throws {
         let body = try makeOutput().inspect()
-        XCTAssertNoThrow(try body.find(button: "Reset to Default"))
+        XCTAssertNoThrow(try body.find(button: "Reset to Default\u{2026}"))
     }
 
     func testDefaultPromptStatusShown() throws {
         let body = try makeOutput().inspect()
         XCTAssertNoThrow(try body.find(text: "Using default prompt"))
-    }
-
-    func testOpenAIAPIKeyCaptionShown() throws {
-        let settings = makeSettings()
-        settings.protocolProvider = .openAICompatible
-        let body = try makeOutput(settings: settings).inspect()
-        XCTAssertNoThrow(try body.find(text: "Leave empty if your local server doesn't require authentication"))
     }
 
     // MARK: - Advanced tab
@@ -477,7 +510,8 @@ final class SettingsViewTests: XCTestCase { // swiftlint:disable:this type_body_
         let body = try makeAdvanced().inspect()
         XCTAssertNoThrow(try body.find(text: "Screen Recording"))
         XCTAssertNoThrow(try body.find(text: "Microphone"))
-        XCTAssertNoThrow(try body.find(text: "Accessibility"))
+        // The Accessibility row depends on the build variant; see
+        // `AdvancedSettingsAccessibilityRowTests`.
     }
 
     #if !APPSTORE
@@ -527,12 +561,14 @@ final class SettingsViewTests: XCTestCase { // swiftlint:disable:this type_body_
         XCTAssertTrue(section.isDisabled())
     }
 
-    func testRecordOnlyDisablesProtocolSection() throws {
+    func testRecordOnlyDisablesProtocolSections() throws {
         let settings = makeSettings()
         settings.recordOnly = true
+        settings.protocolProvider = .openAICompatible
         let body = try makeOutput(settings: settings).inspect()
-        let section = try body.find(viewWithAccessibilityIdentifier: A11yID.protocolSection)
-        XCTAssertTrue(section.isDisabled())
+        for id in [A11yID.protocolSection, A11yID.protocolProviderSection, A11yID.openAIConnectionSection] {
+            XCTAssertTrue(try body.find(viewWithAccessibilityIdentifier: id).isDisabled(), id)
+        }
     }
 
     func testRecordOnlyDoesNotDisableOutputFolderSection() throws {

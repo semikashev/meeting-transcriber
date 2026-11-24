@@ -185,9 +185,9 @@ private final class CapturingWhisperDecodingClient: WhisperDecodingClient {
         audioPaths _: [String],
         decodeOptions: DecodingOptions,
         callback _: TranscriptionCallback,
-    ) -> [[TranscriptionResult]?] {
+    ) -> [Result<[TranscriptionResult], any Error>] {
         filePrompts.append(PromptObservation(decodeOptions.promptTokens))
-        return [[]]
+        return [.success([])]
     }
 
     func transcribeSamples(
@@ -196,6 +196,12 @@ private final class CapturingWhisperDecodingClient: WhisperDecodingClient {
     ) -> [TranscriptionResult] {
         samplePrompts.append(PromptObservation(decodeOptions.promptTokens))
         return []
+    }
+
+    let isMultilingual = true
+
+    func languageLogProbabilities(samples _: [Float]) -> [String: Float] {
+        [:]
     }
 }
 

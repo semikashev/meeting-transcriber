@@ -9,7 +9,7 @@ import XCTest
 final class GeneralSettingsBrowserTitleTests: XCTestCase {
     private func makeSettings(watchBrowser: Bool) throws -> AppSettings {
         let suiteName = "GeneralSettingsBrowserTitleTests.\(UUID().uuidString)"
-        let suite = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        let suite = try XCTUnwrap(DefaultsSuite.open(suiteName))
         addTeardownBlock { DefaultsSuite.remove(suiteName) }
         let settings = AppSettings(defaults: suite)
         settings.watchBrowserMeetings = watchBrowser

@@ -20,10 +20,13 @@
         }
 
         override func tearDown() async throws {
-            // Listener cancellation is fire-and-forget — give Network.framework
-            // a beat to release the port before the next test binds.
+            // Listener cancellation is fire-and-forget, but no wait is needed
+            // for it: every server here binds port 0 and gets a fresh port from
+            // the OS, and the tests that rebind a specific port take it from a
+            // port-0 server of their own and poll until the rebind serves. A
+            // listener still winding down from the previous test holds only its
+            // own port, which no later test asks for.
             server = nil
-            try await Task.sleep(for: .milliseconds(50))
             try await super.tearDown()
         }
 
@@ -42,7 +45,7 @@
             namingStatus: @escaping (UUID) -> NamingStatusDTO? = { _ in nil },
             confirmNaming: @escaping (UUID, [String: String]) -> Bool = { _, _ in false },
             skipJobNaming: @escaping (UUID) -> Bool = { _ in false },
-            transcribe: @escaping (URL, Double) async -> BlockingTranscribeResult = { _, _ in .noFile },
+            transcribe: @escaping BlockingTranscribe = { _, _, _ in .noFile },
             watchStatus: @escaping () -> WatchStatusDTO = { .notWatching },
             watchControl: @escaping (WatchAction) async -> WatchControlOutcome = { _ in .failed },
             recordStatus: @escaping () -> RecordStatusDTO = { .notRecording },
@@ -121,6 +124,17 @@
             XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 403)
         }
 
+        func testNullOriginReturns403() async throws {
+            // file://, data: and sandboxed-iframe pages send `Origin: null`.
+            let base = try await startServer()
+            var headers = authHeader
+            headers["Origin"] = "null"
+            let (_, response) = try await URLSession.shared.data(
+                for: request("GET", base.appendingPathComponent("healthz"), headers: headers),
+            )
+            XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 403)
+        }
+
         func testStateReturnsValidJSON() async throws {
             let snapshot = RPCStateSnapshot(
                 pipeline: .init(isProcessing: true, activeJobCount: 2, waitingJobCount: 0, pendingNamingJobCount: 1),
@@ -146,9 +160,9 @@
         func testStateExposesPostedNotifications() async throws {
             let manager = NotificationManager()
             let suite = "DebugRPCServerIntegrationTests-\(getpid())-\(UUID().uuidString)"
-            let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+            let defaults = try XCTUnwrap(DefaultsSuite.open(suite))
             defer { DefaultsSuite.remove(suite) }
-            let state = AppState(settings: AppSettings(defaults: defaults), notifier: manager)
+            let state = try AppState(pipelineEnvironment: makeIsolatedPipelineEnvironment(), settings: AppSettings(defaults: defaults), notifier: manager)
             defer { state.liveCaptions.clear() }
             manager.notify(title: "Meeting Detected", body: "Recording: Standup (Teams)")
             manager.notify(title: "Silent Recording", body: "Both channels silent")
@@ -181,7 +195,7 @@
         /// dev bundle's container-plist redirect).
         func testStateExposesEffectiveSettings() async throws {
             let suite = "DebugRPCServerIntegrationTests-\(getpid())-\(UUID().uuidString)"
-            let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+            let defaults = try XCTUnwrap(DefaultsSuite.open(suite))
             defer { DefaultsSuite.remove(suite) }
             let settings = AppSettings(defaults: defaults)
             settings.recordOnly = true
@@ -193,7 +207,7 @@
             // controller and kicks off actual CoreML/VAD model loads (network
             // download on a cold CI runner) in an unawaited background Task.
             settings.vadEnabled = true
-            let state = AppState(settings: settings)
+            let state = try AppState(pipelineEnvironment: makeIsolatedPipelineEnvironment(), settings: settings)
             defer { state.liveCaptions.clear() }
 
             let base = try await startServer(snapshot: state.rpcStateSnapshot())
@@ -613,7 +627,7 @@
             let id = UUID()
             let dto = NamingStatusDTO(
                 jobID: id.uuidString, meetingTitle: "Q3 Sync",
-                speakers: [.init(label: "Speaker 1", suggested: "Roman", speakingSeconds: 42)],
+                speakers: [.init(label: "Speaker 1", suggested: "Speaker A", speakingSeconds: 42)],
                 participants: ["Alice"],
             )
             let lookup: (UUID) -> NamingStatusDTO? = { $0 == id ? dto : nil }
@@ -627,7 +641,7 @@
             XCTAssertEqual(decoded.meetingTitle, "Q3 Sync")
             XCTAssertEqual(decoded.participants, ["Alice"])
             XCTAssertEqual(decoded.speakers.first?.label, "Speaker 1")
-            XCTAssertEqual(decoded.speakers.first?.suggested, "Roman")
+            XCTAssertEqual(decoded.speakers.first?.suggested, "Speaker A")
             XCTAssertEqual(decoded.speakers.first?.speakingSeconds, 42)
         }
 
@@ -655,7 +669,7 @@
             let base = try await startServer(confirmNaming: confirm)
 
             var req = request("POST", base.appendingPathComponent("v1/jobs/\(id.uuidString)/naming"), headers: authHeader)
-            req.httpBody = Data(#"{"mapping":{"Speaker 1":"Roman"}}"#.utf8)
+            req.httpBody = Data(#"{"mapping":{"Speaker 1":"Speaker A"}}"#.utf8)
             let (_, response) = try await URLSession.shared.upload(for: req, from: XCTUnwrap(req.httpBody))
             XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200)
 
@@ -665,7 +679,7 @@
                 if !received.isEmpty { break }
                 try await Task.sleep(for: .milliseconds(25))
             }
-            XCTAssertEqual(received, ["Speaker 1": "Roman"])
+            XCTAssertEqual(received, ["Speaker 1": "Speaker A"])
         }
 
         func testV1ConfirmNamingUnknownReturns404() async throws {
@@ -752,7 +766,9 @@
                 jobID: UUID().uuidString, state: .done, meetingTitle: "M",
                 transcriptPath: "/out/t.txt", protocolPath: nil, error: nil, warnings: [],
             )
-            let transcribe: (URL, Double) async -> BlockingTranscribeResult = { _, _ in await Task.yield(); return .completed(dto) }
+            let transcribe: BlockingTranscribe = { _, _, _ in
+                await Task.yield(); return .completed(dto)
+            }
             let base = try await startServer(transcribe: transcribe)
 
             var req = request("POST", base.appendingPathComponent("v1/transcribe"), headers: authHeader)
@@ -769,7 +785,9 @@
                 jobID: UUID().uuidString, state: .transcribing, meetingTitle: "M",
                 transcriptPath: nil, protocolPath: nil, error: nil, warnings: [],
             )
-            let transcribe: (URL, Double) async -> BlockingTranscribeResult = { _, _ in await Task.yield(); return .timedOut(dto) }
+            let transcribe: BlockingTranscribe = { _, _, _ in
+                await Task.yield(); return .timedOut(dto)
+            }
             let base = try await startServer(transcribe: transcribe)
 
             var req = request("POST", base.appendingPathComponent("v1/transcribe"), headers: authHeader)
@@ -779,7 +797,7 @@
         }
 
         func testV1TranscribeNoFileReturns400() async throws {
-            let transcribe: (URL, Double) async -> BlockingTranscribeResult = { _, _ in await Task.yield(); return .noFile }
+            let transcribe: BlockingTranscribe = { _, _, _ in await Task.yield(); return .noFile }
             let base = try await startServer(transcribe: transcribe)
 
             var req = request("POST", base.appendingPathComponent("v1/transcribe"), headers: authHeader)
@@ -885,7 +903,7 @@
             // Bind the closure to a typed local (not a trailing closure) so its
             // two-arg shape can't be mis-inferred against the sibling 2-arg
             // confirmNaming parameter, and SwiftFormat can't restyle it.
-            let transcribe: (URL, Double) async -> BlockingTranscribeResult = { _, wait in
+            let transcribe: BlockingTranscribe = { _, wait, _ in
                 await recorder.record(wait)
                 return .completed(dto)
             }
@@ -936,10 +954,12 @@
             // transcribe yields a fresh job each call; the repeat path instead
             // resolves the stored id via jobStatus (echoed here), so identical
             // jobIDs prove the second request did not re-run transcribe.
-            let transcribe: (URL, Double) async -> BlockingTranscribeResult = { _, _ in
+            let transcribe: BlockingTranscribe = { _, _, onEnqueued in
+                let id = UUID()
+                onEnqueued(id)
                 await Task.yield()
                 return .completed(JobStatusDTO(
-                    jobID: UUID().uuidString, state: .done, meetingTitle: "M",
+                    jobID: id.uuidString, state: .done, meetingTitle: "M",
                     transcriptPath: "/out/t.txt", protocolPath: nil, error: nil, warnings: [],
                 ))
             }
@@ -966,6 +986,49 @@
             XCTAssertEqual(j1, j2, "repeat returns the same job via the idempotency store, no re-run")
         }
 
+        /// A client whose HTTP timeout is shorter than the wait retries while
+        /// the first request is still waiting on its job. The key must already
+        /// be recorded then, so the retry gets that job's status (202, still
+        /// running) instead of creating a second job for the same file.
+        func testV1TranscribeIdempotencyKeyCoversARetryDuringTheWait() async throws {
+            let jobID = UUID()
+            let gate = MainActorGate()
+            var calls = 0
+            let transcribe: BlockingTranscribe = { _, _, onEnqueued in
+                calls += 1
+                // A second run would mean a second job: answer at once rather
+                // than park the retry behind the first request's wait.
+                guard calls == 1 else { return .noFile }
+                onEnqueued(jobID)
+                await gate.wait()
+                return .completed(Self.jobDTO(jobID, state: .done))
+            }
+            let status: (UUID) -> JobStatusDTO? = { id in Self.jobDTO(id, state: .transcribing) }
+            let base = try await startServer(jobStatus: status, transcribe: transcribe)
+            let url = base.appendingPathComponent("v1/transcribe")
+            let body = Data(#"{"path":"/inbox/a.wav"}"#.utf8)
+            var req = request("POST", url, headers: idempotentHeaders("tx-key-in-flight"))
+            req.httpBody = body
+
+            let first = Task { [req] in try await URLSession.shared.upload(for: req, from: body) }
+            await waitFor(gate.hasWaiter, timeout: .seconds(5))
+            let (d2, r2) = try await URLSession.shared.upload(for: req, from: body)
+            XCTAssertEqual(calls, 1, "the retry must not run a second job")
+            XCTAssertEqual((r2 as? HTTPURLResponse)?.statusCode, 202)
+            XCTAssertEqual(try JSONDecoder().decode(JobStatusDTO.self, from: d2).jobID, jobID.uuidString)
+
+            gate.open()
+            let (_, r1) = try await first.value
+            XCTAssertEqual((r1 as? HTTPURLResponse)?.statusCode, 200)
+        }
+
+        private static func jobDTO(_ id: UUID, state: JobState) -> JobStatusDTO {
+            JobStatusDTO(
+                jobID: id.uuidString, state: state, meetingTitle: "M",
+                transcriptPath: nil, protocolPath: nil, error: nil, warnings: [],
+            )
+        }
+
         // MARK: - POST /v1/transcribe?include=transcript (inline text)
 
         /// Issue #431: a headless remote consumer with no shared filesystem
@@ -982,7 +1045,7 @@
                 jobID: UUID().uuidString, state: .done, meetingTitle: "M",
                 transcriptPath: file.path, protocolPath: nil, error: nil, warnings: [],
             )
-            let transcribe: (URL, Double) async -> BlockingTranscribeResult = { _, _ in
+            let transcribe: BlockingTranscribe = { _, _, _ in
                 await Task.yield(); return .completed(dto)
             }
             let base = try await startServer(transcribe: transcribe)
@@ -1011,7 +1074,7 @@
                 jobID: UUID().uuidString, state: .done, meetingTitle: "M",
                 transcriptPath: file.path, protocolPath: nil, error: nil, warnings: [],
             )
-            let transcribe: (URL, Double) async -> BlockingTranscribeResult = { _, _ in
+            let transcribe: BlockingTranscribe = { _, _, _ in
                 await Task.yield(); return .completed(dto)
             }
             let base = try await startServer(transcribe: transcribe)

@@ -3,11 +3,11 @@ import os.log
 
 private let logger = Logger(subsystem: AppPaths.logSubsystem, category: "PipelineQueue")
 
-/// Snapshot restore and orphaned-recording recovery for `PipelineQueue`, split
-/// out of `PipelineQueue.swift` so the primary class body drops under the
-/// `type_body_length` lint cap. An extension of a globally `@MainActor`-isolated
-/// type inherits that isolation, so the moved methods need no explicit
-/// annotation. Pure move; no behavior change.
+/// Snapshot restore for `PipelineQueue`, split out of `PipelineQueue.swift` so
+/// the primary class body drops under the `type_body_length` lint cap. Orphan
+/// recovery is in `PipelineQueue+OrphanRecovery.swift`. An extension of a
+/// globally `@MainActor`-isolated type inherits that isolation, so the moved
+/// methods need no explicit annotation. Pure move; no behavior change.
 extension PipelineQueue {
     // MARK: - Adopting the jobs of a replaced queue
 
@@ -23,8 +23,9 @@ extension PipelineQueue {
     /// memory, and the caller has already checked that it holds no unfinished
     /// work.
     ///
-    /// Finished jobs are dropped with their sidecars, exactly as the restore
-    /// drops them. Keeping them looked harmless and is not: the reaper that
+    /// Finished jobs are dropped with their sidecars, except failed Notion
+    /// exports whose local protocol is still needed for a manual retry.
+    /// Keeping every finished job looked harmless and is not: the reaper that
     /// removes a `.done` job after `completedJobLifetime` is a task owned by the
     /// queue the job came from, so an adopted job would carry no reaper, sit in
     /// the list and the snapshot indefinitely, keep its 16 kHz sidecars in the
@@ -40,19 +41,27 @@ extension PipelineQueue {
         // adoption itself writes nothing (see below): a job that had just
         // failed stayed on disk as running and ran again on the next launch.
         var adopted = replaced.jobs
+        // An export still running there is not interrupted: it is stopped and
+        // started again below, so a slow Notion never keeps the old queue (and
+        // the settings it captured) alive.
+        let handedOver = replaced.handOverRunningNotionExports()
+        let recoveredNotionExports = recoverInterruptedNotionExports(in: &adopted, keeping: Set(handedOver.keys))
         discardFinishedJobs(from: &adopted)
         discardJobsWithMissingAudio(&adopted, interruptedIn: [:])
-        // Count, not equality: both calls above only ever remove, so a
-        // differing count is exactly "something was dropped". `PipelineJob` is
-        // not `Equatable`, and making it so for one bookkeeping line would put
-        // a conformance on a type with two dozen fields.
-        let changed = adopted.count != replaced.jobs.count
+        // Discards change the count; interrupted-export normalization is
+        // tracked separately, without comparing every field on PipelineJob.
+        let changed = adopted.count != replaced.jobs.count || recoveredNotionExports
         jobs = adopted
+        for job in jobs where job.state == .done && job.hasPendingNotionExport {
+            recordTerminalJob(job)
+        }
         // Only when this queue's list differs from what the replaced one held.
         // Every rebuild comes through here once the controller has built a queue
         // itself, including each watch start, and writing an unchanged (usually
         // empty) list would spend an atomic replace on nothing.
         if changed { saveSnapshot() }
+        // Tasks, so they start after the caller has installed this queue's callbacks.
+        resumeHandedOverNotionExports(handedOver)
     }
 
     /// Drop finished jobs and let their sidecars go with them.
@@ -62,10 +71,26 @@ extension PipelineQueue {
     /// decision, not two. It used to be written out at both call sites, held
     /// together only by a comment saying they had to agree.
     private func discardFinishedJobs(from list: inout [PipelineJob]) {
-        let finished = list.filter { $0.state == .done }
+        let finished = list.filter { $0.state == .done && !$0.isHeldAfterCompletion }
         guard !finished.isEmpty else { return }
-        list.removeAll { $0.state == .done }
+        list.removeAll { $0.state == .done && !$0.isHeldAfterCompletion }
         removeNamingDataOfDiscardedJobs(finished)
+    }
+
+    /// A stopped export is retried manually from its complete local backup.
+    private func recoverInterruptedNotionExports(in list: inout [PipelineJob], keeping running: Set<UUID> = []) -> Bool {
+        var changed = false
+        for index in list.indices
+            where list[index].state == .done && list[index].notionExportStatus == .inProgress
+            && !running.contains(list[index].id) {
+            list[index].finishNotionExport(succeeded: false)
+            Self.noteNotionExportFailure(
+                on: &list[index], reason: Self.notionExportInterruptedReason,
+                backupSaved: list[index].protocolPath != nil,
+            )
+            changed = true
+        }
+        return changed
     }
 
     // MARK: - Snapshot Recovery
@@ -79,8 +104,7 @@ extension PipelineQueue {
             // A state saved but not yet on disk is the newer one: a queue that
             // replaces another restores while that queue's last write may
             // still be in flight, and the file would hand it the state before.
-            guard let decoded = try PipelineSnapshotStore.existing(for: logDir)?.latestSaved
-                ?? PipelineSnapshot.load(from: logDir) else {
+            guard let decoded = try PipelineSnapshotStore.latestJobs(in: logDir) else {
                 logger.info("No pipeline snapshot to restore")
                 return
             }
@@ -95,6 +119,7 @@ extension PipelineQueue {
         let interruptedStates = Dictionary(loaded.map { ($0.id, $0.state) }) { _, last in last }
 
         protocolResumeDispositions = resumeDispositions(for: loaded)
+        _ = recoverInterruptedNotionExports(in: &loaded)
 
         // Reset active states back to waiting
         for i in loaded.indices {
@@ -139,6 +164,9 @@ extension PipelineQueue {
         }
 
         jobs = loaded
+        for job in jobs where job.state == .done && job.hasPendingNotionExport {
+            recordTerminalJob(job)
+        }
 
         // Rebuild the session's naming cache from disk for
         // .speakerNamingPending jobs.
@@ -153,7 +181,9 @@ extension PipelineQueue {
         }
         // Naming data lost — use the normal transition so terminal handling,
         // artifact retention, callbacks, and the durable job record stay in
-        // sync with every other completion path.
+        // sync with every other completion path. It marks no output for
+        // retention: the speakers were never confirmed, so the transcript is
+        // the unconfirmed draft and the audio stays.
         for jobID in missingNamingDataJobIDs {
             updateJobState(id: jobID, to: .done)
         }
@@ -162,12 +192,9 @@ extension PipelineQueue {
         cleanupStalePending()
         logger.info("Restored \(loaded.count) jobs from snapshot")
         triggerProcessing()
-        // Auto-popup the naming dialog if any restored job is still
-        // waiting for confirmation. Same notification as the in-pipeline
-        // pop, so MeetingTranscriberApp brings the window forward.
-        if !pendingSpeakerNamingJobs.isEmpty {
-            NotificationCenter.default.post(name: .showSpeakerNaming, object: nil)
-        }
+        // Restored jobs still waiting for names: the window, or with auto-open
+        // off a notification, since they never make the transition again.
+        announceRestoredSpeakerNaming()
     }
 
     /// What to do with each job that was interrupted mid-run, decided before
@@ -190,7 +217,12 @@ extension PipelineQueue {
                 namingDataOnDisk: namingDataOnDisk,
                 transcriptExists: Self.fileExists(job.transcriptPath),
                 hasNamingSlug: job.namingSlug != nil,
-                protocolExists: Self.fileExists(job.protocolPath),
+                // An older local protocol can still exist during a corrected
+                // speaker-name export. It must not complete an interrupted
+                // export without regenerating from the corrected transcript,
+                // unless this run wrote it before the export began.
+                protocolExists: (!job.hasPendingNotionExport || job.hasInterruptedNotionExportWithBackup)
+                    && Self.fileExists(job.protocolPath),
             )
             if disposition != .fullRun { dispositions[job.id] = disposition }
         }
@@ -227,7 +259,12 @@ extension PipelineQueue {
             // Everything is on disk; a second LLM call would only overwrite an
             // identical file.
             protocolResumeDispositions.removeValue(forKey: job.id)
+            if let index = jobs.firstIndex(where: { $0.id == job.id }), jobs[index].hasInterruptedNotionExportWithBackup {
+                jobs[index].finishNotionExport(succeeded: false)
+                recordNotionExportFailure(jobID: job.id, reason: Self.notionExportInterruptedReason)
+            }
             eventLog.append(jobID: job.id, event: "finished_after_restore", from: .waiting, to: .done)
+            markOutputWritten(jobID: job.id, output: job.protocolPath)
             updateJobState(id: job.id, to: .done)
             return true
         }
@@ -246,11 +283,19 @@ extension PipelineQueue {
             jobID: job.id, event: "resumed_protocol_only",
             from: .waiting, to: .generatingProtocol,
         )
-        await generateProtocol(
-            jobID: job.id, transcript: transcript, title: job.meetingTitle,
-            protocolsDir: transcriptPath.deletingLastPathComponent(),
-        )
-        updateJobState(id: job.id, to: .done)
+        do {
+            try await generateProtocol(
+                jobID: job.id, transcript: transcript, title: job.meetingTitle,
+                protocolsDir: transcriptPath.deletingLastPathComponent(),
+                speakerNames: job.notionExportSpeakerNames ?? [],
+                // It was interrupted generating a protocol, so it owes one.
+                transcriptIsTheOutputWithoutAProvider: false,
+            )
+            updateJobState(id: job.id, to: .done)
+        } catch {
+            // Cancelled with its job: nothing is left to finish, and still
+            // `true`, since a full run of a job that is gone would be worse.
+        }
         return true
     }
 
@@ -270,6 +315,11 @@ extension PipelineQueue {
         _ loaded: inout [PipelineJob], interruptedIn: [UUID: JobState],
     ) {
         let missing = loaded.filter { job in
+            // Export-only retries read the complete Markdown backup, and notes
+            // retries the transcript, not audio.
+            if job.state == .done, job.isHeldAfterCompletion { return false }
+            // A notes retry that was still waiting at the quit, likewise.
+            if job.generatesNotesOnly == true { return false }
             guard let mixPath = job.mixPath else { return false }
             // Exempt, like `.speakerNamingPending`: a job the resume can finish
             // reads its transcript and nothing else, so discarding it for a
@@ -382,6 +432,10 @@ extension PipelineQueue {
     @discardableResult
     func retryJob(id: UUID) -> Bool {
         guard canRetryJob(id: id), let index = jobs.firstIndex(where: { $0.id == id }) else { return false }
+        guard Self.sourceAudioExists(for: jobs[index]) else {
+            noteRetryAudioMissing(at: index)
+            return false
+        }
         naming.removeNamingData(
             jobID: id, slug: jobs[index].namingSlug, in: allSidecarDirs(of: jobs[index]),
         )
@@ -394,8 +448,12 @@ extension PipelineQueue {
         return true
     }
 
-    /// Whether `retryJob` would accept this job now. The menu shows Retry only
-    /// where this holds, so a click is never a silent no-op.
+    /// Whether the menu offers Retry for this job: a hint from the queue's
+    /// state, never a file check. It stands for what the menu shows on every
+    /// render, and the recording can sit on a network or removable volume,
+    /// where a `fileExists` can block the main thread. `retryJob` looks at the
+    /// file itself on every click, and one that finds it gone says so on the
+    /// job. The offer stays, so a volume that comes back is retryable again.
     ///
     /// Decided live, never from the error text. A job refused because another
     /// run held its audio is a duplicate only while that run holds it: once the
@@ -404,115 +462,59 @@ extension PipelineQueue {
     /// finished keeps blocking for as long as it is listed, since retrying then
     /// would write the same meeting a second time.
     ///
-    /// The job's own audio must still be there. That also covers the owner
-    /// that moved it: stage 3 relocates a staged recording into the output
-    /// folder, after which the two jobs name different paths and the hold
-    /// check below cannot match them, but the duplicate's path is empty.
+    /// The job must name an audio file. After the owner moved the recording
+    /// (stage 3 relocates a staged one into the output folder) the duplicate
+    /// still names the staging path, so it is offered, and the click reports the
+    /// file gone.
     func canRetryJob(id: UUID) -> Bool {
-        guard let job = jobs.first(where: { $0.id == id }), job.state == .error else { return false }
-        return Self.sourceAudioExists(for: job) && !audioIsHeldElsewhere(for: job)
+        guard let job = jobs.first(where: { $0.id == id }), job.state == .error,
+              Self.sourceAudio(for: job) != nil else { return false }
+        return !audioIsHeldElsewhere(for: job)
+    }
+
+    private static let retryAudioMissingNote = "The recording is no longer there, so there is nothing to retry."
+
+    /// The retry found nothing to run on. The menu shows an error job's error
+    /// text, so the reason goes there, once; the failure it had stays in front.
+    private func noteRetryAudioMissing(at index: Int) {
+        let failure = jobs[index].error ?? ""
+        guard !failure.hasSuffix(Self.retryAudioMissingNote) else { return }
+        jobs[index].error = failure.isEmpty ? Self.retryAudioMissingNote : "\(failure) \(Self.retryAudioMissingNote)"
+        saveSnapshot()
     }
 
     /// The file a run reads first: the mix, or for a paired import without
     /// one, the app track.
+    private static func sourceAudio(for job: PipelineJob) -> URL? {
+        job.mixPath ?? job.appPath
+    }
+
     private static func sourceAudioExists(for job: PipelineJob) -> Bool {
-        guard let source = job.mixPath ?? job.appPath else { return false }
-        return FileManager.default.fileExists(atPath: source.path)
+        sourceAudio(for: job).map { FileManager.default.fileExists(atPath: $0.path) } ?? false
     }
 
     /// Whether a run is claimed for this job or its mix file on any queue, or
     /// another job in this one that has not failed holds the same mix file.
     /// Paired imports without a mix file are compared by the claim alone.
+    /// A failed holder does not count: it processes nothing any more, and this
+    /// job is the way back to the recording.
     private func audioIsHeldElsewhere(for job: PipelineJob) -> Bool {
-        if inFlightRuns.isInFlight(job) { return true }
-        guard let key = job.mixPath?.standardizedFileURL.path else { return false }
-        return jobs.contains { other in
-            other.id != job.id && other.state != .error
-                && other.mixPath?.standardizedFileURL.path == key
-        }
+        inFlightRuns.isInFlight(job) || otherJobHoldsAudio(of: job, in: \.mixPaths, includingFailed: false)
     }
 
-    // MARK: - Orphaned Recording Recovery
-
-    /// Scan `recordingsDir` for `*_mix.wav` files not tracked by any loaded job.
-    /// Creates recovery jobs for untracked recordings younger than `maxAge`.
-    /// Skips files the pipeline is already finished with, successfully or not
-    /// (tracked in processed_recordings.json).
-    ///
-    /// The directory scan + per-file `attributesOfItem` calls run on a
-    /// detached task — startup callers don't block the UI on a potentially
-    /// slow filesystem (e.g. iCloud-backed recordings dir). Mutations to
-    /// `jobs` and the snapshot still happen on the main actor.
-    func recoverOrphanedRecordings(
-        recordingsDir: URL = AppPaths.recordingsDir,
-        maxAge: TimeInterval = 86400,
-    ) async {
-        // One-time migration: seed processed list with existing recordings
-        // Only for the default recordings directory (not test overrides)
-        if recordingsDir == AppPaths.recordingsDir {
-            await processedLedger.migrate(recordingsDir: recordingsDir)
+    /// Whether a job of this queue other than `job` points at one of `job`'s
+    /// audio files, as `files` names them. `includingFailed` counts a failed
+    /// job too: it keeps its recording for Retry. The one rule behind
+    /// `audioIsHeldElsewhere` (Retry) and the move of a cancelled job's
+    /// recording; each says which files and which holders count.
+    func otherJobHoldsAudio(
+        of job: PipelineJob, in files: KeyPath<PipelineJob, [URL]>, includingFailed: Bool,
+    ) -> Bool {
+        let mine = Set(job[keyPath: files].map(\.standardizedFileURL.path))
+        guard !mine.isEmpty else { return false }
+        return jobs.contains { other in
+            other.id != job.id && (includingFailed || other.state != .error)
+                && other[keyPath: files].contains { mine.contains($0.standardizedFileURL.path) }
         }
-
-        // Both reads happen here, on the main actor, before the detached hop:
-        // the registry is main-actor isolated, and reading it from inside the
-        // detached task would be a different question anyway, asked later.
-        let trackedPaths = Set(jobs.compactMap { $0.mixPath?.standardizedFileURL.path })
-        let runningPaths = inFlightRuns.claimedAudioPaths
-        let ledger = processedLedger
-
-        // Off-main: directory scan + processed-list read + per-file
-        // attributesOfItem probes + filtering all happen here.
-        let candidates: [PairedRecordingResolver.Group] = await Task.detached(priority: .utility) {
-            let fm = FileManager.default
-            guard let entries = try? fm.contentsOfDirectory(
-                at: recordingsDir,
-                includingPropertiesForKeys: [.fileSizeKey, .creationDateKey],
-            ) else { return [] }
-            let processedPaths = ledger.load()
-            let now = Date()
-            return PairedRecordingResolver.resolve(urls: entries).paired.filter { group in
-                // Groups without a real mix file (app+mic-only paired imports)
-                // aren't recoverable from the dir scan alone.
-                guard let mixURL = group.mix else { return false }
-                let stdPath = mixURL.standardizedFileURL.path
-                guard !trackedPaths.contains(stdPath) else { return false }
-                guard !runningPaths.contains(stdPath) else { return false }
-                guard !processedPaths.contains(stdPath) else { return false }
-                let attrs = try? fm.attributesOfItem(atPath: mixURL.path)
-                if let created = attrs?[.creationDate] as? Date,
-                   now.timeIntervalSince(created) > maxAge {
-                    return false
-                }
-                // Header-only WAVs are 44 bytes.
-                if let size = attrs?[.size] as? Int, size <= 44 {
-                    return false
-                }
-                return true
-            }
-        }.value
-
-        // Left in staging for the active queue's next recovery: the one its
-        // build ran, or after a folder-change rebuild (which runs none), the
-        // next watch start or launch. Taking them on here would process each
-        // one on a queue nobody sees, and a second time on the active one.
-        guard !candidates.isEmpty, !isRetired else { return }
-
-        for group in candidates {
-            guard let mixURL = group.mix else { continue }
-            var job = PipelineJob(
-                meetingTitle: "Recovered Recording (\(group.stem))",
-                appName: "Unknown",
-                mixPath: mixURL,
-                appPath: group.app,
-                micPath: group.mic,
-                micDelay: 0,
-            )
-            stampTranscriptOutputOptions(on: &job)
-            jobs.append(job)
-            eventLog.append(jobID: job.id, event: "recovered", from: nil, to: .waiting)
-        }
-        saveSnapshot()
-        logger.info("Recovered \(candidates.count) orphaned recording(s)")
-        triggerProcessing()
     }
 }

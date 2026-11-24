@@ -30,6 +30,7 @@ final class EchoBleedDetectorTests: XCTestCase {
         let result = try XCTUnwrap(EchoBleedDetector.analyse(app: app, mic: mic, sampleRate: rate))
         XCTAssertGreaterThan(result.affectedWindowShare, 0.9, "a pure room copy must light up nearly every window")
         XCTAssertTrue(result.isAffected)
+        XCTAssertEqual(result.routes, [.share, .farEndShare, .lockedLag], "a full copy clears every rule")
     }
 
     func testIndependentTracksAreNotDetected() throws {
@@ -72,6 +73,119 @@ final class EchoBleedDetectorTests: XCTestCase {
         XCTAssertFalse(result.isAffected)
     }
 
+    // MARK: - Bleed the plain share misses
+
+    /// A call where the far end speaks in only a few windows and bleeds in
+    /// every one of them, while the rest is an idle line and a quiet room. A
+    /// window with nothing coming out of the loudspeaker cannot carry bleed,
+    /// so counting it in the denominator dilutes the share below the
+    /// threshold however hard the far end bleeds when it does talk.
+    func testBleedInTheFewWindowsTheFarEndTalksIsDetected() throws {
+        let seconds = 300.0
+        var farEnd = [Float](repeating: 0, count: Int(seconds) * rate)
+        for window in [3, 9, 15, 21] {
+            let start = window * 10 * rate
+            for (i, sample) in speechLike(seconds: 10, seed: UInt64(window)).enumerated() {
+                farEnd[start + i] = sample
+            }
+        }
+        // The idle line's own noise stays on the app track only: crossing the
+        // room at half gain puts it under the room's noise, so the windows
+        // the far end spoke in are the only ones the two tracks share.
+        let line = EchoTestAudio.noise(seconds: seconds, amplitude: 0.002, seed: 31)
+        let room = EchoTestAudio.noise(seconds: seconds, amplitude: 0.002, seed: 32)
+        let app = EchoTestAudio.mix(farEnd, line)
+        let mic = EchoTestAudio.mix(bleed(farEnd, delayMs: 15, gain: 0.5), room)
+
+        let result = try XCTUnwrap(EchoBleedDetector.analyse(app: app, mic: mic, sampleRate: rate))
+        XCTAssertEqual(result.windowsScored, 30, "the idle windows still score, they are not digital zero")
+        XCTAssertEqual(result.windowsAffected, 4, "exactly the windows the far end spoke in")
+        XCTAssertTrue(result.isAffected, "share over all windows was \(result.affectedWindowShare)")
+        XCTAssertEqual(result.routes, [.farEndShare], "only the far-end share sees it")
+    }
+
+    /// Bleed in every window, but under a louder local talker, so only the
+    /// two windows the local side is quiet in clear the per-window threshold.
+    /// What still gives it away is the lag: bleed travels one fixed path, so
+    /// the masked windows keep peaking where the clear ones did.
+    func testMaskedBleedAtAStableLagIsDetected() throws {
+        let (app, mic) = maskedBleed(delayMs: 40)
+        let result = try XCTUnwrap(EchoBleedDetector.analyse(app: app, mic: mic, sampleRate: rate))
+        XCTAssertEqual(result.windowsScored, 20)
+        XCTAssertEqual(result.windowsAffected, 2, "only the unmasked windows are hot")
+        let atPath = result.windowScores.count { abs($0.lagSeconds - 0.04) <= 0.0105 }
+        XCTAssertGreaterThan(atPath, 10, "most windows still peak on the bleed path")
+        XCTAssertTrue(result.isAffected)
+        XCTAssertEqual(result.routes, [.lockedLag], "neither share rule sees it")
+    }
+
+    /// The same masked bleed with its path at the very edge of the search. A
+    /// clean call piles its peaks up at an edge too, wherever the correlation
+    /// is still rising when the search stops, so a lag mode there is not
+    /// evidence of one path.
+    func testALagModeAtTheSearchEdgeIsNotEvidence() throws {
+        let (app, mic) = maskedBleed(delayMs: 300)
+        let result = try XCTUnwrap(EchoBleedDetector.analyse(app: app, mic: mic, sampleRate: rate))
+        XCTAssertEqual(result.windowsAffected, 2)
+        let atEdge = result.windowScores.count { abs($0.lagSeconds - 0.3) <= 0.0105 }
+        XCTAssertGreaterThan(atEdge, 10, "the fixture does lock, just at the edge")
+        XCTAssertFalse(result.isAffected)
+    }
+
+    /// Two windows that happen to correlate on an otherwise clean pair, each at
+    /// its own lag. Two hot windows clear the count floor, but nothing locks.
+    func testTwoCoincidentalHotWindowsAtScatteredLagsStayClean() throws {
+        let app = speechLike(seconds: 300, seed: 41)
+        var mic = speechLike(seconds: 300, seed: 42)
+        // A negative delay is a copy that sits early in the mic file.
+        for (window, delayMs) in [(5, -120.0), (20, 180.0)] {
+            let start = window * 10 * rate
+            let shift = Int(delayMs / 1000 * Double(rate))
+            for i in start ..< (start + 10 * rate) {
+                mic[i] = app[i - shift] * 0.5
+            }
+        }
+        let result = try XCTUnwrap(EchoBleedDetector.analyse(app: app, mic: mic, sampleRate: rate))
+        XCTAssertEqual(result.windowsAffected, 2, "the two planted windows are hot")
+        let hotLags = Set(result.windowScores.filter(\.isHot).map { Int(($0.lagSeconds * 1000).rounded()) })
+        XCTAssertEqual(hotLags, [-120, 180])
+        XCTAssertFalse(result.isAffected)
+    }
+
+    /// The far end talks throughout and bleeds at `delayMs` in every window;
+    /// a louder, independent local talker covers all but the first two.
+    private func maskedBleed(delayMs: Double) -> (app: [Float], mic: [Float]) {
+        let app = speechLike(seconds: 200, seed: 43)
+        let local = speechLike(seconds: 200, seed: 44)
+        var mic = bleed(app, delayMs: delayMs, gain: 0.5)
+        for i in (20 * rate) ..< mic.count {
+            mic[i] += local[i]
+        }
+        return (app, mic)
+    }
+
+    // MARK: - The logged series
+
+    /// A window with a flat envelope scores nothing, but it still took ten
+    /// seconds. The logged series keeps a placeholder at its index, so the
+    /// n-th entry is the n-th ten seconds of the recording; dropping it would
+    /// shift every later window and put a field report's evidence at the
+    /// wrong time.
+    func testTheLoggedSeriesKeepsAnUnscoredWindowInPlace() throws {
+        var app = speechLike(seconds: 40, seed: 51)
+        for i in (10 * rate) ..< (20 * rate) {
+            app[i] = 0
+        }
+        let mic = bleed(app, delayMs: 20, gain: 0.5)
+        let result = try XCTUnwrap(EchoBleedDetector.analyse(app: app, mic: mic, sampleRate: rate))
+        XCTAssertEqual(result.windowsScored, 3)
+
+        let entries = PipelineQueue.windowDetail(result.windows).split(separator: " ")
+        XCTAssertEqual(entries.count, 4, "one entry per ten seconds")
+        XCTAssertEqual(entries[1], "-")
+        XCTAssertTrue(entries[2].hasSuffix("@20"), "the window after the gap stays at its own index: \(entries)")
+    }
+
     // MARK: - No verdict is better than a wrong one
 
     func testSilentAppTrackYieldsNoVerdict() {
@@ -110,9 +224,25 @@ final class EchoBleedDetectorTests: XCTestCase {
     /// Bleed at a delay inside the search window is still bleed.
     func testDelayInsideTheLagWindowIsDetected() throws {
         let app = speechLike(seconds: 60, seed: 21)
-        let mic = bleed(app, delayMs: 150, gain: 0.5) // maxLagSeconds is 0.2
+        let mic = bleed(app, delayMs: 150, gain: 0.5)
         let result = try XCTUnwrap(EchoBleedDetector.analyse(app: app, mic: mic, sampleRate: rate))
         XCTAssertTrue(result.isAffected)
+    }
+
+    /// An external or Bluetooth output adds its own latency to the room path,
+    /// so the microphone copy can arrive well over 200 ms after the point the
+    /// recorder aligned the tracks to. A search that stops at 200 ms finds
+    /// nothing there, and the miss is silent. The fixture sits close to the
+    /// upper edge rather than just past 200 ms: its envelope is smoother than
+    /// speech, so a copy only 50 ms past the old edge still correlated there
+    /// and the test would not have failed without the wider search.
+    func testBleedThroughASlowOutputDeviceIsDetected() throws {
+        let app = speechLike(seconds: 60, seed: 25)
+        let mic = bleed(app, delayMs: 290, gain: 0.5)
+        let result = try XCTUnwrap(EchoBleedDetector.analyse(app: app, mic: mic, sampleRate: rate))
+        XCTAssertTrue(result.isAffected, "share was \(result.affectedWindowShare)")
+        let lags = Set(result.windowScores.map { Int(($0.lagSeconds * 1000).rounded()) })
+        XCTAssertEqual(lags, [290], "every window peaks on the path the copy took")
     }
 
     /// The failure this guards is invisible: a mic that starts late puts real
@@ -137,7 +267,7 @@ final class EchoBleedDetectorTests: XCTestCase {
         let mic = Array(bleed(app, delayMs: 15, gain: 0.5).dropFirst(lateStart))
 
         let blind = try XCTUnwrap(EchoBleedDetector.analyse(app: app, mic: mic, sampleRate: rate))
-        XCTAssertFalse(blind.isAffected, "500 ms is outside the +/-200 ms window, so nothing is found")
+        XCTAssertFalse(blind.isAffected, "500 ms early is outside the 200 ms the search reaches early, so nothing is found")
 
         let informed = try XCTUnwrap(EchoBleedDetector.analyse(
             app: app, mic: mic, sampleRate: rate, micDelay: 0.5,

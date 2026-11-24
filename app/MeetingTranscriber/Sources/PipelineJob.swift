@@ -1,3 +1,4 @@
+import AudioTapLib
 import Foundation
 
 enum JobState: String, Codable {
@@ -22,12 +23,19 @@ enum JobState: String, Codable {
         case .waiting: "Waiting..."
         case .transcribing: "Transcribing..."
         case .diarizing: "Diarizing..."
-        case .generatingProtocol: "Generating Protocol..."
+        case .generatingProtocol: "Generating Meeting Notes..."
         case .speakerNamingPending: "Name Speakers..."
         case .done: "Done"
         case .error: "Error"
         }
     }
+}
+
+/// Page creation alone does not mean that all protocol blocks were exported.
+enum NotionExportStatus: String, Codable {
+    case inProgress = "in_progress"
+    case failed
+    case completed
 }
 
 /// Where a job's audio sits once stage 3 has handed it to the output folder:
@@ -71,6 +79,9 @@ struct PipelineJob: Identifiable, Codable {
     private(set) var appPath: URL?
     private(set) var micPath: URL?
     let micDelay: TimeInterval
+    /// The stretches of the mic track the user muted, in seconds of that track.
+    /// Optional because a snapshot from before this field must still decode.
+    private(set) var micMuteIntervals: [MicMuteInterval]? // swiftlint:disable:this discouraged_optional_collection
     let participants: [String]
     /// Addresses of the calendar event's attendees, for the protocol webhook.
     /// Optional so snapshots saved before the field existed still decode; nil
@@ -96,10 +107,89 @@ struct PipelineJob: Identifiable, Codable {
     /// move had just emptied, so the snapshot restore discarded it although the
     /// audio was sitting in the output folder, and the ledger recorded a path
     /// that no longer existed.
+    /// The mix file, the one a duplicate run would read first, as a list.
+    var mixPaths: [URL] {
+        [mixPath].compactMap(\.self)
+    }
+
+    /// Every audio file the job references.
+    var audioPaths: [URL] {
+        [mixPath, appPath, micPath].compactMap(\.self)
+    }
+
     mutating func recordRelocatedAudio(_ paths: RelocatedAudioPaths) {
         mixPath = paths.mix
         appPath = paths.app
         micPath = paths.mic
+    }
+
+    /// The single writer for the Notion page fields. Called as soon as the page
+    /// exists, before its blocks are appended, so a failed append can be
+    /// finished by the next retry rather than becoming a second page.
+    mutating func recordNotionPage(_ page: NotionPageResult, databaseID: String) {
+        notionPageID = page.pageID
+        if let url = page.url.flatMap(Self.trustedNotionURL) {
+            notionPageURL = url
+        }
+        notionDatabaseID = databaseID
+    }
+
+    /// This URL is later handed to `NSWorkspace.open`, so only a Notion https page qualifies.
+    static func trustedNotionURL(_ string: String) -> URL? {
+        guard let url = URL(string: string), url.scheme?.lowercased() == "https",
+              let host = url.host?.lowercased() else { return nil }
+        let isNotion = ["notion.com", "notion.so", "notion.site"].contains { host == $0 || host.hasSuffix(".\($0)") }
+        return isNotion ? url : nil
+    }
+
+    mutating func beginNotionExport(speakerNames: [String], localBackupSaved: Bool = false) {
+        notionExportStatus = .inProgress
+        notionExportSpeakerNames = speakerNames
+        notionExportBackupSaved = localBackupSaved ? true : nil
+    }
+
+    mutating func finishNotionExport(succeeded: Bool) {
+        notionExportStatus = succeeded ? .completed : .failed
+        notionExportBackupSaved = nil
+    }
+
+    /// The export stopped with this run's Markdown already on disk, so a restore
+    /// can offer the retry instead of generating the protocol again.
+    var hasInterruptedNotionExportWithBackup: Bool {
+        notionExportStatus == .inProgress && notionExportBackupSaved == true
+    }
+
+    var hasCompletedNotionExport: Bool {
+        notionExportStatus == .completed
+    }
+
+    /// Whether the protocol exists somewhere: on disk or as a Notion page.
+    var hasSavedProtocol: Bool {
+        protocolPath != nil || hasCompletedNotionExport
+    }
+
+    /// Whether a failed export has a Markdown backup recorded to retry from.
+    /// State only, never the file system, so a view body can ask it; a file
+    /// removed behind the app's back is found, and reported, by the retry.
+    var hasRetryableNotionBackup: Bool {
+        state == .done && notionExportStatus == .failed && protocolPath != nil
+    }
+
+    var hasPendingNotionExport: Bool {
+        notionExportStatus == .inProgress || notionExportStatus == .failed
+    }
+
+    /// A finished meeting whose notes failed, with a transcript recorded to
+    /// make them from. State only, never the file system, so a view body can
+    /// ask it; the retry checks the transcript itself.
+    var hasRetryableMeetingNotes: Bool {
+        state == .done && notesFailure != nil && transcriptPath != nil
+    }
+
+    /// A finished job that stays listed, and in the snapshot, until the user
+    /// acts on it: an export to retry or discard, or notes to retry or dismiss.
+    var isHeldAfterCompletion: Bool {
+        hasPendingNotionExport || hasRetryableMeetingNotes
     }
 
     var artifactStartTime: Date {
@@ -127,6 +217,42 @@ struct PipelineJob: Identifiable, Codable {
     var echo: EchoDetectionDTO?
     var transcriptPath: URL?
     var protocolPath: URL?
+    /// Why the meeting notes could not be generated, when they could not. Nil
+    /// when they were generated, were not asked for, or for snapshots written
+    /// before this field existed.
+    var notesFailure: MeetingNotesFailure?
+    // A job whose meeting notes are made from its transcript, and only those
+    // (a notes retry, or Generate Meeting Notes from Transcript): `runPipeline`
+    // sends it to `generateNotesOnly`. On the job rather
+    // than in the queue's memory, so a retry still waiting at a quit does not
+    // become a full run after the relaunch. Optional like `autoSkipNaming`.
+    // swiftlint:disable:next discouraged_optional_boolean
+    var generatesNotesOnly: Bool?
+    /// The speaker names the failed notes were to be tagged with, for the
+    /// retry's Notion export. Nil when the notes did not fail.
+    var notesSpeakerNames: [String]? // swiftlint:disable:this discouraged_optional_collection
+    /// The name notes from a picked transcript are saved under: the file's own.
+    /// Kept apart from `namingSlug`, which names the speaker-naming sidecars
+    /// and is what removing a job deletes by, so a picked transcript that
+    /// shares a waiting meeting's name cannot take that meeting's data along.
+    var notesBasename: String?
+    /// The Notion page this job created, kept so a retry updates that page
+    /// instead of creating a duplicate. Optional so snapshots written before
+    /// this field existed still decode.
+    private(set) var notionPageID: String?
+    private(set) var notionPageURL: URL?
+    /// The database the page belongs to. A retry against a different database
+    /// must not update a page in the old one.
+    private(set) var notionDatabaseID: String?
+    /// Optional for compatibility with snapshots written before export status
+    /// was tracked independently from the page ID and URL.
+    private(set) var notionExportStatus: NotionExportStatus?
+    /// Structured names retained for export-only retries; never reparse the
+    /// rendered transcript to recover tags.
+    private(set) var notionExportSpeakerNames: [String]? // swiftlint:disable:this discouraged_optional_collection
+    /// Only set while an export is running. An older protocol on disk during a
+    /// re-export must not pass for this run's output.
+    private(set) var notionExportBackupSaved: Bool? // swiftlint:disable:this discouraged_optional_boolean
     var namingSlug: String?
     // Output policy captured when this job enters the queue. Optional so
     // snapshots saved before transcript-output options existed still decode.
@@ -279,6 +405,7 @@ struct PipelineJob: Identifiable, Codable {
         appPath: URL?,
         micPath: URL?,
         micDelay: TimeInterval,
+        micMuteIntervals: [MicMuteInterval] = [],
         participants: [String] = [],
         // swiftlint:disable:next discouraged_optional_collection
         participantEmails: [String]? = nil,
@@ -298,6 +425,7 @@ struct PipelineJob: Identifiable, Codable {
         self.appPath = appPath
         self.micPath = micPath
         self.micDelay = micDelay
+        self.micMuteIntervals = micMuteIntervals.sanitized
         self.participants = participants
         self.participantEmails = participantEmails
         self.enqueuedAt = Date()
@@ -314,6 +442,12 @@ struct PipelineJob: Identifiable, Codable {
         self.useAITitleForFilenames = useAITitleForFilenames
         self.usedDiarizerMode = nil
         self.autoSkipNaming = autoSkipNaming
+    }
+
+    /// The muted stretches as the transcript times them: `mergeDualSourceSegments`
+    /// moves everything from the mic track by `micDelay`.
+    var micMuteSpansOnTranscript: [MicMuteInterval] {
+        (micMuteIntervals ?? []).shifted(by: micDelay)
     }
 
     /// When the stale-naming cleanup starts counting for this job: when it

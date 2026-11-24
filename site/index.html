@@ -36,7 +36,26 @@
 
   <p>I record a lot of work calls, and I never liked that the tools for it (Otter, Fireflies, Granola and the rest) upload the audio to someone else's servers. For me that is a non-starter. So I built one that runs entirely on the Mac, and kept going with it. It is free and the source is on GitHub.</p>
 
-  <img class="shot" src="assets/hero.gif" alt="Meeting Transcriber running in the macOS menu bar: detecting a call, recording, transcribing and writing a summary.">
+  <video class="shot" width="1920" height="1080" autoplay muted loop playsinline poster="assets/hero-poster.jpg" aria-label="Meeting Transcriber running in the macOS menu bar: detecting a call, recording, transcribing and writing a summary.">
+    <source src="assets/hero.mp4" type="video/mp4">
+    <a href="assets/hero.mp4">Watch the demo video</a>
+  </video>
+  <script>
+    // The demo loops for 14 s, so give visitors a way to stop it: no autoplay with
+    // reduced motion, and visible controls when the browser blocks autoplay.
+    (function () {
+      var v = document.querySelector('video.shot');
+      var showControls = function () { v.setAttribute('controls', ''); };
+      if (window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches) {
+        v.removeAttribute('autoplay');
+        v.pause();
+        showControls();
+      } else {
+        var p = v.play();
+        if (p && p.catch) p.catch(showControls);
+      }
+    })();
+  </script>
 
   <h2>What it does</h2>
   <p>It sits in the menu bar. When it notices a Teams, Zoom or Webex window it starts recording, and when the call ends it transcribes the audio, separates the speakers, and writes a Markdown summary with the decisions and action items. None of the audio leaves your machine.</p>
@@ -86,7 +105,7 @@ brew install --cask meeting-transcriber</code></pre>
   <p class="note">Requires macOS 14.2 or later on Apple Silicon (M1 or newer). The transcription runs on the Neural Engine, which Intel Macs do not have.</p>
 
   <h2>Privacy</h2>
-  <p>There is no account, no analytics, and no server behind this, because there is no server. Audio, transcripts and summaries stay on your Mac. The only network traffic is the model download on first run, an optional check for updates against GitHub, and the summary step if you deliberately point it at a cloud model instead of a local one. The full version is on the <a href="privacy.html">privacy page</a>.</p>
+  <p>There is no account, no analytics, and no server behind this, because there is no server. Audio stays on your Mac. Transcripts and summaries stay there too, unless the summary step uses a cloud model (in the Homebrew version the default is your own Claude Code CLI) or you turn on the Notion export. Apart from that, the only network traffic is downloading each speech model the first time it is needed and a daily check for updates against GitHub, which you can turn off. The full version is on the <a href="privacy.html">privacy page</a>.</p>
 
   <h2>Honest about the rough edges</h2>
   <ul class="caveats">

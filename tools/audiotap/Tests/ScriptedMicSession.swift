@@ -6,6 +6,7 @@ import XCTest
 /// test: it can throw on start, wedge inside the call that brings the engine
 /// up, and deliver buffers only when told.
 final class ScriptedMicSession: MicEngineSessionProviding, @unchecked Sendable {
+    let followsSystemDefaultInput = false
     // swiftlint:disable:next force_unwrapping
     let format = AVAudioFormat(standardFormatWithSampleRate: 48000, channels: 1)!
     private let object = NSObject()
@@ -23,6 +24,9 @@ final class ScriptedMicSession: MicEngineSessionProviding, @unchecked Sendable {
     /// object, which it does right after adopting this session and before it
     /// judges the epoch that adoption ended.
     var deliverOnObserverInstall = false
+    /// What a configuration change finds when it asks the engine. Nil by
+    /// default, which restarts on every change.
+    var configurationReading: MicConfigurationChangeReading?
 
     let entered = XCTestExpectation(description: "attempt entered the wedging call")
     private let wedge = DispatchSemaphore(value: 0)
@@ -59,6 +63,10 @@ final class ScriptedMicSession: MicEngineSessionProviding, @unchecked Sendable {
     }
 
     func start() {}
+
+    func configurationChangeReading() -> MicConfigurationChangeReading? {
+        configurationReading
+    }
 
     func teardown() {
         engineMutex.lock()

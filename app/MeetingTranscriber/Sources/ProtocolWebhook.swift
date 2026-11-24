@@ -70,6 +70,10 @@ enum ProtocolWebhook {
         var participantEmails: [String] = []
     }
 
+    /// Hands one saved protocol on. The last argument takes a content-free
+    /// warning for the job when the delivery did not succeed.
+    typealias Delivery = @MainActor (JobInfo, URL, @escaping @MainActor (String) -> Void) -> Void
+
     static func configuredURL(read: (String) -> String? = KeychainHelper.read(key:)) -> URL? {
         guard let raw = read(keychainKey)?.trimmingCharacters(in: .whitespacesAndNewlines),
               let url = URL(string: raw),

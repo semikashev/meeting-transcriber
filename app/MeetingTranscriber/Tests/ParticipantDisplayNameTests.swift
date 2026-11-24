@@ -53,7 +53,7 @@ final class ParticipantDisplayNameTests: XCTestCase {
 
     private func scratchDefaults() throws -> UserDefaults {
         let name = "ParticipantDisplayNameTests-\(UUID().uuidString)"
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: name))
+        let defaults = try XCTUnwrap(DefaultsSuite.open(name))
         addTeardownBlock { DefaultsSuite.remove(name) }
         return defaults
     }

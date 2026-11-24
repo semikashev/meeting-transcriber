@@ -17,7 +17,7 @@
         override func setUp() async throws {
             try await super.setUp()
             testSuiteName = "RPCEngineStateTests-\(getpid())-\(UUID().uuidString)"
-            guard let suite = UserDefaults(suiteName: testSuiteName) else {
+            guard let suite = DefaultsSuite.open(testSuiteName) else {
                 XCTFail("Could not create test UserDefaults suite")
                 return
             }
@@ -40,9 +40,9 @@
         // What's verified here: the snapshot mirrors whatever the live engines
         // currently expose.
 
-        func test_snapshot_reflectsActiveEngine_whisperKit() {
+        func test_snapshot_reflectsActiveEngine_whisperKit() throws {
             settings.transcriptionEngine = .whisperKit
-            let state = AppState(settings: settings)
+            let state = try AppState(pipelineEnvironment: makeIsolatedPipelineEnvironment(), settings: settings)
             state.engines.whisperKit.modelVariant = "openai_whisper-large-v3-v20240930_turbo"
             state.engines.whisperKit.language = "de"
 
@@ -56,9 +56,9 @@
             )
         }
 
-        func test_snapshot_reflectsActiveEngine_parakeet() {
+        func test_snapshot_reflectsActiveEngine_parakeet() throws {
             settings.transcriptionEngine = .parakeet
-            let state = AppState(settings: settings)
+            let state = try AppState(pipelineEnvironment: makeIsolatedPipelineEnvironment(), settings: settings)
             state.engines.parakeetEngine.customVocabularyPath = "/tmp/parakeet-vocab.txt"
 
             let snapshot = state.rpcStateSnapshot()
@@ -69,8 +69,8 @@
             )
         }
 
-        func test_snapshot_exposesEngineModelStates() {
-            let state = AppState(settings: settings)
+        func test_snapshot_exposesEngineModelStates() throws {
+            let state = try AppState(pipelineEnvironment: makeIsolatedPipelineEnvironment(), settings: settings)
 
             let snapshot = state.rpcStateSnapshot()
 
@@ -92,8 +92,8 @@
             XCTAssertEqual(String(describing: EngineModelState.unloaded).lowercased(), "unloaded")
         }
 
-        func test_snapshot_whisperLanguageNil_surfacesAsNil() {
-            let state = AppState(settings: settings)
+        func test_snapshot_whisperLanguageNil_surfacesAsNil() throws {
+            let state = try AppState(pipelineEnvironment: makeIsolatedPipelineEnvironment(), settings: settings)
             state.engines.whisperKit.language = nil
 
             let snapshot = state.rpcStateSnapshot()
@@ -108,9 +108,10 @@
         /// End-to-end smoketest: the snapshot is the supported way to observe
         /// runtime settings → engine propagation from outside the process.
         /// Same flow `mt-cli state | jq .engines` exercises against the live app.
-        func test_snapshot_reflectsRuntimeSettingChange() async {
+        func test_snapshot_reflectsRuntimeSettingChange() async throws {
             settings.transcriptionEngine = .parakeet
-            let state = AppState(settings: settings)
+            settings.customVocabularyEnabled = true
+            let state = try AppState(pipelineEnvironment: makeIsolatedPipelineEnvironment(), settings: settings)
 
             XCTAssertEqual(
                 state.rpcStateSnapshot().engines.parakeet.customVocabularyPath, "",
@@ -130,8 +131,8 @@
 
         // MARK: - Watch state
 
-        func test_snapshot_exposesWatchState() {
-            let state = AppState(settings: settings)
+        func test_snapshot_exposesWatchState() throws {
+            let state = try AppState(pipelineEnvironment: makeIsolatedPipelineEnvironment(), settings: settings)
             // No watch loop yet → nil (encodes as absent in JSON).
             XCTAssertNil(state.rpcStateSnapshot().watchState)
 
@@ -149,7 +150,7 @@
 
         func test_snapshot_jsonContainsEnginesBlock() throws {
             settings.transcriptionEngine = .whisperKit
-            let state = AppState(settings: settings)
+            let state = try AppState(pipelineEnvironment: makeIsolatedPipelineEnvironment(), settings: settings)
 
             let json = try state.rpcStateSnapshot().jsonData()
             let s = try XCTUnwrap(String(data: json, encoding: .utf8))
@@ -162,13 +163,13 @@
 
         // MARK: - LastJob
 
-        func test_snapshot_lastJob_isNilWhenQueueEmpty() {
-            let state = AppState(settings: settings)
+        func test_snapshot_lastJob_isNilWhenQueueEmpty() throws {
+            let state = try AppState(pipelineEnvironment: makeIsolatedPipelineEnvironment(), settings: settings)
             XCTAssertNil(state.rpcStateSnapshot().lastJob)
         }
 
-        func test_snapshot_lastJob_skipsWaitingAndInFlightJobs() {
-            let state = AppState(settings: settings)
+        func test_snapshot_lastJob_skipsWaitingAndInFlightJobs() throws {
+            let state = try AppState(pipelineEnvironment: makeIsolatedPipelineEnvironment(), settings: settings)
             let waiting = makeJob(title: "in-flight")
             state.pipeline.queue.insertJobForTesting(waiting)
             // .waiting is the default state on init; not finished yet.
@@ -176,7 +177,7 @@
         }
 
         func test_snapshot_lastJob_returnsMostRecentFinishedJob() throws {
-            let state = AppState(settings: settings)
+            let state = try AppState(pipelineEnvironment: makeIsolatedPipelineEnvironment(), settings: settings)
             var done = makeJob(title: "earlier-done")
             done.state = .done
             done.transcriptPath = URL(fileURLWithPath: "/tmp/transcript-earlier.md")
@@ -201,7 +202,7 @@
         }
 
         func test_snapshot_lastJob_jsonRoundtripsAllFields() throws {
-            let state = AppState(settings: settings)
+            let state = try AppState(pipelineEnvironment: makeIsolatedPipelineEnvironment(), settings: settings)
             var done = makeJob(title: "Acme · Standup", participants: ["Alice", "Bob"])
             done.state = .done
             done.transcriptPath = URL(fileURLWithPath: "/tmp/transcript.md")

@@ -17,44 +17,79 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/bundle-ids.sh"
 # shellcheck source=signing.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/signing.sh"
 
-# Graceful AppleScript quit → SIGTERM → SIGKILL ladder. Returns 0 when
-# the process is gone, 1 if it survived even SIGKILL (unusual; means
-# the process is wedged in a kernel call). The bundle id can be
+# Graceful AppleScript quit → SIGTERM → SIGKILL ladder. Returns 0 when the app
+# is gone, 2 when it is gone but the AppleScript quit was refused for want of
+# the Automation grant (see below), 1 if it survived even SIGKILL (unusual;
+# means the process is wedged in a kernel call). The bundle id can be
 # overridden for the rare case a forked dev variant uses a different one.
 #
-# Timing budget: up to ~3 s for graceful AppleScript quit, then ~3 s
-# for SIGTERM grace, then SIGKILL with a 1 s reap window. Total worst
-# case ~7 s. The pre-extraction inline ladders ran with shorter
-# windows (3 s or 5 s total); the merged version is strictly more
-# graceful and never sends SIGTERM/SIGKILL when the process has
-# already exited.
+# The AppleScript quit is what runs the app's applicationShouldTerminate, and
+# with it the quit hold that stops a recording and flushes the pipeline
+# snapshots (TerminationFlush in the app: recordingBudget 5 s, then flushBudget
+# 2 s, then a second flushBudget 2 s, so up to E2E_APP_QUIT_HOLD_S = 9 s; the
+# app has no SIGTERM handler, so a signal skips all of it). The waits are sized
+# from that hold, with margin: the Apple Event gets twice the hold to be
+# answered, and the process twice the hold to be gone after it.
+#
+# The Apple Event needs the Automation grant for this job's process to control
+# the dev app, and a pending consent prompt for it blocks rather than fails, so
+# it runs under run_bounded. What the answer means:
+#   - Answered: the hold runs; wait for the process.
+#   - Refused (-1743): the grant is missing for certain and the hold never ran.
+#     An ::error naming the grant, the signal ladder so the next lane does not
+#     inherit the app, and status 2, so a lane does not carry on as if the app
+#     had quit.
+#   - No answer (-1712, or the bound): a pending prompt, or an app that got the
+#     event and is in a modal or nested run loop, or a teardown past its hold.
+#     Nothing here tells those apart, so it is no verdict on the grant: wait
+#     the same as after an answer; if the app is still there, a ::warning
+#     naming all of them, then the signal ladder, and the old outcome (0).
+#   - Any other error (-600 not running, -128 cancelled, ...): not a grant
+#     question; the short wait the ladder always had, then signals.
+#
+# Worst case, the unanswered path, as the reaper's grace has to cover it:
+# run_bounded for 2 x hold + 5 = 23 s overshoots by at most its whole-second
+# wall-clock cap, 25 s; the exit wait of 2 x hold polls whole seconds, 19 s;
+# the TERM and KILL waits 4 s each: about 52 s.
+: "${E2E_APP_QUIT_HOLD_S:=9}"
+_app_gone() { ! pgrep -f "$1" >/dev/null; }
 quit_running_app() {
     local bundle_id="${1:-$DEV_BUNDLE_ID}"
     # Default pattern matches the dev bundle. Release-bundle callers
     # (e.g. test_rpc.sh against the homebrew-cask binary) override by
     # passing a second arg.
     local pattern="${2:-MeetingTranscriber-Dev.app/Contents/MacOS/MeetingTranscriber}"
-    if ! pgrep -f "$pattern" >/dev/null; then
+    local hold="$E2E_APP_QUIT_HOLD_S" out status=0 verdict gone_status=0 wait_s
+    _app_gone "$pattern" && return 0
+    out="$(run_bounded $(( hold * 2 + 5 )) osascript \
+        -e "with timeout of $(( hold * 2 )) seconds" \
+        -e "tell application id \"$bundle_id\" to quit" \
+        -e 'end timeout' 2>&1)" || status=$?
+    verdict="$(tcc_probe_verdict "$status" "$out")"
+    case "$verdict" in
+        granted|blocked) wait_s=$(( hold * 2 )) ;;
+        denied) wait_s=0 ;;
+        *) wait_s=3 ;;
+    esac
+    if [ "$wait_s" -gt 0 ] && poll_until "$wait_s" 0.2 _app_gone "$pattern"; then
         return 0
     fi
-    osascript -e "tell application id \"$bundle_id\" to quit" 2>/dev/null || true
-    for _ in 1 2 3; do
-        pgrep -f "$pattern" >/dev/null || return 0
-        sleep 1
-    done
+    case "$verdict" in
+        denied)
+            gone_status=2
+            echo "::error title=TCC Automation → MeetingTranscriber-Dev not usable::the AppleScript quit was refused (${out:-exit $status}), so the app's quit hold (stopping a recording, flushing the pipeline snapshots) did not run; ending it by signal instead. Fix: $(tcc_fix_hint 'Automation → MeetingTranscriber-Dev')" >&2
+            ;;
+        blocked)
+            echo "::warning title=dev app did not quit::the AppleScript quit got no answer (${out:-exit $status}) and the app was still running $(( hold * 2 )) s later; ending it by signal, without its quit hold. Possible causes: a pending Automation → MeetingTranscriber-Dev prompt on the runner's screen ($(tcc_fix_hint 'Automation → MeetingTranscriber-Dev')), a modal or nested run loop in the app, or a teardown past its quit budget." >&2
+            ;;
+    esac
     pkill -f "$pattern" 2>/dev/null || true
-    for _ in 1 2 3; do
-        pgrep -f "$pattern" >/dev/null || return 0
-        sleep 1
-    done
+    poll_until 3 0.2 _app_gone "$pattern" && return "$gone_status"
     pkill -KILL -f "$pattern" 2>/dev/null || true
-    # Mirror the post-TERM ladder for the post-KILL reap. A process
+    # Mirror the post-TERM wait for the post-KILL reap. A process
     # wedged in a kernel call can take longer than one `sleep 1` to
     # be reaped — a single check would false-negative.
-    for _ in 1 2 3; do
-        pgrep -f "$pattern" >/dev/null || return 0
-        sleep 1
-    done
+    poll_until 3 0.2 _app_gone "$pattern" && return "$gone_status"
     echo "ERROR: could not stop running MeetingTranscriber — kill it manually and retry" >&2
     return 1
 }
@@ -115,15 +150,656 @@ die() {
     exit 1
 }
 
+# host_skip <lane> <summary> — the lane could not run its assertion for a host
+# condition only a person can fix; only a cause that is certainly the host's
+# may come here. Returns 0 (the lane passes); in CI it also annotates, writes
+# the step summary and lists the lane for fail_on_host_skips. Rationale: the
+# e2e-architecture skill, runner setup step 6.
+host_skip() {
+    local lane="$1" summary="$2"
+    echo "[$lane]: SKIP — $summary"
+    [ "${GITHUB_ACTIONS:-}" = "true" ] || return 0
+    echo "::warning title=$lane lane skipped::$summary"
+    # A lost entry in the skip list is reported, since the gate reads nothing
+    # else; a lost summary line is not.
+    step_summary "$(printf '### %s lane skipped\n\n%s' "$lane" "$summary")"
+    if [ -n "${RUNNER_TEMP:-}" ] && ! echo "$lane" 2>/dev/null >>"$RUNNER_TEMP/e2e-host-skips"; then
+        echo "::error title=$lane skip not recorded::could not write $RUNNER_TEMP/e2e-host-skips, so the scheduled-run gate will not see this skip"
+    fi
+    return 0
+}
+
+# step_summary <markdown> — append a paragraph to the job's step summary.
+# Guarded: GITHUB_ACTIONS alone (exported by hand, or under act) does not
+# promise $GITHUB_STEP_SUMMARY, and `set -u` would turn a report into a
+# failure; a write that fails must not change any outcome either.
+step_summary() {
+    [ -z "${GITHUB_STEP_SUMMARY:-}" ] || printf '%s\n\n' "$1" 2>/dev/null >>"$GITHUB_STEP_SUMMARY" || true
+}
+
+# fail_on_host_skips — the body of e2e-app.yml's last step on scheduled and
+# dispatched runs: exit 1, with an error per lane, when any lane of this job
+# called host_skip.
+fail_on_host_skips() {
+    local skips="${RUNNER_TEMP:-}/e2e-host-skips" lane
+    [ -s "$skips" ] || return 0
+    while read -r lane; do
+        echo "::error title=$lane lane skipped::a host condition kept this lane from running its assertion (see the lane's warning above and the e2e-architecture skill)"
+    done <"$skips"
+    return 1
+}
+
+# --- a screen-locked console session -----------------------------------------
+#
+# With the runner's console session screen-locked, the WindowServer delivers
+# nothing a lane drives from outside the app: a posted Escape does not dismiss
+# the naming window, another process finds none of the app's AX windows, and
+# screencapture writes no image. Measured on the runner: all three failed
+# while the TCC preflight read every grant as given, and each failure message
+# pointed at a product bug or at the wrong grant. So the lanes that need it ask
+# first, after their grant checks (a missing grant stays reported as one).
+
+# _console_lock_from_ioreg <uid> — read `ioreg -n Root -d1 -a` (a plist) on
+# stdin and print `locked`, `unlocked`, or `unknown: <why>`.
+#
+# The entry that counts is the IOConsoleUsers session of <uid> that is on the
+# console: the lanes' app runs in this user's session, and only the session in
+# front gets the WindowServer's events. Another user's lock says nothing about
+# ours, and our session not being in front (Fast User Switching, nobody signed
+# in) is a different fault with its own message (assert_console_user), so both
+# read as unknown here. CGSSessionScreenIsLocked is absent on an unlocked
+# session, so absent and false both mean unlocked. plutil's raw extraction
+# reads single values, which no data or date value elsewhere in the tree can
+# break, unlike a conversion of the whole tree to JSON.
+_console_lock_from_ioreg() {
+    local uid="$1" plist count i found="" locked
+    plist="$(cat)"
+    count="$(plutil -extract IOConsoleUsers raw -o - - <<<"$plist" 2>/dev/null)" || count=""
+    case "$count" in
+        ''|*[!0-9]*) echo "unknown: no IOConsoleUsers array in the ioreg output"; return 0 ;;
+    esac
+    for (( i = 0; i < count; i++ )); do
+        [ "$(plutil -extract "IOConsoleUsers.$i.kCGSSessionUserIDKey" raw -o - - <<<"$plist" 2>/dev/null)" = "$uid" ] || continue
+        [ "$(plutil -extract "IOConsoleUsers.$i.kCGSSessionOnConsoleKey" raw -o - - <<<"$plist" 2>/dev/null)" = true ] || continue
+        [ -z "$found" ] || { echo "unknown: more than one console session for uid $uid"; return 0; }
+        found="$i"
+    done
+    [ -n "$found" ] || { echo "unknown: no console session for uid $uid"; return 0; }
+    locked="$(plutil -extract "IOConsoleUsers.$found.CGSSessionScreenIsLocked" raw -o - - <<<"$plist" 2>/dev/null)" || locked=false
+    case "$locked" in
+        true) echo locked ;;
+        false) echo unlocked ;;
+        *) echo "unknown: CGSSessionScreenIsLocked reads '$locked'" ;;
+    esac
+}
+
+# console_lock_state — _console_lock_from_ioreg for this process's user, over a
+# fresh ioreg read. Always status 0.
+console_lock_state() {
+    { run_bounded 10 ioreg -n Root -d1 -a 2>/dev/null || true; } | _console_lock_from_ioreg "$(id -u)"
+}
+
+# host_skip_if_screen_locked <lane> <assertion> — host_skip <lane> and return 0
+# when this user's console session is screen-locked; return 1 to run the
+# assertion otherwise. Unknown runs it too, with a note: host_skip may only
+# take a cause that is certainly the host's, and a probe that cannot read the
+# lock must neither skip lanes for good (silently green on PR runs) nor fail a
+# healthy one. A locked screen then fails as it did before this check existed.
+host_skip_if_screen_locked() {
+    local lane="$1" what="$2" state user
+    state="$(console_lock_state)"
+    case "$state" in
+        locked)
+            user="$(id -un)"
+            host_skip "$lane" "The runner's screen is locked (ioreg reports CGSSessionScreenIsLocked for the console session of $user), so from outside the app no keystroke lands, no AX window is found and no screenshot is written, and $what did not run. This is not a missing grant. Fix: unlock the runner's screen; to keep it from locking again, set System Settings → Lock Screen → \"Require password after screen saver begins or display is turned off\" to Never for the account $user (see the e2e-architecture skill, runner setup)."
+            return 0 ;;
+        unlocked) return 1 ;;
+    esac
+    echo "[$lane]: could not tell whether the screen is locked ($state); running $what anyway"
+    return 1
+}
+
+# --- Reading the RPC server: an answer, or no answer -------------------------
+#
+# A driver that pipes an RPC read into jq cannot tell an app that answered
+# `false` from one that did not answer at all: a refused connection, a timeout,
+# an app blocked behind a TCC consent prompt all come out as empty input, jq
+# turns that into empty or `null`, and the caller reads it as the real value. A
+# poll then waits out its whole window on "not yet" and blames the feature, and
+# a negative check ("the window is gone", "the prompt was cleared") passes on an
+# app that said nothing. These helpers keep the two apart by status:
+#
+#   rpc_read <path>       one GET into RPC_STATUS + RPC_BODY; 0 answered, 2 no
+#                         usable answer (reason in RPC_ERR)
+#   poll_rpc <path> [--not-yet <code>]... [opts] <t> <i> <pred...>
+#                         poll_state's loop over fresh rpc_read's of <path>,
+#                         plus 5: answered a code that cannot turn into a 200
+#   rpc_is <f> [a]        a poll_rpc predicate: HTTP 200 and jq -e <f> [a]
+#   rpc_field <f> [a]     jq -r <f> [a] on the last answer, only if it was a 200
+#   metrics_snapshot      one usable /metrics snapshot into RPC_BODY
+#   rpc_ready             poll_until predicate: token loaded, /healthz answers 200
+#   rpc_why <rc> <path> <msg>
+#                         the failure message for an rpc_read / poll_rpc status
+#
+#   state_read            one read of /state into STATE_BODY; 0 answered, 2 no
+#                         usable answer
+#   state_query <f> [a]   jq -r <f> [a] over one read; 0 + output, 2 no answer,
+#                         3 the filter failed on an answer
+#   poll_state [--each <cmd>] [--judge-deadline-read] <t> <i> <pred...>
+#                         poll_until over fresh reads; 0 pred held, 1 timed
+#                         out with the app answering, 2 app not answering,
+#                         4 the --each check returned non-zero
+#   state_is <f> [a]      a poll_state predicate: jq -e <f> [a] on STATE_BODY
+#   state_why <rc> <msg>  the failure message for one of those statuses
+#
+# What counts as an answer, the same for every reader:
+# - No reply within the bound, or a transport error: no answer.
+# - 401 or 403: the app refused the driver's token. That says nothing about
+#   the path, so it is no usable answer (status 2) for every reader, with
+#   RPC_REFUSED=1 and the reason saying so; and since a token does not start
+#   working by waiting, a poll stops on it at once instead of sitting out its
+#   window.
+# - Any other HTTP status is an answer, and the caller judges the code: the
+#   /v1 routes answer 404 or 409 on purpose. A poll judges it for the caller:
+#   poll_rpc stops with status 5 on a code outside 200, 409 and its --not-yet
+#   list, since such a code (an unknown job, a bad request, a server error)
+#   does not turn into a 200 by waiting. Only /state is narrower, because it
+#   only ever means one thing: there an answer is a 200 whose body is a JSON
+#   object, and anything else is no usable answer.
+
+# The per-read bound, enforced by run_bounded whichever transport is used
+# (mt-cli's own 5 s request timeout does not cover everything it can block on),
+# and also handed to curl as --max-time: RPC_READ_BOUND_S, or the older name
+# STATE_READ_BOUND_S, or 15 s. Read at each call, so either can be set for one
+# read (`RPC_READ_BOUND_S=5 rpc_read /healthz`).
+
+# _rpc_fetch <path> — one bounded GET <path> with the driver's RPC_TOKEN. Leaves
+# the HTTP status in _RPC_FETCH_CODE, the body in _RPC_FETCH_BODY and, when it
+# fails, the reason in _RPC_FETCH_WHY; the readers copy what they keep, so a
+# /state read does not overwrite a caller's RPC_BODY. 0: an HTTP status came
+# back. 3: it was 401 or 403. 2: none came back.
+_rpc_fetch() {
+    local dir rc=0 bound="${RPC_READ_BOUND_S:-${STATE_READ_BOUND_S:-15}}"
+    _RPC_FETCH_CODE="" _RPC_FETCH_BODY="" _RPC_FETCH_WHY=""
+    if [ -z "${RPC_TOKEN:-}" ]; then
+        _RPC_FETCH_WHY="RPC_TOKEN is not set, so there is no way to ask the app"
+        return 2
+    fi
+    dir="$(mktemp -d "${TMPDIR:-/tmp}/rpc-read.XXXXXX")" || { _RPC_FETCH_WHY="mktemp failed"; return 2; }
+    _RPC_FETCH_CODE="$(run_bounded "$bound" curl --silent --show-error --max-time "$bound" \
+        --output "$dir/body" --write-out '%{http_code}' \
+        --header "Authorization: Bearer $RPC_TOKEN" \
+        "${RPC_BASE:-http://127.0.0.1:9876}$1" 2>"$dir/err")" || rc=$?
+    _RPC_FETCH_BODY="$(cat "$dir/body" 2>/dev/null || true)"
+    case "$rc:$_RPC_FETCH_CODE" in
+        0:401 | 0:403)
+            _RPC_FETCH_WHY="the app refused the request with HTTP $_RPC_FETCH_CODE (a wrong or rotated token)"
+            rm -rf "$dir"
+            return 3 ;;
+        0:[1-5][0-9][0-9]) rm -rf "$dir"; return 0 ;;
+        # 28: curl's own --max-time, which usually fires just before
+        # run_bounded's; the same condition either way.
+        124:* | 28:*) _RPC_FETCH_WHY="no reply within ${bound}s" ;;
+        0:*) _RPC_FETCH_WHY="no HTTP status came back ('$_RPC_FETCH_CODE')" ;;
+        *) _RPC_FETCH_WHY="the request failed (exit $rc): $(tr '\n' ' ' <"$dir/err" | head -c 300)" ;;
+    esac
+    rm -rf "$dir"
+    return 2
+}
+
+# rpc_read <path> — one bounded GET of <path>. Answered: the HTTP status in
+# RPC_STATUS, the body in RPC_BODY and the path in RPC_PATH, status 0. Not
+# answered (a refusal included, see above): those three keep the last answer,
+# the reason goes to RPC_ERR and to stderr, RPC_REFUSED says whether it was a
+# refusal, status 2. Runs in the current shell so all of them survive; call it
+# bare or in a condition. Meant for
+# `rpc_read "$p" || fail "$(rpc_why $? "$p" ...)"`, then a check of RPC_STATUS.
+rpc_read() {
+    local rc=0
+    _rpc_fetch "$1" || rc=$?
+    if [ "$rc" -eq 0 ]; then
+        RPC_STATUS="$_RPC_FETCH_CODE" RPC_BODY="$_RPC_FETCH_BODY" RPC_PATH="$1" RPC_REFUSED=0
+        return 0
+    fi
+    RPC_ERR="$_RPC_FETCH_WHY"
+    RPC_REFUSED=0
+    [ "$rc" -ne 3 ] || RPC_REFUSED=1
+    echo "rpc_read: no usable answer from the app on $1 ($RPC_ERR)" >&2
+    return 2
+}
+
+# rpc_is <filter> [jq-args...] — true when the last rpc_read answered 200 and
+# `jq -e <filter>` holds on its body. Any other code is false, so a 404 cannot
+# satisfy a negative filter; a filter that errors is false too.
+rpc_is() {
+    local filter="$1"
+    shift
+    [ "${RPC_STATUS:-}" = 200 ] && [ -n "${RPC_BODY:-}" ] \
+        && jq -e "$@" "$filter" <<<"$RPC_BODY" >/dev/null 2>&1
+}
+
+# rpc_field <filter> [jq-args...] — `jq -r <filter>` over the last rpc_read's
+# body when it answered 200; prints nothing and returns 1 for any other code
+# or a filter that fails. For reading a field (`.state`) out of an answer
+# whose code the caller has not checked.
+rpc_field() {
+    local filter="$1"
+    shift
+    [ "${RPC_STATUS:-}" = 200 ] && jq -r "$@" "$filter" <<<"$RPC_BODY" 2>/dev/null
+}
+
+# poll_rpc <path> [--not-yet <code>]... [--each <cmd>] [--judge-deadline-read]
+#          <timeout_s> <interval_s> <predicate> [args...]   (options in any order)
+# poll_state over fresh rpc_read's of <path>: same options, same statuses,
+# same logging and deadline rule (see poll_state). The predicate runs only on
+# an answer and reads RPC_STATUS and RPC_BODY (rpc_is, or a function that also
+# stashes fields).
+#
+# A 200 and a 409 are answers the predicate judges; so is each --not-yet code,
+# for a route that answers it while the awaited thing is still on its way (a
+# 404 on GET .../naming before the job parks, on GET /v1/jobs/<id> before a
+# restore). Any other code cannot turn into a 200 by waiting (a 404 for an
+# unknown job, a 400, a 5xx), so the poll stops at once with status 5 rather
+# than sit out the window and read as a feature timeout. A route whose 503
+# means "not ready yet" (the /ui endpoints, while their window is not open)
+# needs --not-yet 503. A refusal (401/403)
+# stops it at once too, as no usable answer (status 2).
+poll_rpc() {
+    local _p_path="$1"
+    shift
+    local _p_read=_poll_rpc_read _p_err=RPC_ERR _p_what="$_p_path" _p_name=poll_rpc
+    local _p_settles=_poll_rpc_settles _p_not_yet="200 409"
+    local -a _p_keep=(RPC_STATUS RPC_BODY RPC_PATH)
+    _poll_answers "$@"
+}
+
+# poll_rpc's reader: quiet, since the poll logs the first and last gap itself.
+_poll_rpc_read() { rpc_read "$_p_path" 2>/dev/null; }
+
+# poll_rpc's check on an answer: true when its code is one the wait may get past.
+_poll_rpc_settles() {
+    case " $_p_not_yet " in
+        *" $RPC_STATUS "*) return 0 ;;
+    esac
+    return 1
+}
+
+# rpc_why <status> <path> <message> — the failure message for an rpc_read,
+# poll_rpc or metrics_snapshot status. 1 (answered, never held): <message>, and
+# the last answer to <path>, code and body, when this shell holds one (not
+# when the read ran in a $(...) subshell). 2: that the app gave no usable
+# answer (or refused the token), so the check never ran. 5: the code the app
+# answered, which the wait could not get past.
+rpc_why() {
+    local last=""
+    [ "${RPC_PATH:-}" != "$2" ] || last=" (last answer: HTTP $RPC_STATUS ${RPC_BODY:-<empty body>})"
+    case "$1" in
+        1) echo "$3$last" ;;
+        2)
+            if [ "${RPC_REFUSED:-0}" = 1 ]; then
+                echo "the app refused the driver's token on $2 (reason logged above), so this went unchecked: $3"
+            else
+                echo "no answer from the app on $2 (reason logged above), so this went unchecked: $3"
+            fi ;;
+        4) echo "the per-tick check handed to poll_rpc failed (its output is above), so this went unchecked: $3" ;;
+        5) echo "the app answered $2 with a code this wait cannot get past (an unknown id, a bad request or a server error): $3$last" ;;
+        *) echo "$3" ;;
+    esac
+}
+
+# rpc_ready — a poll_until predicate for the app's RPC server coming up: the
+# driver's RPC_TOKEN_FILE exists, RPC_TOKEN is loaded from it (for every read
+# after), and GET /healthz answers 200 within 5 s. It asks the server, never
+# just the file: the token file outlives every run on the host, so the file
+# alone once let "RPC up" be logged 70 ms after launch with nothing listening.
+rpc_ready() {
+    [ -f "$RPC_TOKEN_FILE" ] || return 1
+    RPC_TOKEN="$(cat "$RPC_TOKEN_FILE")"
+    RPC_READ_BOUND_S=5 rpc_read /healthz 2>/dev/null && [ "$RPC_STATUS" = 200 ]
+}
+
+# metrics_snapshot — one GET /metrics into RPC_BODY. 0: a usable snapshot. 1:
+# an answer that is not one. 2: no usable answer (rpc_read logged why). Call it
+# bare, not in $(...), so rpc_why sees the read:
+# `metrics_snapshot || fail "$(rpc_why $? /metrics ...)"; snap="$RPC_BODY"`.
+metrics_snapshot() {
+    rpc_read /metrics || return 2
+    rpc_is '.monotonicTimeSeconds > 0'
+}
+
+# state_read — one bounded read of /state. Answered: the body in STATE_BODY,
+# status 0. Not answered: STATE_BODY keeps the last answer (what a timed-out
+# poll wants to show), the reason goes to STATE_ERR, status 2, and
+# RPC_REFUSED says whether it was a refusal. Runs in the current shell so all
+# of them survive; call it bare or in a condition, not in $(...).
+# curl with the driver's RPC_TOKEN when it holds one, since its token file can
+# sit in a lane's own home where mt-cli does not look; mt-cli (which exits
+# non-zero on any transport failure) for the drivers that only ever talk
+# through $MTCLI.
+state_read() {
+    local body err rc=0 bound
+    RPC_REFUSED=0
+    if [ -n "${RPC_TOKEN:-}" ]; then
+        _rpc_fetch /state || rc=$?
+        [ "$rc" -ne 3 ] || RPC_REFUSED=1
+        [ "$rc" -eq 0 ] || { STATE_ERR="$_RPC_FETCH_WHY"; return 2; }
+        body="$_RPC_FETCH_BODY"
+        if [ "$_RPC_FETCH_CODE" != 200 ]; then
+            STATE_ERR="the app answered HTTP $_RPC_FETCH_CODE instead of the state: '$(head -c 200 <<<"$body")'"
+            return 2
+        fi
+    elif [ -n "${MTCLI:-}" ]; then
+        bound="${RPC_READ_BOUND_S:-${STATE_READ_BOUND_S:-15}}"
+        err="$(mktemp "${TMPDIR:-/tmp}/state-read.XXXXXX")" || { STATE_ERR="mktemp failed"; return 2; }
+        body="$(run_bounded "$bound" "$MTCLI" state 2>"$err")" || rc=$?
+        case "$rc" in
+            0) ;;
+            124) STATE_ERR="no reply within ${bound}s" ;;
+            *) STATE_ERR="the request failed (exit $rc): $(tr '\n' ' ' <"$err" | head -c 300)" ;;
+        esac
+        rm -f "$err"
+        [ "$rc" -eq 0 ] || return 2
+    else
+        STATE_ERR="neither RPC_TOKEN nor MTCLI is set, so there is no way to ask the app"
+        return 2
+    fi
+    if [ -n "$body" ] && jq -e 'type == "object"' <<<"$body" >/dev/null 2>&1; then
+        STATE_BODY="$body"
+        return 0
+    fi
+    STATE_ERR="the reply was not a JSON object: '$(head -c 200 <<<"$body")'"
+    return 2
+}
+
+# state_query <filter> [jq-args...] — one read, `jq -r <filter>` over it.
+# Answered: jq's output, status 0, even when that is `false`, `null` or empty.
+# No answer: the reason on stderr, status 2. A filter that fails on the answer:
+# status 3. Meant for `v="$(state_query ...)" || fail "$(state_why $? ...)"`;
+# `state_query .` is the whole body, for several fields from one snapshot.
+state_query() {
+    local filter="$1"
+    shift
+    state_read || { echo "state_query: no answer from the app on /state ($STATE_ERR)" >&2; return 2; }
+    jq -r "$@" "$filter" <<<"$STATE_BODY" || return 3
+}
+
+# state_is <filter> [jq-args...] — true when `jq -e <filter>` holds on
+# STATE_BODY. A filter that errors (a field not there yet) is false, as it
+# would be in the pipe it replaces.
+state_is() {
+    local filter="$1"
+    shift
+    jq -e "$@" "$filter" <<<"$STATE_BODY" >/dev/null 2>&1
+}
+
+# permission_health_reported: true once STATE_BODY carries the result of the
+# app's permission check, which runs asynchronously after launch. Keyed on a
+# verdict field rather than on `isHealthy`, which reads false until the first
+# check completes and would be indistinguishable from a real problem.
+permission_health_reported() {
+    state_is '(.permissionHealth.microphone // "unknown") != "unknown"'
+}
+
+# assert_console_user: die unless this user holds the foreground Aqua session.
+# `open` routes to the WindowServer of that session, so with another user in
+# front (Fast User Switching) or nobody signed in it fails with a bare
+# `procNotFound (-600)`. For lanes that launch through `open`; a directly
+# executed binary does not need it.
+assert_console_user() {
+    local fg_user my_user
+    fg_user="$(stat -f "%Su" /dev/console)"
+    my_user="$(id -un)"
+    [ "$fg_user" != "$my_user" ] || return 0
+    # `root` means the login window is up and nobody is signed in, a different
+    # fix from another user holding the foreground.
+    if [ "$fg_user" = "root" ]; then
+        die "no user is signed in at the console (loginwindow), so \`open\` has no Aqua session to route to. Sign '$my_user' in and re-run."
+    fi
+    die "Aqua foreground user is '$fg_user', not '$my_user': Fast User Switching is active, and \`open\` would fail with a bare -600. Log '$fg_user' out completely, then re-run."
+}
+
+# poll_state [--each <cmd>] [--judge-deadline-read] <timeout_s> <interval_s>
+#            <predicate> [args...]
+# poll_until with a fresh state_read before every tick; the predicate runs
+# only on an answer and reads STATE_BODY (state_is, or a function that also
+# stashes fields or traces, in the current shell). The app going quiet and
+# coming back is logged, once each way, and does not stop the poll.
+#
+# --each <cmd>: run <cmd> at the start of every tick, before the read and
+#   whether or not the app then answers, and once more before the deadline
+#   read below. It is for the liveness check (assert_app_alive), which has to
+#   run on an unanswered tick above all: a crashed app answers nothing, so a
+#   check inside the predicate would never run, and the poll would sit out its
+#   window and report no answer instead of a dead process. <cmd> is one word
+#   (wrap a check that takes arguments in a function) and is expected to end
+#   the run itself on failure, as assert_app_alive does; if it returns
+#   non-zero instead, the poll stops at once with status 4.
+# --judge-deadline-read: run the predicate on the deadline read too (below).
+#   Only for a predicate whose verdict is in the snapshot's own content, such
+#   as "a job that is new and terminal": seen on that read after a gap, it
+#   proves as much as it would on any answered tick, the last of which can
+#   land past the deadline as well. Not for a predicate with a time bound: the
+#   deadline read can return up to RPC_READ_BOUND_S after the window. It
+#   passes only when the app also answered inside the window. Without it, a
+#   condition first seen on the deadline read is not a pass.
+#
+# 0: the predicate held. 1: the window ran out with the app answering at its
+# end, so the condition was false on every answer (gaps inside the window are
+# logged, not held against the verdict). 2: the app was not answering: no
+# answer in the whole window, or none at its end and none to one more read, so
+# a single dropped read at the deadline is not taken for a dead app; also, at
+# once, the app refusing the driver's token (RPC_REFUSED=1). 4: the --each
+# command returned non-zero. 1 and 2 are what keep "never happened" apart
+# from "nobody there to ask"; state_why words them.
+poll_state() {
+    # _p_settles and _p_not_yet empty: a poll_state nested in a poll_rpc
+    # predicate must not see the outer poll's through dynamic scoping.
+    local _p_read=state_read _p_err=STATE_ERR _p_what=/state _p_name=poll_state
+    local _p_settles="" _p_not_yet=""
+    local -a _p_keep=(STATE_BODY)
+    _poll_answers "$@"
+}
+
+# The loop behind poll_state and poll_rpc. The wrapper sets, as locals this
+# sees through dynamic scoping: _p_read (the reader, 0 answered / non-zero
+# not, RPC_REFUSED=1 for a refusal), _p_err (the variable it leaves the reason
+# in), _p_keep (the variables that hold its answer, put back to the window's
+# last answer when the deadline read is not judged), _p_what / _p_name for the
+# log lines, and optionally _p_settles (a check on each answer; false stops the
+# poll with status 5).
+_poll_answers() {
+    local each="" judge_late=0
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --each) each="$2"; shift 2 ;;
+            --judge-deadline-read) judge_late=1; shift ;;
+            --not-yet) _p_not_yet="$_p_not_yet $2"; shift 2 ;;
+            *) break ;;
+        esac
+    done
+    local timeout="$1" interval="$2" answered=0 last=0 quiet_since="" stop_rc=0
+    shift 2
+    if poll_until "$timeout" "$interval" _poll_answers_tick "$@"; then
+        return "$stop_rc"
+    fi
+    if [ "$last" -eq 1 ]; then
+        return 1
+    fi
+    # The extra read asks whether the app still answers. Without
+    # --judge-deadline-read the predicate is not run on it, since a condition
+    # first true after the window is not one that held inside it, and the
+    # answer variables stay the window's last answer, for the caller's
+    # diagnostics.
+    local -a _p_window=()
+    local _p_v _p_i=0
+    for _p_v in "${_p_keep[@]}"; do
+        _p_window+=("${!_p_v:-}")
+    done
+    if [ -n "$each" ]; then
+        "$each" || return 4
+    fi
+    if ! "$_p_read"; then
+        echo "$_p_name: no answer from the app on $_p_what at the end of the ${timeout}s window${quiet_since:+, none for the last $(( SECONDS - quiet_since ))s} (${!_p_err})" >&2
+        return 2
+    fi
+    if [ -n "${_p_settles:-}" ] && ! "$_p_settles"; then
+        _poll_answers_unsettled
+        return 5
+    fi
+    # Judged only after answers inside the window: a pass needs the window to
+    # have been observed at all, or what a caller collected per tick (a value
+    # seen or never seen) would stand on nothing.
+    if [ "$judge_late" -eq 1 ] && [ "$answered" -eq 1 ]; then
+        "$@" && return 0
+    elif [ "$judge_late" -eq 0 ]; then
+        for _p_v in "${_p_keep[@]}"; do
+            printf -v "$_p_v" '%s' "${_p_window[$_p_i]}"
+            _p_i=$(( _p_i + 1 ))
+        done
+    fi
+    if [ "$answered" -eq 0 ]; then
+        echo "$_p_name: the app answered $_p_what only after the ${timeout}s window, never inside it" >&2
+        return 2
+    fi
+    return 1
+}
+
+# One _poll_answers tick: the --each command, a read, then the predicate if
+# the app answered. It updates _poll_answers' answered / last / quiet_since /
+# stop_rc, which bash's dynamic scoping makes visible here. Whatever has to
+# stop the poll before its window ends (a failed --each command, a refused
+# token, an answer _p_settles rejects) ends poll_until by returning 0, with
+# stop_rc set.
+_poll_answers_tick() {
+    if [ -n "$each" ] && ! "$each"; then
+        stop_rc=4
+        return 0
+    fi
+    if ! "$_p_read"; then
+        if [ "${RPC_REFUSED:-0}" = 1 ]; then
+            echo "$_p_name: ${!_p_err} on $_p_what; a token does not start working by waiting, so the poll stops" >&2
+            stop_rc=2
+            return 0
+        fi
+        last=0
+        if [ -z "$quiet_since" ]; then
+            quiet_since="$SECONDS"
+            echo "$_p_name: no answer from the app on $_p_what (${!_p_err}); still polling" >&2
+        fi
+        return 1
+    fi
+    if [ -n "$quiet_since" ]; then
+        echo "$_p_name: the app answers $_p_what again, after $(( SECONDS - quiet_since ))s without an answer" >&2
+        quiet_since=""
+    fi
+    answered=1 last=1
+    if [ -n "${_p_settles:-}" ] && ! "$_p_settles"; then
+        _poll_answers_unsettled
+        stop_rc=5
+        return 0
+    fi
+    "$@"
+}
+
+_poll_answers_unsettled() {
+    echo "$_p_name: the app answered $_p_what with HTTP ${RPC_STATUS:-?}, which waiting cannot turn into a 200, so the poll stops" >&2
+}
+
+# state_why <status> <message> — the failure message for a state_query or
+# poll_state status: <message> as given when the app answered, and a statement
+# that the app did not, so the check never ran, when it did not.
+state_why() {
+    case "$1" in
+        2)
+            if [ "${RPC_REFUSED:-0}" = 1 ]; then
+                echo "the app refused the driver's token on /state (reason logged above), so this went unchecked: $2"
+            else
+                echo "no answer from the app on /state (reason logged above), so this went unchecked: $2"
+            fi ;;
+        3) echo "the jq filter failed on the app's /state answer (jq's error is above): $2" ;;
+        4) echo "the per-tick check handed to poll_state failed (its output is above), so this went unchecked: $2" ;;
+        *) echo "$2" ;;
+    esac
+}
+
+# --- menu-bar badge seen during a lane ----------------------------------------
+#
+# /state.badge is the BadgeKind the menu bar shows (MenuBarIcon.swift:
+# inactive, recording, transcribing, diarizing, processing, userAction, done,
+# error, updateAvailable). A lane notes it on each snapshot its polls already
+# read and asserts on the set at the end, which needs no extra reads: only a
+# badge that lasts longer than the poll interval can be asserted as seen
+# (recording, for the length of the meeting), while an absence holds whatever
+# the timing.
+E2E_BADGES_SEEN=""
+
+# badge_note [<state json>] — add the snapshot's badge (the argument, or
+# STATE_BODY) to E2E_BADGES_SEEN, space-separated, each value once. Always
+# returns 0, since it runs inside poll predicates.
+badge_note() {
+    local badge
+    badge="$(jq -r '.badge // empty | strings' <<<"${1:-${STATE_BODY:-null}}" 2>/dev/null)" || return 0
+    [ -n "$badge" ] || return 0
+    case " $E2E_BADGES_SEEN " in
+        *" $badge "*) ;;
+        *) E2E_BADGES_SEEN="${E2E_BADGES_SEEN:+$E2E_BADGES_SEEN }$badge" ;;
+    esac
+    return 0
+}
+
+# badge_seen <badge> — whether badge_note has seen that value.
+badge_seen() {
+    case " $E2E_BADGES_SEEN " in *" $1 "*) return 0 ;; esac
+    return 1
+}
+
+# badges_seen_among <badge>... — those of the given values badge_note has seen,
+# space-separated, in the order given; empty when none.
+badges_seen_among() {
+    local badge out=""
+    for badge in "$@"; do
+        if badge_seen "$badge"; then out="${out:+$out }$badge"; fi
+    done
+    printf '%s' "$out"
+}
+
+# watch_state — the app's watch state: the loop's state, empty when there is no
+# watch loop, and `unreadable` when the app did not answer, so a dead or hung
+# app never reads as "not watching".
+watch_state() { state_query '.watchState // ""' 2>/dev/null || echo unreadable; }
+
+# rpc_post_status <path> <json> [max-time] — POST a JSON body to the debug RPC
+# server and print only the HTTP status, `000` when nothing answered. For the
+# calls whose status code is the contract under test. Uses the calling
+# driver's RPC_BASE and RPC_TOKEN.
+rpc_post_status() {
+    local code
+    code="$(curl --silent --max-time "${3:-15}" -o /dev/null -w '%{http_code}' -X POST \
+        --header "Authorization: Bearer $RPC_TOKEN" \
+        --header "Content-Type: application/json" \
+        --data "$2" "$RPC_BASE$1" 2>/dev/null)" || true
+    echo "${code:-000}"
+}
+
+# rpc_post <path> <json> — POST a JSON body to the dev RPC server and print the
+# response body, `{}` when nothing answered, so a caller's jq reads a missing
+# answer as a missing field. Same base, token and timeout as rpc_post_status.
+rpc_post() {
+    curl --silent --show-error --max-time 15 -X POST \
+        --header "Authorization: Bearer $RPC_TOKEN" \
+        --header "Content-Type: application/json" \
+        --data "$2" "$RPC_BASE$1" 2>/dev/null || echo '{}'
+}
+
 # Assert that a process matching `$pattern` is running. Exits 1 with a
 # clear error if not. Intended for polling loops that would otherwise
 # burn their full timeout if the app crashed mid-poll — the loop just
 # sees `{}` (or no /state response) and surfaces a misleading
 # "expected X never happened" error.
 #
-# Pattern-based (via `pgrep -f`) rather than PID-based so it works for
-# both `&`-launched scripts (e2e-silent-recording.sh) and
-# `open`-launched scripts (e2e-app.sh) without two APIs. The default
+# Pattern-based (via `pgrep -f`) rather than PID-based: an app started
+# through `open` (the way the lanes launch it, see the e2e-architecture
+# skill) is no child of the driver, so there is no PID to hold. The default
 # matches the deployed dev .app — same string as `quit_running_app`.
 assert_app_alive() {
     local pattern="${1:-MeetingTranscriber-Dev.app/Contents/MacOS/MeetingTranscriber}"
@@ -306,8 +982,9 @@ delete_dev_default() {
 # container copy is only a fallback for a host where the standard plist has not
 # been created yet; a plain `defaults read <bundle> <key>` cannot stand in for
 # either, because cfprefsd redirects it into the container whenever one exists.
-# Empty when unset. Only e2e-app.sh calls this, for a diagnostic log line rather
-# than an assertion; it exists so a reader does not re-derive the container
+# Empty when unset. Only e2e-app.sh calls this: for diagnostic log lines, and to
+# skip the retention default check on a host that switched retention on (see
+# `retention_default_verdict`). It exists so a reader does not re-derive the container
 # redirect by hand. Mutating a dev default needs `write_dev_default`; this is
 # for verification and readback only.
 read_dev_default_effective() {
@@ -323,6 +1000,103 @@ read_dev_default_effective() {
     else
         /usr/bin/defaults read "$bundle" "$key" 2>/dev/null || true
     fi
+}
+
+# --- settings as launch arguments ---------------------------------------------
+#
+# A lane that writes its settings into the dev bundle's preferences has to
+# record and restore them, and a killed run leaves them changed for the next
+# lane. Passed as launch arguments instead (`open <app> --args -key value`),
+# they land in the process's argument domain, which UserDefaults.standard
+# consults before the stored preferences and never writes back: nothing to
+# restore, nothing a killed run can leave behind, and the container redirect
+# described at write_dev_default does not matter.
+#
+# Only keys whose read in the app takes an argument-domain value are listed.
+# Arguments arrive as strings: "YES", or a raw value. AppSettings reads the four
+# below through `UserDefaults.flag(forKey:)` (`bool(forKey:default:)`), which
+# accepts "YES"/"NO", and `string(forKey:)` for the engine; the app shell's own
+# auto-watch start reads `bool(forKey: "autoWatch")`, which takes "YES" too.
+# The upgrade lane passes the same kind of arguments to the binary and asserts
+# them. Keys read as `object(forKey:) as? Int` or `as? Double` (numSpeakers,
+# pollInterval, the OpenAI sampling values) would not cast from a string and
+# are deliberately absent. Each listed key has its /state.settings path, which
+# is how the helper proves the argument arrived.
+_e2e_launch_setting() {
+    case "$1" in
+        autoWatch) echo "bool .settings.detection.autoWatch" ;;
+        recordOnly) echo "bool .settings.recording.recordOnly" ;;
+        liveTranscriptionEnabled) echo "bool .settings.recording.liveTranscriptionEnabled" ;;
+        transcriptionEngine) echo "string .settings.transcription.engine" ;;
+        unloadModelsWhenIdle) echo "bool .settings.transcription.unloadModelsWhenIdle" ;;
+        *) return 1 ;;
+    esac
+}
+
+# launch_dev_app <bundle> [--env NAME=VALUE]... [--] [<key>=<value>]...
+# Start the bundle with `open`, the settings as launch arguments (`true`/`false`
+# for a boolean key), wait up to RPC_READY_TIMEOUT_S (default 30) for the RPC
+# server (rpc_ready, so the caller's RPC_TOKEN_FILE), then read
+# /state.settings and require every setting to be what was passed. `--env`
+# goes to `open`, the one way an environment variable reaches a process
+# LaunchServices starts (MEETINGTRANSCRIBER_DEBUG_RPC=1 brings the RPC server
+# up without the debugRPCEnabled preference). The app must not be running:
+# `open` only activates a running app and drops the arguments, which the
+# readback then reports.
+# 0: launched and every setting in effect. 1: the RPC server did not come up,
+# or the app reports another value (a launch argument that did not arrive). 2:
+# a key or value this helper cannot pass, refused before anything starts. On
+# 1 and 2 the reason is in E2E_LAUNCH_ERR.
+# shellcheck disable=SC2034 # E2E_LAUNCH_ERR is the caller's to read
+launch_dev_app() {
+    local bundle="$1" pair key value spec path got
+    shift
+    local -a open_args=() app_args=() settings=()
+    E2E_LAUNCH_ERR=""
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --env) open_args+=(--env "$2"); shift 2 ;;
+            --) shift; break ;;
+            -*) E2E_LAUNCH_ERR="launch_dev_app: unknown option $1"; return 2 ;;
+            *) break ;;
+        esac
+    done
+    for pair in "$@"; do
+        key="${pair%%=*}" value="${pair#*=}"
+        spec="$(_e2e_launch_setting "$key")" \
+            || { E2E_LAUNCH_ERR="launch_dev_app: $key cannot be passed as a launch argument (see _e2e_launch_setting)"; return 2; }
+        case "${spec%% *}:$value" in
+            bool:true) app_args+=("-$key" YES) ;;
+            bool:false) app_args+=("-$key" NO) ;;
+            bool:*) E2E_LAUNCH_ERR="launch_dev_app: $key takes true or false, not '$value'"; return 2 ;;
+            *) app_args+=("-$key" "$value") ;;
+        esac
+        settings+=("$key|$value|$spec")
+    done
+    # `${a[@]+...}`: bash 3.2 under `set -u` calls an empty array unbound.
+    open ${open_args[@]+"${open_args[@]}"} "$bundle" ${app_args[@]+--args "${app_args[@]}"} \
+        || { E2E_LAUNCH_ERR="\`open\` could not launch $bundle (see its message above)"; return 1; }
+    local ready_s="${RPC_READY_TIMEOUT_S:-30}"
+    poll_until "$ready_s" 1 rpc_ready \
+        || { E2E_LAUNCH_ERR="RPC /healthz did not respond within ${ready_s}s of launching $bundle"; return 1; }
+    [ "${#settings[@]}" -gt 0 ] || return 0
+    local rc=0
+    local readback_s="${E2E_LAUNCH_READBACK_S:-20}"
+    poll_state "$readback_s" 1 state_is '.settings | type == "object"' || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        E2E_LAUNCH_ERR="$(state_why "$rc" "the app answered, but no /state carrying settings arrived within ${readback_s}s, so whether the launch arguments took effect could not be read back")"
+        return 1
+    fi
+    for pair in "${settings[@]}"; do
+        IFS='|' read -r key value spec <<<"$pair"
+        path="${spec#* }"
+        got="$(jq -r "$path | if . == null then \"<absent>\" else tostring end" <<<"$STATE_BODY" 2>/dev/null)" || got="<unreadable>"
+        if [ "$got" != "$value" ]; then
+            E2E_LAUNCH_ERR="the app was launched with $key=$value but reports ${path#.}=$got: the launch argument did not reach it (an app that was already running when \`open\` ran, or an \`open\` that dropped the arguments), so the lane would run on the stored setting instead"
+            return 1
+        fi
+    done
+    return 0
 }
 
 # --- mic-stall lane state that outlives one run -------------------------------
@@ -366,18 +1140,22 @@ mic_stall_restore_protocol() {
     return 0
 }
 
-# Whether `home` is one of the lane's own `mktemp` homes: directly inside the
-# directory the lane creates them in (MIC_STALL_HOME_PARENT, by default
-# $TMPDIR or /tmp, as the lane does), named `e2e-mic-stall-home.` plus the
-# letters and digits mktemp fills in. Anchored on purpose: a substring match
-# would take `<parent>/e2e-mic-stall-home.a/../../Documents` too, and the
-# callers remove what this accepts.
-mic_stall_is_lane_home() {
-    local home="$1"
-    local parent="${MIC_STALL_HOME_PARENT:-${TMPDIR:-/tmp}}"
-    parent="${parent%/}"
-    [[ "$home" =~ ^.*/e2e-mic-stall-home\.[A-Za-z0-9]+$ ]] || return 1
+# e2e_is_lane_home <home> <stem> <parent> — whether `home` is one of a lane's
+# own `mktemp` homes: directly inside `parent`, named `<stem>.` plus the letters
+# and digits mktemp fills in. Anchored on purpose: a substring match would take
+# `<parent>/<stem>.a/../../Documents` too, and the callers remove what this
+# accepts. The lanes with an isolated home (--mic-stall, --upgrade) each pass
+# their own stem, so neither can remove the other's home.
+e2e_is_lane_home() {
+    local home="$1" stem="$2" parent="${3%/}"
+    [[ "$home" =~ ^.*/${stem}\.[A-Za-z0-9]+$ ]] || return 1
     [ "${home%/*}" = "$parent" ]
+}
+
+# Whether `home` is one of the mic-stall lane's homes, created in
+# MIC_STALL_HOME_PARENT (by default $TMPDIR or /tmp, as the lane does).
+mic_stall_is_lane_home() {
+    e2e_is_lane_home "$1" e2e-mic-stall-home "${MIC_STALL_HOME_PARENT:-${TMPDIR:-/tmp}}"
 }
 
 # Remove a mic-stall run's throwaway home, unless the app that used it (`pid`)
@@ -480,6 +1258,36 @@ transcript_is_german() {
     GERMAN_MARKER_HITS="${hit# }"
     GERMAN_MARKER_MATCHED="$matched"
     [ "$matched" -ge "$GERMAN_MARKER_WORDS_MIN" ]
+}
+
+# transcript_covered_seconds <transcript> — how far into the recording the
+# transcript reaches, in whole seconds, on stdout; status 1 and no output when it
+# has no segment line (or cannot be read). A line is `[MM:SS] Label: text`, or
+# `[H:MM:SS] ...` from an hour on (TimestampedSegment in the app); only a stamp
+# at the start of a line counts, so a time spoken in the text is not one. A line
+# is a block of one speaker's consecutive segments (mergeConsecutiveSpeakers)
+# and carries only its first segment's start, so where it ends is estimated
+# from its words at TRANSCRIPT_WORDS_PER_SECOND, a rate faster than speech:
+# the estimate falls short of the real end, never past it. Without it a
+# complete transcript whose diarization heard one voice, a single block at
+# [00:00], would read as covering nothing. The latest estimated end over all
+# lines, since nothing promises a merged dual-track transcript is in time order.
+TRANSCRIPT_WORDS_PER_SECOND=4
+transcript_covered_seconds() {
+    awk -v rate="$TRANSCRIPT_WORDS_PER_SECOND" '
+        match($0, /^\[([0-9]+:)?[0-9][0-9]:[0-9][0-9]\]/) {
+            n = split(substr($0, 2, RLENGTH - 2), part, ":")
+            s = (n == 3) ? part[1] * 3600 + part[2] * 60 + part[3] : part[1] * 60 + part[2]
+            text = substr($0, RLENGTH + 1)
+            colon = index(text, ": ")
+            if (colon > 0) text = substr(text, colon + 2)
+            words = split(text, w, /[ \t]+/)
+            for (i = 1; i <= words; i++) if (w[i] == "") words--
+            end = s + int(words / rate)
+            if (!found || end > max) { max = end; found = 1 }
+        }
+        END { if (found) print max; else exit 1 }
+    ' "$1" 2>/dev/null
 }
 
 # _pid_is_alive <pid> — does this process exist, whether or not we may signal it.
@@ -626,6 +1434,30 @@ record_only_violation() {
     fi
 }
 
+# echo_suppressed_violation <job-json> <min>: why the job left fewer than <min>
+# microphone segments out of its transcript, or nothing at all when it left
+# enough. A missing or non-numeric count and a record jq cannot read fail too:
+# none of them shows that anything was removed, and jq orders every string
+# above every number, so a count of "0" would otherwise clear any floor. An
+# empty record is refused before jq, which reads it as no input and says nothing.
+# jq's output is kept only when it succeeds, so a record that is not JSON, not
+# shaped like a job or followed by junk gives one reason, not a partial verdict
+# with the error appended.
+echo_suppressed_violation() {
+    case "$2" in
+        '' | *[!0-9]*) printf 'the floor %s is not a count' "${2:-<empty>}"; return 0 ;;
+    esac
+    [ -n "$1" ] || { printf 'the job record is empty'; return 0; }
+    local out
+    out="$(jq -r --argjson min "$2" '
+        .echo.suppressedSegments as $n
+        | if ($n | type) != "number" then "no suppressedSegments count in the verdict"
+          elif $n < $min then "\($n) segment(s) suppressed, below the floor of \($min)"
+          else empty end' <<<"$1" 2>/dev/null)" \
+        || { printf 'jq could not read the job record (not JSON, or not shaped like a job)'; return 0; }
+    printf '%s' "$out"
+}
+
 # NOT LOOKING IS NOT THE SAME AS FINDING NOTHING, and both callers read this
 # function's OUTPUT, so the distinction has to live in its status. Two ways to
 # come back empty without having looked, both measured:
@@ -708,6 +1540,55 @@ snapshot_new_job_ids() {
 # one child matching it, so a changed predicate fails there, before the
 # orphan check that relies on it could report a false "none left".
 MT_LOG_STREAM_PREDICATE="subsystem CONTAINS 'com.meetingtranscriber'"
+
+# unified_log_unusable <stream|show> [log-binary] — whether this user cannot
+# use the unified log the way the --quit-flush lane needs (its header says why
+# that rules out a non-admin user on macOS 26).
+#   stream  a one-second `log stream` must run;
+#   show    an entry written through `logger` just before must come back, so a
+#           `log show` that answers but returns nothing also counts.
+# Prints a one-line reason unless usable. Status 0: refused for want of
+# permission (the macOS 26 non-admin case); 1: usable; 2: unknown mode; 3: any
+# other failure (a failed write, an empty answer, an unrecognised error), which
+# is not that host property. For tests: the binary is the second
+# argument, and UNIFIED_LOG_PROBE_LOGGER and UNIFIED_LOG_PROBE_SLEEP replace the
+# logger command and the wait between reads.
+unified_log_unusable() {
+    local mode="$1" bin="${2:-/usr/bin/log}" out="" token i
+    case "$mode" in
+        stream)
+            out="$("$bin" stream --predicate 'process == "mt-e2e-log-probe"' --timeout 1 2>&1)" && return 1
+            ;;
+        show)
+            token="mt-e2e-log-probe-$$-$RANDOM"
+            if ! "${UNIFIED_LOG_PROBE_LOGGER:-logger}" -t mt-e2e-log-probe "$token"; then
+                echo "could not write the probe entry with logger"
+                return 3
+            fi
+            # The entry can take a moment to become visible: up to five reads.
+            # The predicate names logger's process, so `log`'s own record of
+            # this invocation (which carries the token) is not returned.
+            for i in 1 2 3 4 5; do
+                [ "$i" -eq 1 ] || sleep "${UNIFIED_LOG_PROBE_SLEEP:-1}"
+                out="$("$bin" show --last 1m --style compact \
+                    --predicate "process == \"logger\" AND eventMessage CONTAINS \"$token\"" 2>&1)" || break
+                grep -q -- "$token" <<<"$out" && return 1
+                out="log show answered but did not return an entry written a moment before"
+            done
+            ;;
+        *) echo "unknown mode '$mode'"; return 2 ;;
+    esac
+    # The refusal line, not the filter banner `log` prints before it; a
+    # placeholder when the banner was all there was.
+    local line
+    if line="$(grep -m1 -E 'Must be admin|Could not open|not permitted' <<<"$out")"; then
+        echo "$line"
+        return 0
+    fi
+    line="$(grep -v '^Filtering the log data' <<<"$out" | grep -m1 . || true)"
+    echo "${line:-<no output>}"
+    return 3
+}
 
 # second_quit_outcome <trace> <osascript-output> — which of the two measured
 # answers a second AppleScript quit, sent while the first was held open, got.
@@ -931,4 +1812,715 @@ remove_state_backup() {
         rm -f "$backup/$name"
     done
     rmdir "$backup" 2>/dev/null || { echo "backup $backup holds files it did not write; left in place"; return 1; }
+}
+
+# --- calls that a TCC consent prompt can block --------------------------------
+#
+# While macOS shows a consent prompt for a protected resource (Files & Folders,
+# Automation, ...), the call that raised it does not fail: it BLOCKS until
+# someone answers, and on the unattended runner nobody does. The grants key on
+# the binary path of the job's responsible process, the runner service's node,
+# and a runner update can move that node (externals/node20 -> node24), which
+# drops every grant at once. Full story: the e2e-architecture skill, runner
+# setup step 6.
+
+# run_bounded <seconds> <cmd> [args...] — run a command with a hard wall-clock
+# bound. Its stdout and stderr are replayed to ours once it ends. Status: the
+# command's own, or 124 when it was still running at the bound; it is then
+# SIGKILLed with its descendants and abandoned, never waited for. <seconds>
+# may carry one decimal (0.5).
+#
+# Nothing simpler survives the case it exists for: macOS ships no `timeout`, a
+# `perl -e alarm` wrapper leaves the caller waiting on a process the signal
+# does not stop, and a `$(...)` around a background child waits for EOF on a
+# pipe the abandoned child keeps open. So the command writes to files and the
+# caller polls a status file its subshell writes last.
+run_bounded() {
+    local limit="$1" dir pid status whole frac limit_cs waited=0 step=5 started="$SECONDS"
+    shift
+    whole="${limit%%.*}"
+    frac="${limit#"$whole"}"
+    frac="${frac#.}"
+    limit_cs=$(( 10#${whole:-0} * 100 + 10#${frac:0:1}0 ))
+    [ "$limit_cs" -gt 0 ] || limit_cs=5
+    dir="$(mktemp -d "${TMPDIR:-/tmp}/run-bounded.XXXXXX")" || return 125
+    # `set +e`: the subshell inherits errexit, and a failing command must
+    # still reach the line that records its status.
+    ( set +e; "$@"; echo "$?" >"$dir/status" ) >"$dir/out" 2>"$dir/err" </dev/null &
+    pid=$!
+    # Probe before sleeping: 0.05 s steps for the first second, so a quick
+    # command costs almost nothing, then 0.5 s, so a long bound is not
+    # hundreds of forks. Slept time is counted, and the wall clock caps it
+    # too (rounded up, plus one: SECONDS counts whole seconds and can tick
+    # over at once), so a loaded host cannot stretch the bound by much.
+    while [ ! -s "$dir/status" ] && [ "$waited" -lt "$limit_cs" ] \
+        && [ $(( SECONDS - started )) -le $(( (limit_cs + 99) / 100 + 1 )) ]; do
+        [ "$waited" -lt 100 ] || step=50
+        [ "$step" -le $(( limit_cs - waited )) ] || step=$(( limit_cs - waited ))
+        sleep "$(printf '%d.%02d' $(( step / 100 )) $(( step % 100 )))"
+        waited=$(( waited + step ))
+    done
+    if [ -s "$dir/status" ]; then
+        wait "$pid" 2>/dev/null || true
+        status="$(cat "$dir/status")"
+    else
+        local -a victims=()
+        _read_pids victims < <(_descendant_pids "$pid")
+        kill -KILL ${victims[@]+"${victims[@]}"} "$pid" 2>/dev/null || true
+        # Out of the job table, so the shell neither waits for it nor writes a
+        # "Killed: 9" notice into the log when it goes.
+        disown "$pid" 2>/dev/null || true
+        status=124
+    fi
+    cat "$dir/out"
+    cat "$dir/err" >&2
+    rm -rf "$dir"
+    return "$status"
+}
+
+# _read_pids <array-name> — append the pids on stdin, one per line, to the
+# named array. An array rather than a space-joined string, so no caller's IFS
+# can turn the kill into a no-op (see _no_pid_alive).
+_read_pids() {
+    local _pid
+    while IFS= read -r _pid; do
+        [ -n "$_pid" ] && eval "$1+=(\"\$_pid\")"
+    done
+    return 0
+}
+
+# _descendant_pids <pid> — every descendant of pid, one per line, deepest
+# first, found by parent pid only. Nothing here is matched by name.
+_descendant_pids() {
+    local child children
+    children="$(pgrep -P "$1" 2>/dev/null || true)"
+    # Read line by line rather than split, so a caller's IFS cannot matter.
+    while IFS= read -r child; do
+        [ -n "$child" ] || continue
+        _descendant_pids "$child"
+        echo "$child"
+    done <<<"$children"
+}
+
+# e2e_tcc_prompt_timeout — E2E_TCC_PROMPT_TIMEOUT (default 10) as a positive
+# whole number of seconds, base 10 so a leading zero is not octal. Status 1,
+# with the reason on stderr, for anything else. The bound for every TCC probe:
+# short in CI so a missing grant is reported in seconds, long (300) for a
+# one-time grant session at the runner's screen.
+e2e_tcc_prompt_timeout() {
+    local raw="${E2E_TCC_PROMPT_TIMEOUT:-10}"
+    case "$raw" in
+        ''|*[!0-9]*) ;;
+        *) if [ $(( 10#$raw )) -gt 0 ]; then echo $(( 10#$raw )); return 0; fi ;;
+    esac
+    echo "E2E_TCC_PROMPT_TIMEOUT must be a positive whole number of seconds, got '$raw'" >&2
+    return 1
+}
+
+# tcc_probe_verdict <status> <output> — what a probe of a TCC-guarded resource
+# answered: `granted` (status 0); `blocked` (status 124 from run_bounded, or
+# AppleScript's own timeout -1712: no answer, which on the runner means a
+# consent prompt is waiting on the screen); `denied` (the system's refusal:
+# Files & Folders' "Operation not permitted", Automation's -1743,
+# Accessibility's -1719 / "assistive access"); or `error` for anything else,
+# which is not a grant answer and must not be read as one.
+tcc_probe_verdict() {
+    local status="$1" output="$2"
+    case "$status" in
+        0) echo granted; return 0 ;;
+        124) echo blocked; return 0 ;;
+    esac
+    case "$output" in
+        *"-1712"*|*"timed out"*) echo blocked ;;
+        *"Operation not permitted"*|*"-1743"*|*"not authori"*|*"-1719"*|*"assistive access"*|*"not allowed"*)
+            echo denied ;;
+        *) echo error ;;
+    esac
+}
+
+# _tcc_grantee_from_ps <pid> — read a `ps -axo pid=,ppid=,comm=` table on stdin
+# and print "<pid> <comm>" of the process TCC most likely attributes <pid>'s
+# accesses to: the topmost GitHub runner node (`.../externals/node*/bin/node`)
+# among its ancestors, else the topmost ancestor below launchd (Terminal, sshd,
+# ...). `comm` may be relative (runsvc.sh starts node as ./externals/...), so
+# the caller resolves the path. Status 1 when <pid> is not in the table.
+_tcc_grantee_from_ps() {
+    awk -v start="$1" '
+        { pid = $1; ppid = $2; sub(/^[ \t]*[0-9]+[ \t]+[0-9]+[ \t]+/, ""); parent[pid] = ppid; comm[pid] = $0 }
+        END {
+            if (!(start in parent)) exit 1
+            p = start; top = ""; node = ""
+            for (n = 0; (p in parent) && p > 1 && n < 200; n++) {
+                top = p
+                if (comm[p] ~ /(^|\/)externals\/node[^\/]*\/bin\/node$/) node = p
+                p = parent[p]
+            }
+            pick = (node != "" ? node : top)
+            print pick, comm[pick]
+        }'
+}
+
+# tcc_grantee [pid] — the absolute path of the binary to allow in System
+# Settings for this job (see _tcc_grantee_from_ps), resolved from the running
+# process, never assumed: a runner update moves it. Falls back to a
+# description when nothing can be resolved.
+tcc_grantee() {
+    local line pid comm path
+    if line="$(ps -axo pid=,ppid=,comm= | _tcc_grantee_from_ps "${1:-$$}")" && [ -n "$line" ]; then
+        pid="${line%% *}"
+        comm="${line#* }"
+        # lsof's first `txt` entry is the executable itself, absolute even when
+        # the process was started through a relative path.
+        path="$(lsof -a -p "$pid" -d txt -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)"
+        echo "${path:-$comm}"
+        return 0
+    fi
+    echo "the binary that started this job (for the CI runner: <runner dir>/externals/node<N>/bin/node, whichever node runsvc.sh starts)"
+}
+
+# tcc_fix_hint <pane> [grantee] — the one-sentence fix every TCC message ends
+# with: where to allow which binary, and where the background is.
+tcc_fix_hint() {
+    printf 'System Settings → Privacy & Security → %s: allow %s (answer the prompt on the runner'"'"'s screen if one is open), then re-run; see the e2e-architecture skill, runner setup step 6.' \
+        "$1" "${2:-$(tcc_grantee)}"
+}
+
+# --- drivers a step timeout left behind ---------------------------------------
+#
+# A step that times out does not reliably take its driver down: one blocked in
+# a TCC-guarded read outlived its step, and the rerun's e2e-app.sh refused to
+# start next to it. So every e2e driver records itself in CI, by pid AND start
+# time, and the next driver of the job and the workflow's `if: always()` step
+# end exactly those: a pid alone may have been reused, and a pattern would
+# match whatever else names the script.
+
+# _ancestor_pids [pid] — pid (default: this shell) and each ancestor up to,
+# not including, launchd, space-delimited with a leading and trailing space so
+# a caller can test membership with `case " $list " in *" $p "*`.
+_ancestor_pids() {
+    local p="${1:-$$}" out=" "
+    while [ -n "$p" ] && [ "$p" -gt 1 ]; do
+        out="$out$p "
+        p="$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')"
+    done
+    echo "$out"
+}
+
+# e2e_register_driver — record this script's pid in the job's driver list,
+# after ending what an earlier step left in it (a step that runs after a
+# timeout, `if: always()` or `!cancelled()` or after a continue-on-error lane,
+# would otherwise start next to the leftover driver). Every e2e-*.sh driver
+# that sources this file calls it right after; it is explicit rather than a
+# side effect of `source`, since it can signal processes and wait. CI only
+# ($RUNNER_TEMP is per job); a no-op elsewhere.
+e2e_register_driver() {
+    [ "${GITHUB_ACTIONS:-}" = "true" ] && [ -n "${RUNNER_TEMP:-}" ] || return 0
+    e2e_reap_registered_drivers || true
+    local started
+    started="$(ps -o lstart= -p $$ 2>/dev/null)" || return 0
+    printf '%s\t%s\t%s\n' "$$" "$started" "$(basename "$0")" 2>/dev/null >>"$RUNNER_TEMP/e2e-driver-pids" || true
+}
+
+# e2e_reap_registered_drivers [list] — end every driver in the list that is
+# still running as the process recorded (same pid, same start time).
+#
+# Every driver gets SIGTERM at the same moment, together rather than one by
+# one: a nested driver that exits early would otherwise start its parent's
+# cleanup, and a TERM sent to the parent a moment later would cut it off. A
+# driver whose trap can run then runs it with its children still there (the
+# drivers that trap only EXIT clean up at once, and some of them quit or sweep
+# an app that is their own child). After E2E_REAP_UNBLOCK_S (10) seconds, the
+# drivers still running have the non-driver descendants they had before the
+# TERM SIGKILLed: bash holds a TERM trap until its foreground child returns,
+# and that child is the call blocked behind the prompt. What a trap started
+# after the TERM is left alone. A descendant that is itself a registered
+# driver (an e2e-app.sh --redeploy-only under e2e-browser.sh, e2e-soak.sh or
+# e2e-channel-fault.sh) is spared, and gets its own TERM. The drivers share
+# E2E_REAP_GRACE_S (90) seconds in all for their traps. The arithmetic: a
+# trap held until the unblock starts by about 11 s (10 s plus the poll's
+# whole-second overshoot); quit_running_app's worst case is about 52 s (see
+# there); restoring routing, settings and shared state, and sweeping
+# recordings, is allowed 10 s; that is 73 s, and 90 leaves 17 s of margin.
+# Then SIGKILL for what is left, with whatever the traps started, which with
+# its 3 s wait keeps the whole reap under 100 s; the workflows' reaper steps
+# allow 3 minutes. This shell and its ancestors are never touched. Entries that are
+# gone are dropped; a driver that survives SIGKILL stays listed, so the job's
+# last step still sees it, and makes the status 1.
+e2e_reap_registered_drivers() {
+    local list="${1:-${RUNNER_TEMP:-}/e2e-driver-pids}" pid started name p ancestors
+    local keep="" survivors="" entries="" members=" "
+    local -a drivers=() children=() all=()
+    [ -s "$list" ] || return 0
+    ancestors="$(_ancestor_pids)"
+    while IFS=$'\t' read -r pid started name; do
+        [ -n "$pid" ] || continue
+        case "$ancestors" in
+            *" $pid "*) keep="$keep$pid"$'\t'"$started"$'\t'"$name"$'\n'; continue ;;
+        esac
+        [ "$(ps -o lstart= -p "$pid" 2>/dev/null)" = "$started" ] || continue
+        echo "::warning title=leftover e2e driver::$name (pid $pid) was still running from an earlier step; ending it and its children. A step timeout leaves one behind; look in that step's log for a call blocked behind a TCC prompt."
+        drivers+=("$pid")
+        members="$members$pid "
+        entries="$entries$pid"$'\t'"$started"$'\t'"$name"$'\n'
+    done <"$list"
+    if [ "${#drivers[@]}" -gt 0 ]; then
+        local unblock="${E2E_REAP_UNBLOCK_S:-10}" grace="${E2E_REAP_GRACE_S:-90}" before="" owner
+        # The descendants as they are before the TERM, with start times and
+        # the driver they hang under. Only these are ever SIGKILLed below, and
+        # only while their start time still matches, so neither what a trap
+        # starts after the TERM nor a pid reused meanwhile is touched.
+        for pid in "${drivers[@]}"; do
+            while IFS= read -r p; do
+                [ -n "$p" ] || continue
+                case "$members" in *" $p "*) continue ;; esac
+                before="$before$p"$'\t'"$(ps -o lstart= -p "$p" 2>/dev/null)"$'\t'"$pid"$'\n'
+            done < <(_descendant_pids "$pid")
+        done
+        kill -TERM "${drivers[@]}" 2>/dev/null || true
+        # Phase 1: a driver whose trap can run does so now, with its children
+        # (the app it started, its simulator) still there for the cleanup to
+        # quit or sweep after.
+        poll_until "$unblock" 0.2 _no_pid_alive "${drivers[@]}" || true
+        # Phase 2: a driver still here is most likely held by a foreground
+        # child blocked behind a prompt, which keeps bash from running its
+        # pending TERM trap. SIGKILL the descendants it had before the TERM,
+        # so the trap runs, and give it the rest of the grace.
+        while IFS=$'\t' read -r p started owner; do
+            [ -n "$p" ] && [ -n "$started" ] || continue
+            _pid_is_alive "$owner" || continue
+            if [ "$(ps -o lstart= -p "$p" 2>/dev/null)" = "$started" ]; then children+=("$p"); fi
+        done <<<"$before"
+        [ "${#children[@]}" -eq 0 ] || kill -KILL "${children[@]}" 2>/dev/null || true
+        poll_until $(( grace > unblock ? grace - unblock : 1 )) 0.2 _no_pid_alive "${drivers[@]}" || true
+        # Then SIGKILL what is left: the drivers, what their traps started,
+        # and what they had before (orphaned if their driver died on TERM).
+        all=("${drivers[@]}")
+        for pid in "${drivers[@]}"; do
+            if _pid_is_alive "$pid"; then _read_pids all < <(_descendant_pids "$pid"); fi
+        done
+        while IFS=$'\t' read -r p started owner; do
+            [ -n "$p" ] && [ -n "$started" ] || continue
+            if [ "$(ps -o lstart= -p "$p" 2>/dev/null)" = "$started" ]; then all+=("$p"); fi
+        done <<<"$before"
+        kill -KILL "${all[@]}" 2>/dev/null || true
+        poll_until 3 0.2 _no_pid_alive "${all[@]}" || true
+        for p in "${all[@]}"; do
+            if _pid_is_alive "$p"; then survivors="$survivors $p"; fi
+        done
+        while IFS=$'\t' read -r pid started name; do
+            [ -n "$pid" ] || continue
+            case " $survivors " in *" $pid "*) keep="$keep$pid"$'\t'"$started"$'\t'"$name"$'\n' ;; esac
+        done <<<"$entries"
+    fi
+    printf '%s' "$keep" >"$list"
+    [ -s "$list" ] || rm -f "$list"
+    if [ -n "$survivors" ]; then
+        echo "::error title=e2e driver could not be ended::pid(s)${survivors} survived SIGKILL, most likely stuck in a call a TCC prompt holds; answer the prompt on the runner's screen (see the e2e-architecture skill, runner setup step 6)"
+        return 1
+    fi
+    return 0
+}
+
+# --- preference overrides a lane must undo, even after a killed run ----------
+#
+# A lane that changes a host's own settings (not a test toggle but a user's
+# choice, such as the protocol provider) has to put them back on every exit, and
+# a run killed before its trap fires must not leave them changed for good. So
+# the old values go to a record file on disk BEFORE the first write, and every
+# later run of the driver restores a record it finds before changing anything.
+#
+# Values are kept as their property-list XML (`<real>0.7</real>`, `<true/>`,
+# `<string>…</string>`), read through `defaults export` and written back with
+# `defaults write <plist> <key> '<fragment>'`, both through cfprefsd. Not
+# `defaults read` and `-float`: `-float` stores a 32-bit float (0.7 comes back
+# as 0.69999998807907104), and `defaults read` prints both as "0.7", so a
+# read-back would hide the loss. Measured on macOS 26.
+#
+# Record lines are plist, key, value fragment (or `absent`) and, once marked,
+# the lane's own value, separated by the ASCII unit separator (0x1f), not a tab:
+# a tab is IFS whitespace, so `read` would collapse an empty field.
+
+# _defaults_export <plist> — the whole plist as XML, through cfprefsd. Returns
+# 1 when nothing readable came back, which callers must not mistake for "every
+# key absent". A plist that does not exist exports as an empty dictionary.
+_defaults_export() {
+    local xml
+    xml="$(/usr/bin/defaults export "$1" - 2>/dev/null)" || return 1
+    case "$xml" in *"<plist"*) printf '%s' "$xml" ;; *) return 1 ;; esac
+}
+
+# _defaults_fragment <export-xml> <key> — the key's value in what
+# `_defaults_export` printed, as one line of plist XML; `absent` when the key is
+# not there. Returns 1 for empty input, for a value that spans lines (a string
+# with a newline, a dictionary or an array), which a record line cannot carry,
+# and when plutil fails for any other reason than a missing key.
+_defaults_fragment() {
+    local out
+    [ -n "$1" ] || return 1
+    if ! out="$(plutil -extract "$2" xml1 -o - - <<<"$1" 2>&1)"; then
+        case "$out" in
+            *"No value at that key path"*) printf 'absent'; return 0 ;;
+            *) return 1 ;;
+        esac
+    fi
+    out="$(sed -n '/^<plist/,/^<\/plist>/p' <<<"$out" | sed '1d;$d')"
+    case "$out" in
+        ''|*$'\n'*|*$'\x1f'*) return 1 ;;
+    esac
+    printf '%s' "$out"
+}
+
+# defaults_record_keys <record> <plist> <key>... — append one line per key to
+# `record`: plist, key, the value's plist XML (or `absent`). `plist` is an
+# absolute path, as write_dev_default writes. Returns 1, recording nothing for
+# this plist, when the plist cannot be read or a key holds something a line
+# cannot carry: the caller must not change a value it could not put back.
+defaults_record_keys() {
+    local record="$1" plist="$2" key xml fragment lines=""
+    shift 2
+    xml="$(_defaults_export "$plist")" || {
+        echo "defaults_record_keys: could not read $plist" >&2; return 1; }
+    for key in "$@"; do
+        fragment="$(_defaults_fragment "$xml" "$key")" || {
+            echo "defaults_record_keys: $key in $plist is not a single-line value; not recordable" >&2; return 1; }
+        lines="$lines$plist"$'\x1f'"$key"$'\x1f'"$fragment"$'\n'
+    done
+    printf '%s' "$lines" >>"$record"
+}
+
+# dev_defaults_record <record> <bundle> <key>... — defaults_record_keys over
+# every plist write_dev_default writes: the standard one, and the container one
+# when it exists. A lane that snapshots only the standard plist leaves its
+# values in the container on exit. Put back with defaults_restore_record, which
+# is a no-op for a record that does not exist yet, so an exit trap armed before
+# this ran restores nothing rather than deleting keys it never read.
+dev_defaults_record() {
+    local record="$1" bundle="$2" container
+    shift 2
+    defaults_record_keys "$record" "$(dev_standard_plist "$bundle")" "$@" || return 1
+    container="$(dev_container_plist "$bundle")"
+    [ ! -f "$container" ] || defaults_record_keys "$record" "$container" "$@"
+}
+
+# defaults_mark_lane_values <record> — append to each line the value its key
+# holds now, once the lane has written its own. The restore then puts back only
+# keys that still hold the lane's value: anything else is a choice made since (a
+# killed run, then a person changing the setting before the next run repairs
+# it), which an old record must not overwrite. A record never marked (a run
+# killed between the record and its writes) restores every key. Marking again
+# replaces the old marks. Returns 1, leaving the record unmarked, when a plist
+# cannot be read: a mark taken from a failed read would later make every key
+# look changed and nothing would be restored.
+defaults_mark_lane_values() {
+    local record="$1" plist key value _old xml="" xml_of="" now out=""
+    [ -f "$record" ] || return 0
+    # shellcheck disable=SC2034  # an old mark is read only to be dropped
+    while IFS=$'\x1f' read -r plist key value _old; do
+        [ -n "$key" ] || continue
+        if [ "$plist" != "$xml_of" ]; then
+            xml="$(_defaults_export "$plist")" || return 1
+            xml_of="$plist"
+        fi
+        now="$(_defaults_fragment "$xml" "$key")" || return 1
+        out="$out$plist"$'\x1f'"$key"$'\x1f'"$value"$'\x1f'"$now"$'\n'
+    done <"$record"
+    printf '%s' "$out" >"$record.tmp" && mv "$record.tmp" "$record"
+}
+
+# defaults_restore_record <record> — put back every value `record` holds, then
+# read each one back. A key no longer holding the lane's marked value is left
+# as it is, and said; so is one whose current value a line could not carry,
+# which the lane never writes. A line not in this format is dropped, and said.
+# Lines that are settled are dropped; a line whose value did not come back, or
+# whose plist could not be read at all, stays in the record, and then this
+# returns 1, so a later run retries exactly those and never re-applies a settled
+# one over a choice made in between. The defaults writes swallow their own
+# errors, so the read-back is the only evidence a restore landed. Each plist is
+# exported once before the writes and once after them.
+defaults_restore_record() {
+    local record="$1" plist key value lane line xml="" xml_of="" now keep="" written=""
+    [ -f "$record" ] || return 0
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        IFS=$'\x1f' read -r plist key value lane <<<"$line"
+        case "$value" in
+            absent|"<"*) ;;
+            *) echo "defaults_restore_record: dropping a line it cannot read: $key in $plist" >&2; continue ;;
+        esac
+        case "$lane" in
+            *$'\x1f'*) echo "defaults_restore_record: dropping a line it cannot read: $key in $plist" >&2; continue ;;
+        esac
+        if [ "$plist" != "$xml_of" ]; then
+            xml="$(_defaults_export "$plist")" || xml=""
+            xml_of="$plist"
+        fi
+        [ -n "$xml" ] || { keep="$keep$line"$'\n'; continue; }
+        now="$(_defaults_fragment "$xml" "$key")" || now="<not representable>"
+        if [ -n "$lane" ] && [ "$now" != "$lane" ]; then
+            echo "defaults_restore_record: $key in $plist changed since the lane set it; keeping it" >&2
+            continue
+        fi
+        if [ "$value" = absent ]; then
+            /usr/bin/defaults delete "$plist" "$key" >/dev/null 2>&1 || true
+        else
+            /usr/bin/defaults write "$plist" "$key" "$value" 2>/dev/null || true
+        fi
+        written="$written$line"$'\n'
+    done <"$record"
+    xml_of=""
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        IFS=$'\x1f' read -r plist key value lane <<<"$line"
+        if [ "$plist" != "$xml_of" ]; then
+            xml="$(_defaults_export "$plist")" || xml=""
+            xml_of="$plist"
+        fi
+        now="$(_defaults_fragment "$xml" "$key")" || now=""
+        [ "$now" = "$value" ] || keep="$keep$line"$'\n'
+    done <<<"$written"
+    if [ -n "$keep" ]; then
+        printf '%s' "$keep" >"$record.tmp" && mv "$record.tmp" "$record"
+        echo "defaults_restore_record: did not restore: $(cut -d $'\x1f' -f2 "$record" | tr '\n' ' '); keeping them in $record for the next run" >&2
+        return 1
+    fi
+    rm -f "$record"
+}
+
+# openai_stub_request_violations <request> <expect> — what is wrong with one
+# request the --protocol lane's stub logged (scripts/fixtures/openai-chat-stub.py),
+# one line per problem, nothing when it is the request the lane expects. Both
+# arguments are JSON. `expect` carries: path, model, language, transcript,
+# temperature and topP (null: the key must be absent from the body), and
+# languageInPrompt (false when a custom prompt is installed, which need not name
+# the language at all). The API key is not checked here: the lane runs with
+# whatever key the host has, and where it goes is covered by
+# OpenAIProtocolGeneratorTests.
+openai_stub_request_violations() {
+    jq -nr --argjson r "$1" --argjson e "$2" '
+        def sampling($name; $want):
+            if $want == null then
+                (if ($r.body | has($name)) then "\($name) was sent (\($r.body[$name])) but no override is set" else empty end)
+            elif $r.body[$name] != $want then "\($name) is \($r.body[$name] // "absent"), expected \($want)"
+            else empty end;
+        if ($r.body | type) != "object" then "the body is not a JSON object (\($r.bodyBytes) bytes)"
+        else
+            (if $r.method != "POST" then "method is \($r.method), expected POST" else empty end),
+            (if $r.path != $e.path then "path is \($r.path), expected \($e.path)" else empty end),
+            (if ($r.contentType | startswith("application/json") | not) then "Content-Type is \($r.contentType | tojson), expected application/json" else empty end),
+            (if $r.body.model != $e.model then "model is \($r.body.model | tojson), expected \($e.model | tojson)" else empty end),
+            (if $r.body.stream != true then "stream is \($r.body.stream | tojson), expected true" else empty end),
+            (if ($r.body.max_tokens | type) != "number" then "max_tokens is \($r.body.max_tokens | tojson), expected a number on the first attempt" else empty end),
+            sampling("temperature"; $e.temperature),
+            sampling("top_p"; $e.topP),
+            (if ($r.body.messages | type) != "array" or ($r.body.messages | length) != 2 then "messages is not a [system, user] pair"
+             else
+                $r.body.messages[0] as $sys | $r.body.messages[1] as $user |
+                (if $sys.role != "system" then "messages[0].role is \($sys.role | tojson), expected system" else empty end),
+                (if $user.role != "user" then "messages[1].role is \($user.role | tojson), expected user" else empty end),
+                (if ($sys.content | tostring | contains("{LANGUAGE}")) then "the system prompt still holds the {LANGUAGE} placeholder" else empty end),
+                (if $e.languageInPrompt and ($sys.content | tostring | contains($e.language) | not) then "the system prompt does not name the protocol language \($e.language | tojson)" else empty end),
+                (if $user.content != $e.transcript then "the user message is not the transcript (\($user.content | tostring | length) chars sent, \($e.transcript | length) in the transcript file)" else empty end)
+             end)
+        end'
+}
+
+# --- diagnostics bundle of a failed lane ---------------------------------------
+#
+# What a failed e2e-app.sh lane leaves for the workflow to upload: the app's
+# /state, its queue snapshot, the tail of its pipeline log, the lane's simulator
+# log and the app's crash reports from this run. The artifact is public, since
+# the repository is, so every structured file is rebuilt from an ALLOWLIST of
+# fields (a field the app adds later stays out until someone adds it here), and
+# what is kept was checked field by field for what it can carry:
+#   - left out: speaker names (speakerDB.recentNames, knownSpeakerNames),
+#     meeting titles and naming slugs, participants, spoken text (live-caption
+#     hypotheses and finals), notification bodies, every path (transcript,
+#     protocol, output folder, vocabulary file, Claude CLI), the microphone's
+#     name and device UID, the OpenAI endpoint and model, export page ids and
+#     URLs, the update check's error text;
+#   - also left out: the text of job errors and warnings. It is the most
+#     useful line of a failure, and it is in the lane's own log already, but
+#     it is free text: an NSError names the file it failed on (a recording's
+#     name carries the meeting title), a protocol error can echo a server's
+#     body, and no pattern can tell which words are a title. The bundle says
+#     whether there was an error and how many warnings;
+#   - kept: counts, states, booleans, enum values, durations, levels, the
+#     engine and model names, permission verdicts, notification titles (fixed
+#     strings in the app), window pin flags.
+# The simulator log has the account name taken out of /Users paths. A crash
+# report is taken only when it is the dev app's (the installed app has the
+# same process name) and is rebuilt from an allowlist of its keys too: the
+# exception, the termination, the threads and the binary images, without the
+# application-specific messages (where a fatalError's text lands), the
+# mapped-region summaries (which name mapped files) and the per-machine
+# crash-reporter key; then the account name goes from its paths. Tested by
+# scripts/tests/test_e2e_diagnostics.sh, which feeds each one a sample full of
+# names and asserts they are gone.
+
+# The pipeline-log lines the bundle keeps: the latest transitions, which is
+# what a failure is read from, without the whole history of a long-lived host.
+E2E_DIAG_LOG_TAIL_LINES=200
+
+# e2e_redact_state — a /state answer on stdin, its allowlisted copy on stdout.
+e2e_redact_state() {
+    jq '
+        def pick($o; $keys): if $o == null then null else reduce $keys[] as $k ({}; . + {($k): $o[$k]}) end;
+        {
+            pipeline: pick(.pipeline; ["isProcessing", "activeJobCount", "waitingJobCount", "pendingNamingJobCount"]),
+            speakerDB: (if .speakerDB == null then null else {count: .speakerDB.count} end),
+            pendingNamingJobs: [(.pendingNamingJobs // [])[] | {jobID, speakerCount}],
+            engines: (if .engines == null then null else {
+                active: .engines.active,
+                whisperKit: pick(.engines.whisperKit; ["modelVariant", "language", "modelState"]),
+                parakeet: pick(.engines.parakeet; ["modelState"])
+            } end),
+            lastJob: (if .lastJob == null then null else {
+                jobID: .lastJob.jobID, state: .lastJob.state, appName: .lastJob.appName,
+                durationSec: .lastJob.durationSec,
+                hasTranscript: (.lastJob.transcriptPath != null), hasProtocol: (.lastJob.protocolPath != null),
+                exportStatus: .lastJob.export.status,
+                hasError: (.lastJob.error != null), warningCount: ((.lastJob.warnings // []) | length),
+                participantCount: ((.lastJob.participants // []) | length)
+            } end),
+            channelHealth: pick(.channelHealth; ["micSilent", "appSilent", "recordingSilent", "appNoiseFloorOnly",
+                "micFault", "appFault", "micLevelDBFS", "appLevelDBFS", "micSecondsSinceLastBuffer",
+                "micSecondsSinceLastEnergy", "appSecondsSinceLastBuffer", "appSecondsSinceLastEnergy", "micStallCount"]),
+            permissionHealth: pick(.permissionHealth; ["screenRecording", "microphone", "accessibility", "isHealthy",
+                "notifications", "notificationsAlertStyle", "notificationsTimeSensitive", "notificationsScheduledDelivery"]),
+            liveCaptions: (if .liveCaptions == null then null else {recentFinalsCount: ((.liveCaptions.recentFinals // []) | length)} end),
+            watchState, pendingConsentApp, isManualRecording,
+            notifications: [(.notifications // [])[] | {title, postedAt, posted}],
+            settings: (.settings as $s | if $s == null then null else {
+                detection: pick($s.detection; ["watchTeams", "watchZoom", "watchWebex", "autoWatch", "pollIntervalSeconds"]),
+                recording: pick($s.recording; ["endGraceSeconds", "noMic", "recordOnly", "perChannelIndicatorEnabled",
+                    "liveTranscriptionEnabled", "liveCaptionsOverlayEnabled", "liveCaptionsSize", "asymmetricSilenceWarningSeconds"]),
+                transcription: pick($s.transcription; ["engine", "whisperKitModel", "whisperLanguage", "parakeetLanguage",
+                    "customVocabularyEnabled"]),
+                diarization: pick($s.diarization; ["diarize", "mode", "numSpeakers", "vadEnabled", "vadThreshold",
+                    "clusterThreshold", "warmStartFa", "warmStartFb", "minSegmentDurationSeconds", "excludeOverlap"]),
+                protocolGeneration: pick($s.protocolGeneration; ["provider", "language", "openAITemperature", "openAITopP"]),
+                output: pick($s.output; ["hasCustomDirectory", "hasCustomPrompt", "includeFullTranscriptInProtocol",
+                    "saveRawTranscriptSeparately", "useAITitleForFilenames"]),
+                diagnostics: pick($s.diagnostics; ["verboseDiagnostics", "debugRPCEnabled"]),
+                updates: pick($s.updates; ["checkForUpdates", "includePreReleases"])
+            } end),
+            badge,
+            updateStatus: pick(.updateStatus; ["available", "availableVersion", "isPrerelease", "isChecking"]),
+            windows: [(.windows // [])[] | {id, isVisible, floating, canJoinAllSpaces, fullScreenAuxiliary}]
+        }'
+}
+
+# e2e_redact_queue — a pipeline_queue.json on stdin, its allowlisted copy on
+# stdout: per job its id, state, app, timing and diarizer mode, which audio it
+# has, and whether it has an error and how many warnings.
+e2e_redact_queue() {
+    jq '
+        if type != "array" then {unreadable: true} else [.[] | {
+            id, state, appName, enqueuedAt, usedDiarizerMode, autoSkipNaming,
+            hasMix: (.mixPath != null), hasApp: (.appPath != null), hasMic: (.micPath != null),
+            hasTranscript: (.transcriptPath != null),
+            hasError: (.error != null), warningCount: ((.warnings // []) | length)
+        }] end'
+}
+
+# e2e_redact_pipeline_log — pipeline_log.jsonl lines on stdin, each reduced to
+# the five keys the app writes (PipelineEventLog); a line that is not a JSON
+# object is dropped.
+e2e_redact_pipeline_log() {
+    jq -cR 'fromjson? | objects | {timestamp, job_id, event, from, to}'
+}
+
+# e2e_scrub_text — free text on stdin, with the account name taken out of every
+# /Users path.
+e2e_scrub_text() {
+    sed -E -e 's#/Users/[^/[:space:]"'"'"']+#/Users/<user>#g'
+}
+
+# e2e_redact_crash_report <ips> — the report's allowlisted copy on stdout when
+# it is a crash of the dev app (`MeetingTranscriber-Dev.app` in its procPath);
+# status 1 and nothing written for any other report, or one that does not
+# parse. An .ips file is a one-line JSON header followed by the JSON body.
+e2e_redact_crash_report() {
+    local header body
+    header="$(head -n 1 "$1" | jq -c '{app_name, app_version, build_version, bundleID, bug_type, os_version, timestamp, incident_id, name}' 2>/dev/null)" || return 1
+    body="$(tail -n +2 "$1" | jq -c '
+        select((.procPath // "") | contains("MeetingTranscriber-Dev.app"))
+        | {procName, procPath, bundleInfo, osVersion, captureTime, exception, termination,
+           faultingThread, threads, usedImages, lastExceptionBacktrace}' 2>/dev/null)" || return 1
+    [ -n "$header" ] && [ -n "$body" ] || return 1
+    printf '%s\n%s\n' "$header" "$body" | e2e_scrub_text
+}
+
+# e2e_write_diagnostics <out-dir> <app-data-dir> <marker> <simulator-log> [<crash-dir>]
+# Write the bundle into <out-dir> (created, never emptied: only files of the
+# names below are written, so pointing it at a shared folder deletes nothing).
+# Each part is best effort and the call always returns 0 once <out-dir>
+# exists: a diagnostics step must not change a lane's verdict. /state is read
+# once, bounded to 5 s, through state_read, so the caller's RPC_TOKEN (or
+# MTCLI) decides how. Crash reports are the dev app's (see
+# e2e_redact_crash_report) newer than <marker>; none are taken without a marker.
+e2e_write_diagnostics() {
+    local out="$1" data="$2" marker="$3" sim_log="$4" crash_dir="${5:-$HOME/Library/Logs/DiagnosticReports}"
+    local redacted f report
+    mkdir -p "$out" || return 1
+    if RPC_READ_BOUND_S=5 state_read 2>/dev/null && redacted="$(e2e_redact_state <<<"$STATE_BODY" 2>/dev/null)"; then
+        printf '%s\n' "$redacted" >"$out/state.json"
+    else
+        echo "No usable /state answer when this bundle was written: the app had exited, hung, or answered something that is not a state snapshot." >"$out/state.unavailable.txt"
+    fi
+    if [ -f "$data/ipc/pipeline_queue.json" ] && redacted="$(e2e_redact_queue <"$data/ipc/pipeline_queue.json" 2>/dev/null)"; then
+        printf '%s\n' "$redacted" >"$out/pipeline_queue.json"
+    fi
+    if [ -f "$data/ipc/pipeline_log.jsonl" ]; then
+        tail -n "$E2E_DIAG_LOG_TAIL_LINES" "$data/ipc/pipeline_log.jsonl" 2>/dev/null \
+            | e2e_redact_pipeline_log >"$out/pipeline_log.tail.jsonl" 2>/dev/null || true
+    fi
+    if [ -n "$sim_log" ] && [ -f "$sim_log" ]; then
+        e2e_scrub_text <"$sim_log" >"$out/simulator.log" 2>/dev/null || true
+    fi
+    if [ -n "$marker" ] && [ -f "$marker" ] && [ -d "$crash_dir" ]; then
+        while IFS= read -r f; do
+            report="$(e2e_redact_crash_report "$f")" || continue
+            mkdir -p "$out/crash-reports" && printf '%s\n' "$report" >"$out/crash-reports/$(basename "$f")" || true
+        done < <(find "$crash_dir" -maxdepth 1 -type f -name 'MeetingTranscriber*.ips' -newer "$marker" 2>/dev/null)
+    fi
+    return 0
+}
+
+# --- recording retention default ---------------------------------------------
+#
+# Recording retention (issue #723) is off unless the user switches it on, and a
+# finished job then keeps its relocated audio. Unit tests pin the default and
+# the policy; the meeting lanes of e2e-app.sh pin the production chain with
+# this: the retention pass that runs when a job reaches done, against the app's
+# real settings and output folder. In CI the lane runs with a period of 0 days,
+# so the switch is all that keeps the recording (see where e2e-app.sh launches
+# the app). The pass runs on its own right after done and, switched off, logs
+# nothing to wait for, so the file is looked at again after `grace_s`; a pass
+# that starts later than that goes unseen.
+
+# Whether `defaults read` printed a value the app reads as on
+# (`UserDefaults.flag`): any integer but 0, or yes/true in any case. A string
+# "2" reads as unset in the app but prints like the integer 2; it counts as on
+# here, so the doubt goes to skipping rather than to a false red.
+retention_reads_as_on() {
+    case "$1" in
+        [Yy][Ee][Ss] | [Tt][Rr][Uu][Ee]) return 0 ;;
+        '' | *[!0-9-]* | -) return 1 ;;
+    esac
+    [ "$1" -ne 0 ] 2>/dev/null
+}
+
+# Prints one verdict and returns 0, so the caller decides what fails:
+#   skip     retention is on for this host (`retention_reads_as_on`):
+#            deleting is what the user asked for
+#   missing  the recording was not there when the job finished
+#   deleted  it was there, and gone `grace_s` later
+#   kept     it was there both times
+retention_default_verdict() {
+    local enabled="$1" mix="$2" grace_s="$3"
+    if retention_reads_as_on "$enabled"; then echo skip; return 0; fi
+    if [ ! -f "$mix" ]; then echo missing; return 0; fi
+    sleep "$grace_s"
+    if [ -f "$mix" ]; then echo kept; else echo deleted; fi
 }

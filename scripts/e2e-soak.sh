@@ -10,8 +10,9 @@
 #
 # This lane holds ONE meeting open for the requested duration, samples
 # `GET /metrics` throughout, and reports how memory moved across the run. It
-# then asserts the pipeline still produces a job at the end — a soak that leaks
-# and a soak that quietly stops working are different failures, and both matter.
+# then asserts the meeting still lands as a recording at the end — a soak that
+# leaks and a soak that quietly stops working are different failures, and both
+# matter.
 #
 # Measurement: `/metrics` self-reports `physFootprintBytes` (Activity Monitor's
 # "Memory" column) via proc_pid_rusage. Growth is a least-squares slope over all
@@ -75,11 +76,13 @@ DEV_BUNDLE_DEPLOY="$HOME/Applications/MeetingTranscriber-Dev.app"
 SIMULATOR_PKG="$ROOT/tools/meeting-simulator"
 SIMULATOR_BIN="$SIMULATOR_PKG/.build/release/meeting-simulator"
 DEFAULT_FIXTURE="$ROOT/app/MeetingTranscriber/Tests/Fixtures/two_speakers_de.wav"
+# shellcheck disable=SC2034 # read by the RPC helpers in lib/e2e-helpers.sh
 RPC_TOKEN_FILE="$HOME/Library/Application Support/MeetingTranscriber/.rpc-token"
 # Record-only writes to `<effectiveOutputDir>/recordings`, which defaults to
 # Downloads — NOT the Application Support path that only appears as a default
 # initializer argument. e2e-app.sh asserts against this same directory.
 REC_DIR="$HOME/Downloads/MeetingTranscriber/recordings"
+# shellcheck disable=SC2034 # read by the RPC helpers in lib/e2e-helpers.sh
 RPC_BASE="http://127.0.0.1:9876"
 # shellcheck source=lib/bundle-ids.sh
 source "$ROOT/scripts/lib/bundle-ids.sh"
@@ -108,30 +111,16 @@ fail() { printf '[e2e-soak] FAIL: %s\n' "$*" >&2; exit 1; }
 
 # shellcheck source=scripts/lib/e2e-helpers.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/e2e-helpers.sh"
+# Ends what a timed-out earlier step left running, then records this
+# driver for the next (see e2e_register_driver).
+e2e_register_driver
 
 require_command() {
     command -v "$1" >/dev/null || fail "missing command: $1"
 }
 
+# shellcheck disable=SC2034 # read by the RPC helpers in lib/e2e-helpers.sh
 RPC_TOKEN=""
-rpc() {
-    local path="$1"
-    curl --silent --show-error --max-time 10 \
-        --header "Authorization: Bearer $RPC_TOKEN" \
-        "$RPC_BASE$path" 2>/dev/null || true
-}
-
-# Fetch /metrics, refusing anything that is not a usable snapshot. The
-# non-empty guard matters: jq 1.6 exits 0 on EMPTY input even with -e, so a
-# timed-out curl would otherwise masquerade as a valid reading and silently
-# flatten the growth curve.
-metrics_snapshot() {
-    local m
-    m="$(rpc /metrics)"
-    { [ -n "$m" ] && jq -e '.monotonicTimeSeconds > 0' <<<"$m" >/dev/null 2>&1; } \
-        || fail "/metrics returned no usable snapshot: $m"
-    printf '%s' "$m"
-}
 
 # Least-squares slope of footprint over time, in MB per hour, plus the summary
 # numbers worth logging. Reads a JSON array of {minutes, footprintMB} samples.
@@ -159,18 +148,6 @@ growth_summary() {
         }'
 }
 
-# See the shared note in e2e-app.sh: `rpc` ends in `|| true`, so probing
-# through it reports success for a refused connection and leaves the token
-# file, which outlives every run on the host, as the only real condition.
-# Ask curl directly and let its exit status decide.
-_rpc_ready() {
-    [ -f "$RPC_TOKEN_FILE" ] || return 1
-    RPC_TOKEN="$(cat "$RPC_TOKEN_FILE")"
-    curl --silent --fail --max-time 5 \
-        --header "Authorization: Bearer $RPC_TOKEN" \
-        "$RPC_BASE/healthz" >/dev/null 2>&1
-}
-
 # --- preflight ------------------------------------------------------------
 
 require_command jq
@@ -185,33 +162,32 @@ case "$SAMPLE_EVERY_MIN" in ''|*[!0-9]*) fail "--sample-every must be a positive
 [ $((SOAK_MINUTES / SAMPLE_EVERY_MIN)) -ge 2 ] \
     || fail "--minutes/--sample-every must yield at least 2 samples (got $((SOAK_MINUTES / SAMPLE_EVERY_MIN)))"
 
-# Address the standard-domain plist directly, and write through
-# `write_dev_default`. `defaults <bundle-id>` is redirected into the app's
-# container once containermanagerd has registered one, while the dev .app is not
-# sandboxed and
-# resolves the standard domain, so the two disagree and a lane can configure
-# nothing at all without any error. See write_dev_default in
-# scripts/lib/e2e-helpers.sh.
-_STANDARD_PLIST="$(dev_standard_plist "$BUNDLE_ID")"
-SAVED_DEBUG_RPC=$(snapshot_default "$_STANDARD_PLIST" debugRPCEnabled)
-SAVED_AUTO_WATCH=$(snapshot_default "$_STANDARD_PLIST" autoWatch)
-SAVED_RECORD_ONLY=$(snapshot_default "$_STANDARD_PLIST" recordOnly)
+# Snapshot the settings this lane changes, in both plists write_dev_default
+# writes, so on_exit puts each back to its own earlier value (see
+# dev_defaults_record in scripts/lib/e2e-helpers.sh).
+DEFAULTS_RECORD="$(mktemp "${TMPDIR:-/tmp}/e2e-soak-defaults.XXXXXX")"
+dev_defaults_record "$DEFAULTS_RECORD" "$BUNDLE_ID" debugRPCEnabled autoWatch recordOnly \
+    || fail "could not record the dev bundle's settings; nothing was changed"
 
 RUN_START_MARKER="$(mktemp "${TMPDIR:-/tmp}/e2e-soak-start.XXXXXX")"
 SIM_PID=""
 
 on_exit() {
     [ -n "${SIM_PID:-}" ] && kill "$SIM_PID" 2>/dev/null || true
-    restore_bool_default "$_STANDARD_PLIST" debugRPCEnabled "$SAVED_DEBUG_RPC"
-    restore_bool_default "$_STANDARD_PLIST" autoWatch       "$SAVED_AUTO_WATCH"
-    restore_bool_default "$_STANDARD_PLIST" recordOnly      "$SAVED_RECORD_ONLY"
     if [ "$APP_AFTER" = quit ]; then
         quit_running_app || true
         sweep_run_artifacts "$REC_DIR" "$RUN_START_MARKER"
     fi
     rm -f "${RUN_START_MARKER:-}" 2>/dev/null || true
+    # After the quit, which may write the app's in-memory settings back.
+    defaults_restore_record "$DEFAULTS_RECORD" || true
 }
-trap on_exit EXIT INT TERM
+# INT/TERM exit (and so run on_exit once, from EXIT): a trap that only ran
+# on_exit would return into the interrupted command and let the lane carry on
+# after its cleanup, which a reaper SIGTERM relies on not happening.
+trap on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # --- build + launch -------------------------------------------------------
 
@@ -228,29 +204,31 @@ if [ ! -x "$SIMULATOR_BIN" ]; then
         || fail "meeting-simulator build failed"
 fi
 
+# Quit first, then write: a running app holds its settings in memory and may
+# write them back as it quits, which would undo the writes below (see
+# e2e-channel-fault.sh, where that was measured).
+quit_running_app || true
+
 # Record-only: the soak is about the resident process over an hour, and running
 # transcription on every loop of the fixture would measure the ASR engine
-# instead. The pipeline assertion at the end re-enables the full path.
+# instead. That capture still works at the end is checked by the recording's
+# sidecar, not by a pipeline job.
 write_dev_default "$BUNDLE_ID" debugRPCEnabled true bool
 write_dev_default "$BUNDLE_ID" autoWatch true bool
 write_dev_default "$BUNDLE_ID" recordOnly true bool
 
 mkdir -p "$REC_DIR"
-quit_running_app || true
 log "Launching $DEV_BUNDLE_DEPLOY"
 open "$DEV_BUNDLE_DEPLOY"
 
-RPC_TOKEN="$(cat "$RPC_TOKEN_FILE" 2>/dev/null || true)"
-[ -n "$RPC_TOKEN" ] || fail "no RPC token at $RPC_TOKEN_FILE"
-
-poll_until "$RPC_READY_TIMEOUT_S" 1 _rpc_ready \
+poll_until "$RPC_READY_TIMEOUT_S" 1 rpc_ready \
     || fail "RPC /healthz did not respond within ${RPC_READY_TIMEOUT_S}s"
 log "RPC up"
 
 # Launch-time work (model preload, snapshot load, orphan recovery) allocates;
 # letting it finish keeps it out of the growth curve, where it would read as a
 # leak in the first samples.
-log "Settling for up to ${SETTLE_TIMEOUT_S}s before the baseline sample"
+log "Settling for ${SETTLE_TIMEOUT_S}s before the baseline sample"
 sleep "$SETTLE_TIMEOUT_S"
 
 # --- soak -----------------------------------------------------------------
@@ -269,20 +247,16 @@ log "Starting meeting-simulator for ${MEETING_SECONDS}s (${SOAK_MINUTES}min meas
 "$SIMULATOR_BIN" "$SIMULATOR_FIXTURE" --silent --duration "$MEETING_SECONDS" >/dev/null 2>&1 &
 SIM_PID=$!
 
-_is_recording() {
-    local state
-    state="$(rpc /state)"
-    [ -n "$state" ] && jq -e '.watchState == "recording"' <<<"$state" >/dev/null 2>&1
-}
-poll_until "$RECORDING_DEADLINE_S" 2 _is_recording \
-    || fail "app did not reach watchState=recording within ${RECORDING_DEADLINE_S}s"
+poll_state "$RECORDING_DEADLINE_S" 2 state_is '.watchState == "recording"' \
+    || fail "$(state_why $? "app did not reach watchState=recording within ${RECORDING_DEADLINE_S}s")"
 log "Recording started; letting the allocation ramp settle for ${RECORDING_SETTLE_S}s"
 sleep "$RECORDING_SETTLE_S"
 
 SAMPLES="[]"
 ELAPSED_MIN=0
 while [ "$ELAPSED_MIN" -lt "$SOAK_MINUTES" ]; do
-    snap="$(metrics_snapshot)"
+    metrics_snapshot || fail "$(rpc_why $? /metrics "the CPU/RAM snapshot was not taken")"
+    snap="$RPC_BODY"
     footprint_mb="$(jq -r '(.physFootprintBytes / 1048576) | round' <<<"$snap")"
     SAMPLES="$(jq -n --argjson s "$SAMPLES" --argjson m "$ELAPSED_MIN" --argjson f "$footprint_mb" \
         '$s + [{minutes: $m, footprintMB: $f}]')"
@@ -295,7 +269,8 @@ while [ "$ELAPSED_MIN" -lt "$SOAK_MINUTES" ]; do
     ELAPSED_MIN=$((ELAPSED_MIN + SAMPLE_EVERY_MIN))
 done
 
-snap="$(metrics_snapshot)"
+metrics_snapshot || fail "$(rpc_why $? /metrics "the CPU/RAM snapshot was not taken")"
+snap="$RPC_BODY"
 footprint_mb="$(jq -r '(.physFootprintBytes / 1048576) | round' <<<"$snap")"
 SAMPLES="$(jq -n --argjson s "$SAMPLES" --argjson m "$ELAPSED_MIN" --argjson f "$footprint_mb" \
     '$s + [{minutes: $m, footprintMB: $f}]')"

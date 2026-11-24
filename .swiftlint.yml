@@ -11,9 +11,9 @@ included:
   - scripts/generate_menu_bar_gifs.swift
 
 excluded:
-  - FluidAudio
   - .build
   - app/MeetingTranscriber/.build
+  - app/MeetingTranscriber/.build-appstore
   - tools/audiotap/.build
   - tools/meeting-simulator/.build
 
@@ -98,7 +98,8 @@ opt_in_rules:
 analyzer_rules:
   - unused_declaration
   # unused_import omitted: results differ between xcodebuild (CI) and swift build (local)
-  # due to implicit framework linking in Xcode SDK. Run locally with scripts/lint.sh if needed.
+  # due to implicit framework linking in Xcode SDK. Run the rules listed here locally
+  # with `scripts/lint.sh --analyze`.
 
 disabled_rules:
   - trailing_comma        # Project convention — intentional trailing commas (99 occurrences)
@@ -165,3 +166,25 @@ file_name:
     - TestHelpers.swift
     - WhisperKitDualSourceTests.swift
     - main.swift
+
+custom_rules:
+  # A test suite opened with a plain name keeps its plist in ~/Library/Preferences,
+  # and cfprefsd writes that file back seconds after the test process exits, so no
+  # teardown can remove it. DefaultsSuite.open files the suite in a scratch folder
+  # of the process's own instead; see Tests/DefaultsSuite.swift. Only the app's
+  # tests: the tools packages' tests (audiotap, mt-cli) open no defaults suite
+  # and have no DefaultsSuite to point at.
+  scratch_defaults_suite:
+    name: "Scratch defaults suite"
+    regex: '(UserDefaults\??|\.init)\(\s*suiteName\s*:'
+    included: '/app/MeetingTranscriber/Tests/'
+    excluded: '/Tests/DefaultsSuite\.swift$'
+    excluded_match_kinds:
+      - comment
+      - comment.mark
+      - comment.url
+      - doccomment
+      - doccomment.field
+      - string
+    message: "Open test suites with DefaultsSuite.open(_:), which keeps their file out of ~/Library/Preferences"
+    severity: error

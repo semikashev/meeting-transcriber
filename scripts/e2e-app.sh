@@ -8,7 +8,7 @@
 #
 # This is the production-app E2E path, intentionally separate from the
 # fixture-based component E2E tests in `app/MeetingTranscriber/Tests/*E2E*.swift`
-# (which run on PR-CI). Rationale and history: see CLAUDE.md > E2E architecture.
+# (which run on PR-CI). Rationale and history: see the e2e-architecture skill.
 #
 # Prerequisites on the runner host (one-time setup):
 #   - Xcode at /Applications/Xcode.app (xcode-select pointed there)
@@ -45,6 +45,9 @@ QUIT_FOREIGN_APP=false   # hand-runs: quit a dev app this driver did not start i
 ECHO_CANCEL=false        # same two pairs with the canceller ON: assert the far end is taken out of the mic audio (see run_echo_cancel)
 QUIT_FLUSH=false         # quit with a manual recording running + assert the recording survives as a job (issue #745, see run_quit_flush)
 MIC_STALL=""             # stall | stall-after-delivery: withhold the mic's buffers and assert the progress watchdog (see run_mic_stall)
+UPGRADE=false            # start the build on the data v0.8.1 leaves behind, in an isolated home (see run_upgrade)
+PROTOCOL_LANE=false      # generate the protocol through a local OpenAI-compatible stub and assert request + file (see run_protocol_lane)
+PROTOCOL_REPAIR=false    # only finish what a killed --protocol run left on the host, then exit (see _pp_repair)
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -71,21 +74,32 @@ while [ $# -gt 0 ]; do
         --quit-flush)       QUIT_FLUSH=true ;;
         --mic-stall)        MIC_STALL=stall ;;
         --mic-stall-late)   MIC_STALL=stall-after-delivery ;;
+        --upgrade)          UPGRADE=true ;;
+        --protocol)         PROTOCOL_LANE=true ;;
+        --protocol-repair)  PROTOCOL_REPAIR=true ;;
         -h|--help)
             cat <<'HELP'
 Usage: e2e-app.sh [--no-build] [--keep-app] [--two-meetings] [--record-only]
                   [--reimport-recorded | --reimport-latest] [--keep-recordings]
                   [--naming-escape] [--naming-switch] [--echo-bleed] [--echo-cancel]
-                  [--naming-confirm] [--quit-flush] [--fixture path/to.wav]
+                  [--naming-confirm] [--quit-flush] [--upgrade] [--protocol]
+                  [--fixture path/to.wav]
 
   --no-build           Skip build/deploy/re-sign; use ~/Applications/MeetingTranscriber-Dev.app as-is.
   --keep-app           Leave the dev app running on exit. Default: quit it.
   --two-meetings       Run two meetings back-to-back (cooldown + state-reset coverage).
+                       Also the title-source check: meeting 1 must carry the
+                       simulator's window title and app name, meeting 2 plays
+                       with a window title equal to the app name and must carry
+                       the "MeetingSimulator Call" placeholder (see --title-source).
   --mic-only           Record the microphone with no app audio (issue #633) via
                        POST /v1/record, and assert the sidecar carries a mic track
                        and NO app track. Reroutes the default OUTPUT to BlackHole
                        2ch for the lane's duration so the loopback input has
-                       something to hear, and restores it on any exit.
+                       something to hear, and restores it on any exit. Also
+                       the live check of POST /v1/watch's refusal: a start
+                       during the manual recording must answer 409 and
+                       change nothing.
   --record-only        Enable record-only mode: assert on sidecar JSON + mix WAV instead
                        of transcript/protocol. Exercises the WatchLoop branch that
                        skips VAD/transcription/diarization/protocol generation.
@@ -139,8 +153,9 @@ Usage: e2e-app.sh [--no-build] [--keep-app] [--two-meetings] [--record-only]
                        lanes), reads GET /v1/jobs/<id>/naming, POSTs an anonymous
                        Speaker A / Speaker B mapping, then asserts the confirmed
                        names land as transcript speaker labels, the raw
-                       diarization labels are gone, and the speaker DB learned the
-                       voices. Standalone lane (incompatible with the other lane
+                       diarization labels are gone, the speaker DB learned the
+                       voices, and (in CI) a second copy of the fixture is
+                       suggested the confirmed names. Standalone lane (incompatible with the other lane
                        flags). Under CI it snapshots + restores the runner's real
                        speakers.json / recognition_log.jsonl so confirming never
                        pollutes the persistent speaker DB; that snapshot/restore
@@ -155,7 +170,7 @@ Usage: e2e-app.sh [--no-build] [--keep-app] [--two-meetings] [--record-only]
                        on the first job and one on the second, which moves the
                        surviving R_ label to a lower row. The lane asserts that
                        geometry, then (with BOTH jobs still pending) switches the
-                       dialog's segmented job picker to the second job so the same
+                       dialog's job picker to the second job so the same
                        view is reused, posts real keystrokes into the surviving R_
                        field from outside the process, and asserts the app is
                        still alive, the text landed in that row and nowhere else,
@@ -170,7 +185,9 @@ Usage: e2e-app.sh [--no-build] [--keep-app] [--two-meetings] [--record-only]
                        the detected meeting title is the clean "MeetingSimulator Call"
                        placeholder — not the raw IOKit assertion name. Fails against
                        the pre-fix detector, so it proves the deployed
-                       detection → title-selection chain end-to-end.
+                       detection → title-selection chain end-to-end. CI runs this
+                       check as meeting 2 of --two-meetings; the flag stays for
+                       running it on its own by hand.
   --echo-bleed         Assert the echo-bleed verdict end to end. Synthesises two
                        dual-source pairs from the shipped fixtures — one whose
                        microphone track carries the app track back from the
@@ -206,7 +223,7 @@ Usage: e2e-app.sh [--no-build] [--keep-app] [--two-meetings] [--record-only]
                        reply; which one is logged from AppKit's own log, and
                        either way the held quit must end the app exactly once,
                        leave no app or 'log stream' process, and keep the
-                       recording.
+                       recording. Hand-run only; see the lane header.
                        Does NOT prove that the snapshot flush is what saved the
                        job (a no-op flush stays green) or anything about a
                        logout. Each launch must have exactly one
@@ -246,6 +263,49 @@ Usage: e2e-app.sh [--no-build] [--keep-app] [--two-meetings] [--record-only]
   --mic-stall-late     Same, but the microphone delivers for its first 10 s and
                        then stops with no configuration change: the shape a
                        one-shot first-buffer check never sees.
+  --upgrade            Start this build on what v0.8.1 leaves on disk (a model in
+                       Documents/huggingface, an unreadable speakers.json, an
+                       interrupted queued job, a finished-job record), in an
+                       isolated home removed on exit and with the network closed
+                       but for localhost; what it asserts is listed at
+                       run_upgrade. Clones the model from E2E_UPGRADE_MODEL_SOURCE
+                       (a `huggingface` folder with openai_whisper-small and its
+                       tokenizer), by default the account's app model folder,
+                       which it only reads. Records nothing, so needs no TCC
+                       grant and no audio device. Standalone lane.
+  --protocol           Run the protocol stage against a local OpenAI-compatible
+                       stub (scripts/fixtures/openai-chat-stub.py on a free
+                       127.0.0.1 port) instead of a real model. Imports a short
+                       fixture twice via POST /v1/jobs. First with the stub
+                       answering: asserts the one chat-completions request it got
+                       (model, stream, max_tokens, temperature set and top_p
+                       absent, the protocol language in the system prompt, the
+                       transcript file as the user message), then the job done with
+                       no protocol warning and protocolPath naming a file in the
+                       output folder that is the stub's reply plus the
+                       transcript. Then with the stub answering HTTP 500:
+                       asserts the job done with the "transcript saved" warning,
+                       no protocolPath and no protocol file. Changes the host's
+                       protocol, OpenAI and diarize/output settings and restores
+                       them on exit, or on the next run of this script (or
+                       --protocol-repair) when one was killed. Leaves the API
+                       key alone: the request carries whatever key the host has,
+                       and the stub never logs it. Quits the app on every exit,
+                       since it holds those settings in memory, and removes the
+                       jobs' transcripts, protocols and sidecars.
+                       Outside CI it refuses, changing nothing, while the
+                       pipeline queue or the staging folder holds work the
+                       launch would send to the stub. Needs python3. Standalone
+                       lane; incompatible with --keep-app.
+  --protocol-repair    Finish what a killed --protocol run left: quit a running
+                       dev app (it may hold the lane's settings), stop a leftover
+                       stub, restore the recorded settings, drop the lane's
+                       unfinished jobs from the queue snapshot and remove its
+                       output files. Exits non-zero when a setting did not come
+                       back. A no-op when nothing is left. CI runs it as an
+                       always() step after the lane. Outside CI a running dev
+                       app is quit only with --quit-foreign-app. Runs nothing
+                       else; incompatible with the lane flags.
   --fixture            Audio fixture for meeting-simulator. Default: two_speakers_de.wav.
   --quit-foreign-app   Outside CI the driver refuses to start while a dev app it did
                        not launch is running (someone may be using it). Pass this
@@ -263,6 +323,33 @@ done
 # through to whichever branch the dispatch chain checks first.
 if [ "$REIMPORT_RECORDED" = true ] && [ "$REIMPORT_LATEST" = true ]; then
     echo "Error: --reimport-recorded and --reimport-latest are mutually exclusive" >&2
+    exit 2
+fi
+# --protocol points the host's protocol provider at a stub for the whole run, so
+# any other lane in the same run would send its transcript there, and its own
+# settings (diarize off among them) would change what that lane asserts.
+if [ "$PROTOCOL_LANE" = true ] && { [ "$NAMING_CONFIRM" = true ] || [ "$NAMING_ESCAPE" = true ] \
+    || [ "$NAMING_SWITCH" = true ] || [ "$RECORD_ONLY" = true ] || [ "$REIMPORT_RECORDED" = true ] \
+    || [ "$REIMPORT_LATEST" = true ] || [ "$MIC_DEVICE_CHANGE" = true ] || [ "$CRASH_RECOVERY" = true ] \
+    || [ "$REDEPLOY_ONLY" = true ] || [ "$TWO_MEETINGS" = true ] || [ "$MIC_ONLY" = true ] \
+    || [ "$TITLE_SOURCE" = true ] || [ "$ECHO_BLEED" = true ] || [ "$ECHO_CANCEL" = true ] \
+    || [ "$QUIT_FLUSH" = true ] || [ -n "$MIC_STALL" ] || [ "$UPGRADE" = true ] \
+    || [ -n "$SIMULATOR_FIXTURE" ]; }; then
+    echo "Error: --protocol is a standalone lane; incompatible with the other lane flags and --fixture" >&2
+    exit 2
+fi
+if [ "$PROTOCOL_REPAIR" = true ] && { [ "$PROTOCOL_LANE" = true ] || [ "$NAMING_CONFIRM" = true ] \
+    || [ "$NAMING_ESCAPE" = true ] || [ "$NAMING_SWITCH" = true ] || [ "$RECORD_ONLY" = true ] \
+    || [ "$REIMPORT_RECORDED" = true ] || [ "$REIMPORT_LATEST" = true ] || [ "$MIC_DEVICE_CHANGE" = true ] \
+    || [ "$CRASH_RECOVERY" = true ] || [ "$REDEPLOY_ONLY" = true ] || [ "$TWO_MEETINGS" = true ] \
+    || [ "$MIC_ONLY" = true ] || [ "$TITLE_SOURCE" = true ] || [ "$ECHO_BLEED" = true ] \
+    || [ "$ECHO_CANCEL" = true ] || [ "$QUIT_FLUSH" = true ] || [ -n "$MIC_STALL" ] \
+    || [ "$UPGRADE" = true ] || [ -n "$SIMULATOR_FIXTURE" ]; }; then
+    echo "Error: --protocol-repair runs nothing but the repair; incompatible with the lane flags and --fixture" >&2
+    exit 2
+fi
+if [ "$PROTOCOL_LANE" = true ] && [ "$APP_AFTER" = leave ]; then
+    echo "Error: --protocol quits the app on exit, which holds the lane's settings in memory; incompatible with --keep-app" >&2
     exit 2
 fi
 
@@ -367,6 +454,20 @@ if [ -n "$MIC_STALL" ] && { [ "$NAMING_CONFIRM" = true ] || [ "$NAMING_ESCAPE" =
     echo "Error: --mic-stall/--mic-stall-late is a standalone lane; incompatible with the other lane flags and --fixture" >&2
     exit 2
 fi
+# --upgrade launches its own app in its own home, with its own settings and the
+# network closed; any other lane in the same run would run against that home or
+# without network, and --keep-app would leave an app writing into a home the
+# lane removes.
+if [ "$UPGRADE" = true ] && { [ "$NAMING_CONFIRM" = true ] || [ "$NAMING_ESCAPE" = true ] \
+    || [ "$NAMING_SWITCH" = true ] || [ "$RECORD_ONLY" = true ] || [ "$REIMPORT_RECORDED" = true ] \
+    || [ "$REIMPORT_LATEST" = true ] || [ "$MIC_DEVICE_CHANGE" = true ] || [ "$CRASH_RECOVERY" = true ] \
+    || [ "$REDEPLOY_ONLY" = true ] || [ "$TWO_MEETINGS" = true ] || [ "$MIC_ONLY" = true ] \
+    || [ "$TITLE_SOURCE" = true ] || [ "$ECHO_BLEED" = true ] || [ "$ECHO_CANCEL" = true ] \
+    || [ "$QUIT_FLUSH" = true ] || [ -n "$MIC_STALL" ] || [ -n "$SIMULATOR_FIXTURE" ] \
+    || [ "$APP_AFTER" = leave ]; }; then
+    echo "Error: --upgrade is a standalone lane; incompatible with the other lane flags, --fixture and --keep-app" >&2
+    exit 2
+fi
 
 # --mic-device-change needs the fault-injection seam compiled in, so it must
 # build — `defaults`/runtime flags can't add the -DE2E_FAULT_INJECTION code.
@@ -384,6 +485,57 @@ if [ "$REDEPLOY_ONLY" = true ] && [ "$MIC_DEVICE_CHANGE" = true ]; then
     echo "Error: --redeploy-only restores the canonical bundle; incompatible with --mic-device-change" >&2
     exit 2
 fi
+# One lane per run, for every pair the per-lane checks above do not name: the
+# dispatch chain runs only the lane it tests first, so a second one would pass
+# without running. Not lanes of their own: --two-meetings next to --record-only
+# (two record-only meetings), --record-only next to --reimport-recorded (which
+# implies it) and --keep-recordings (a modifier).
+_LANES=""
+_add_lane() { [ "$1" != true ] || _LANES="$_LANES $2"; }
+_add_lane "$REIMPORT_LATEST" --reimport-latest
+_add_lane "$REIMPORT_RECORDED" --reimport-recorded
+# --reimport-recorded implies --record-only.
+if [ "$REIMPORT_RECORDED" = false ]; then
+    _add_lane "$RECORD_ONLY" --record-only
+fi
+# --two-meetings on its own is a lane; next to --record-only it is a modifier.
+if [ "$RECORD_ONLY" = false ] || [ "$REIMPORT_RECORDED" = true ]; then
+    _add_lane "$TWO_MEETINGS" --two-meetings
+fi
+_add_lane "$MIC_ONLY" --mic-only
+_add_lane "$MIC_DEVICE_CHANGE" --mic-device-change
+_add_lane "$CRASH_RECOVERY" --crash-recovery
+_add_lane "$REDEPLOY_ONLY" --redeploy-only
+_add_lane "$NAMING_CONFIRM" --naming-confirm
+_add_lane "$NAMING_ESCAPE" --naming-escape
+_add_lane "$NAMING_SWITCH" --naming-switch
+_add_lane "$TITLE_SOURCE" --title-source
+_add_lane "$ECHO_BLEED" --echo-bleed
+_add_lane "$ECHO_CANCEL" --echo-cancel
+_add_lane "$QUIT_FLUSH" --quit-flush
+if [ -n "$MIC_STALL" ]; then
+    _add_lane true "--mic-stall/--mic-stall-late"
+fi
+_add_lane "$UPGRADE" --upgrade
+_add_lane "$PROTOCOL_LANE" --protocol
+_add_lane "$PROTOCOL_REPAIR" --protocol-repair
+case "$_LANES" in
+    *" "*" "*)
+        echo "Error: one lane per run; got$_LANES" >&2
+        exit 2
+        ;;
+esac
+# The lane's name in file names: its flag without the dashes, `meeting` for the
+# default single meeting, the mic-stall variant spelled out, and the diarizer
+# mode appended when MTT_DIARIZER_MODE picks one (the Sortformer lane is the
+# default meeting under another mode). Names the files this lane leaves (its
+# simulator log; in CI, its diagnostics folder) so a later lane in the same job
+# overwrites none of them.
+_LANE_SLUG="${_LANES# }"
+_LANE_SLUG="${_LANE_SLUG#--}"
+[ -z "$MIC_STALL" ] || _LANE_SLUG="mic-$MIC_STALL"
+[ -n "$_LANE_SLUG" ] || _LANE_SLUG=meeting
+[ -z "${MTT_DIARIZER_MODE:-}" ] || _LANE_SLUG="$_LANE_SLUG-$(printf '%s' "$MTT_DIARIZER_MODE" | tr -c 'A-Za-z0-9-' '_')"
 # Export before the build step below so run_app.sh adds -DE2E_FAULT_INJECTION.
 # --mic-stall may run --no-build against a fault build already deployed; the
 # preflight checks that the deployed bundle really is one.
@@ -460,6 +612,161 @@ if [ -n "$MIC_STALL" ]; then
     [ -d "$HOME/Library/Application Support/FluidAudio" ] \
         && ln -s "$HOME/Library/Application Support/FluidAudio" "$APP_HOME/Library/Application Support/FluidAudio"
 fi
+# The upgrade lane's home: a temp dir of its own like the mic-stall lane's, but
+# seeded with what v0.8.1 leaves behind rather than empty, and with no link to
+# the host's model caches, because the WhisperKit model is the thing under test
+# and the lane switches diarization and VAD off so no other model is needed.
+# `_ug_cleanup` (armed here, run again by on_exit) quits the app this lane
+# launched, since nothing else of value runs in that home, and then removes the
+# home, unless the app could not be stopped. Keyed on the pid `_ug_launch`
+# records at once, not on the readiness poll's record, so a launch whose RPC
+# never came up is stopped too; a run that never launched leaves any running
+# dev app alone, since that one is not writing into this home.
+_UG_HOME_STEM=e2e-upgrade-home
+_ug_cleanup() {
+    [ -n "${_UG_HOME_PARENT:-}" ] && declare -F e2e_is_lane_home >/dev/null || return 0
+    e2e_is_lane_home "$APP_HOME" "$_UG_HOME_STEM" "$_UG_HOME_PARENT" || return 0
+    # Status 2 is "gone, ended by signal" (see quit_running_app): the home can
+    # go then, nothing writes there any more.
+    local quit_status=0
+    if [ -n "${_UG_APP_PID:-}" ] && kill -0 "$_UG_APP_PID" 2>/dev/null; then
+        quit_running_app || quit_status=$?
+    fi
+    if [ "$quit_status" -eq 1 ]; then
+        printf '[e2e-app] [upgrade] the app could not be stopped; leaving its home %s\n' "$APP_HOME" >&2
+        return 0
+    fi
+    rm -rf "${APP_HOME:?}"
+}
+if [ "$UPGRADE" = true ]; then
+    _UG_HOME_PARENT="${TMPDIR:-/tmp}"
+    _UG_HOME_PARENT="${_UG_HOME_PARENT%/}"   # the app reports its paths without it
+    APP_HOME="$(mktemp -d "$_UG_HOME_PARENT/$_UG_HOME_STEM.XXXXXX")"
+    trap '_ug_cleanup' EXIT
+    mkdir -p "$APP_HOME/Library/Application Support" "$APP_HOME/Documents" "$APP_HOME/Downloads"
+fi
+# The protocol lane's state. What has to outlive a killed run sits in the same
+# directory as the mic-stall lane's records, so the repair at the start of every
+# later run (and the workflow's always-run step, --protocol-repair) can finish
+# what a killed run left: the settings it overrides as they were before, the ids
+# of the jobs it enqueued, and the files those jobs wrote into the host's output
+# folder.
+#
+# The lane does not touch the API key. The app reads it from the Keychain, and
+# a lane-owned item would mean editing the user keychain search list, which is
+# shared with the second runner and with an installed app on the same host. So
+# the request carries whatever key the host has configured, the stub never logs
+# it, and where the key goes is covered by OpenAIProtocolGeneratorTests.
+# The deployed dev app's process, for every pgrep in this script (here because
+# the protocol helpers below need it before the preflight runs).
+_DEV_APP_PATTERN="MeetingTranscriber-Dev.app/Contents/MacOS/MeetingTranscriber"
+_PP_RECORD="$_MS_STATE_DIR/protocol-lane-defaults"
+_PP_JOBS_RECORD="$_MS_STATE_DIR/protocol-lane-jobs"
+_PP_OUTPUTS_RECORD="$_MS_STATE_DIR/protocol-lane-outputs"
+# The host's own data and output folders, not $APP_HOME's: the lane never runs
+# in an isolated home, and the repair runs from every lane, --mic-stall and
+# --upgrade (whose $APP_HOME is a temp dir) included.
+_PP_HOST_SNAPSHOT="$HOME/Library/Application Support/MeetingTranscriber/ipc/pipeline_queue.json"
+_PP_HOST_OUTPUT_DIR="$HOME/Downloads/MeetingTranscriber"
+_PP_KEYS=(protocolProvider protocolLanguage openAIEndpoint openAIModel openAITemperature openAITopP
+    diarize saveRawTranscriptSeparately includeFullTranscriptInProtocol useAITitleForFilenames)
+_PP_MODEL="e2e-stub-model"
+_PP_LANGUAGE="French"
+_PP_TEMPERATURE=0.5   # exactly representable, so the JSON number compares exactly
+_PP_REPLY=$'# Meeting Protocol - E2E Stub Reply\n\n## Summary\nCanned protocol from the e2e chat-completions stub.'
+_PP_DIR=""
+_PP_STUB_PID=""
+
+# Finish what the lane left on the host: its settings, its unfinished jobs in
+# the queue snapshot, its output files. Idempotent, and every step keeps its own
+# record until it is done, so a later run retries only what is left. Returns 1
+# when a setting did not come back.
+#
+# The jobs are dropped by id, and only while no MeetingTranscriber runs at all
+# (the installed app shares the snapshot and could save it between the read and
+# the rename): a quit saves a job still in flight into the snapshot, and the
+# host's next launch would resume it under the host's own settings from a
+# fixture copy that no longer exists. Finished ones are left; the app discards
+# them at load. While any MeetingTranscriber runs they cannot be dropped, and
+# the next dev launch would resume them, so that is a failure too. The output
+# files are removed only inside the output folder. A killed run's stub is
+# matched by the lane's own temp-dir argument, which no other stub (the helper
+# test's, for one) carries.
+_pp_repair() {
+    local status=0 snapshot="$_PP_HOST_SNAPSHOT" ids f
+    pkill -f "openai-chat-stub.py --port-file /tmp/e2e-protocol\." 2>/dev/null || true
+    if [ -f "$_PP_RECORD" ]; then
+        if defaults_restore_record "$_PP_RECORD"; then
+            printf '[e2e-app] [protocol] protocol settings restored to the values before the lane\n'
+        else
+            printf '[e2e-app] WARNING: [protocol] some protocol settings were not restored; %s keeps them for the next run\n' "$_PP_RECORD" >&2
+            status=1
+        fi
+    fi
+    if [ -f "$_PP_JOBS_RECORD" ] && { pgrep -f "$_DEV_APP_PATTERN" >/dev/null 2>&1 || [ -n "$(non_dev_meetingtranscriber_pids)" ]; }; then
+        printf '[e2e-app] WARNING: [protocol] a MeetingTranscriber is running, so the lane jobs a killed run left (%s) cannot be dropped from the queue snapshot; quit it and rerun\n' "$_PP_JOBS_RECORD" >&2
+        status=1
+    elif [ -f "$_PP_JOBS_RECORD" ]; then
+        ids="$(jq -R 'ascii_downcase' "$_PP_JOBS_RECORD" | jq -s -c .)"
+        if [ ! -f "$snapshot" ]; then
+            rm -f "$_PP_JOBS_RECORD"
+        elif jq --argjson ids "$ids" \
+            'if type == "array" then map(select(((.id // "") | ascii_downcase) as $id
+                | ($ids | index($id)) == null or .state == "done" or .state == "error")) else . end' \
+            "$snapshot" >"$snapshot.e2e-tmp" 2>/dev/null && mv "$snapshot.e2e-tmp" "$snapshot"; then
+            rm -f "$_PP_JOBS_RECORD"
+        else
+            rm -f "$snapshot.e2e-tmp"
+            printf '[e2e-app] WARNING: [protocol] could not drop the lane jobs from %s; kept %s\n' "$snapshot" "$_PP_JOBS_RECORD" >&2
+        fi
+    fi
+    if [ -f "$_PP_OUTPUTS_RECORD" ]; then
+        while IFS= read -r f; do
+            case "$f" in
+                "$_PP_HOST_OUTPUT_DIR"/*) [ -f "$f" ] && rm -f "$f" && printf '[e2e-app] [protocol] removed %s\n' "$f" ;;
+            esac
+        done <"$_PP_OUTPUTS_RECORD"
+        rm -f "$_PP_OUTPUTS_RECORD"
+    fi
+    return "$status"
+}
+
+# Undo everything the protocol lane changed; idempotent, so the early trap and
+# on_exit can both run it. Returns 1 when the host's settings could not be put
+# back, which on_exit turns into a red run.
+#
+# The fast steps first and with INT/TERM ignored: a second signal during the
+# slow quit would otherwise end on_exit early (it runs once) with nothing
+# restored. Then any dev app that is still running: every other one was quit
+# before this lane launched, and it holds the lane's settings in memory (a stub
+# endpoint, diarize off), so left running after a failure it would process the
+# host's next meeting with them, after the restore on disk had already read back
+# clean. Stopping it also means no lane job can write a file after the removal.
+_pp_cleanup() {
+    local status=0
+    trap '' INT TERM
+    if [ -n "$_PP_STUB_PID" ]; then
+        kill "$_PP_STUB_PID" 2>/dev/null || true
+        wait "$_PP_STUB_PID" 2>/dev/null || true
+        _PP_STUB_PID=""
+    fi
+    rm -f "$_PP_RECORD.tmp"
+    if [ -f "$_PP_RECORD" ]; then
+        defaults_restore_record "$_PP_RECORD" || status=1
+    fi
+    if pgrep -f "$_DEV_APP_PATTERN" >/dev/null 2>&1; then
+        quit_running_app \
+            || printf '[e2e-app] WARNING: [protocol] the dev app could not be stopped; it still holds the lane settings in memory\n' >&2
+    fi
+    _pp_repair || status=1
+    if [ -n "$_PP_DIR" ] && [ -d "$_PP_DIR" ]; then
+        rm -rf "$_PP_DIR"
+        _PP_DIR=""
+    fi
+    return "$status"
+}
+
+# shellcheck disable=SC2034 # read by the RPC helpers in lib/e2e-helpers.sh
 RPC_TOKEN_FILE="$APP_HOME/Library/Application Support/MeetingTranscriber/.rpc-token"
 RPC_BASE="http://127.0.0.1:9876"
 
@@ -471,26 +778,29 @@ RPC_BASE="http://127.0.0.1:9876"
 OUTPUT_DIR="$APP_HOME/Downloads/MeetingTranscriber"
 RECORDINGS_DIR="$OUTPUT_DIR/recordings"
 # `find -newer` marker so cleanup only touches THIS run's files — never
-# pre-existing user data (see CLAUDE.md feedback on destructive FS scans).
+# pre-existing user data.
 RECORD_ONLY_MARKER="/tmp/e2e-app-record-only-marker.$$"
+# The simulator's output, one file per lane (see _LANE_SLUG) rather than one
+# that every lane overwrote, so a failed lane's log outlives the lanes after it.
+SIM_LOG="/tmp/e2e-app-sim-$_LANE_SLUG.log"
+# The shared name the single-lane workflows (e2e-crash-recovery.yml,
+# e2e-mic-device-change.yml) upload; on_exit copies the lane's log there.
+_SIM_LOG_LEGACY="/tmp/e2e-app-sim.log"
 
 [ -n "$SIMULATOR_FIXTURE" ] || SIMULATOR_FIXTURE="$DEFAULT_FIXTURE"
 
-# Content-assertion keywords for the default two_speakers_de fixture. The
-# `run_one_meeting` transcript check greps for these German content words so a
-# live-recorded run can't go green on a >100-byte GARBAGE transcript: an empty
-# file, a wrong-language hallucination, or silent-capture noise all clear the
-# size check but hit zero of these. This list is identical to the xctest E2E's
-# `expectedKeywords` (ParakeetE2ETests.swift / WhisperKitE2ETests.swift) and
-# must stay in sync with them if the fixture is regenerated. The fixture also
-# speaks "Meeting", but neither this list nor the xctest set includes it: it is
-# the one English word, so requiring only German words proves the German
-# fixture actually transcribed rather than an English hallucination.
-# The check itself lives in lib/e2e-helpers.sh as `transcript_is_german` and
-# keys on common German words, NOT on the fixture's script. Recording starts
-# only once the app has DETECTED the meeting, so the opening seconds are never
-# captured and which sentences land shifts run to run; a script-derived list
-# therefore measured recording-start timing, not transcription quality.
+# Content assertion for the default two_speakers_de fixture. The
+# `run_one_meeting` transcript check requires German words so a live-recorded
+# run can't go green on a >100-byte GARBAGE transcript: an empty file, a
+# wrong-language hallucination, or silent-capture noise all clear the size
+# check but hit none of them.
+# The check lives in lib/e2e-helpers.sh as `transcript_is_german` and keys on
+# common German words, NOT on the fixture's script, unlike the xctest E2E's
+# `expectedKeywords`, which check a transcription of the whole fixture.
+# Recording starts only once the app has DETECTED the meeting, so the opening
+# seconds are never captured and which sentences land shifts run to run; a
+# script-derived list therefore measured recording-start timing, not
+# transcription quality.
 # Applied only when the simulator plays the known fixture (and not the
 # mic-device-change survival lane); a custom --fixture keeps only the
 # >100-byte size check.
@@ -504,6 +814,29 @@ IS_DEFAULT_FIXTURE=false
 RPC_READY_TIMEOUT_S=30
 PIPELINE_TIMEOUT_S=240
 
+# How long after the simulator starts a recording must have begun. Detection
+# itself takes two consecutive hits of the 3 s detector poll, so a few seconds;
+# the bound is set from the other side instead: the simulator plays the 49.8 s
+# fixture, so at 40 s only about ten seconds of it are left, which cannot give a
+# transcript that reaches TRANSCRIPT_MIN_COVERAGE_S below. Waiting longer could
+# not rescue the run. Failing here names the likely cause (detector, grants)
+# minutes before the job poll's own timeout would, which can only say that no
+# job arrived. Needs calibrating against the detection latency measured on the
+# runner.
+RECORDING_START_TIMEOUT_S=40
+
+# How far into the recording a transcript of the default fixture must reach,
+# in seconds (transcript_covered_seconds, which underestimates on purpose).
+# Chosen low, since the recording starts only once the meeting is detected and
+# so misses a variable opening stretch: the record-only lane requires 25 s of
+# active speech in the same kind of capture (WAV_VERDICT_FIXTURE_MIN_ACTIVE_S),
+# and 25 s of speech spans at least 25 s, of which the estimate of the last
+# block's length, at four words a second, may see well under half. A
+# transcript that stops short of this covers a small part of what was played,
+# which is the truncation this catches. Calibrate on the runner; the measured
+# values will likely allow a higher floor.
+TRANSCRIPT_MIN_COVERAGE_S=15
+
 # Record-only skips the whole pipeline, so the budget is just: detector
 # notices the simulator stopped (~1 s poll) + endGrace (≥1 s) + recorder
 # finalize (~3 s) + sidecar write (instant). 60 s gives ample buffer.
@@ -516,7 +849,6 @@ RECORD_ONLY_DEADLINE_S=60
 # is 49.8 s long and carries 37.5 s above the threshold) rather than at a token
 # value that any partial capture would clear.
 WAV_VERDICT_THRESHOLD_DBFS=-50
-WAV_VERDICT_MIN_ACTIVE_S=3
 WAV_VERDICT_FIXTURE_MIN_ACTIVE_S=25
 
 # Sidecar write completes before the recorder's async tail bytes do — give
@@ -524,9 +856,10 @@ WAV_VERDICT_FIXTURE_MIN_ACTIVE_S=25
 # Observed worst case on Mini is ~1 s; 2 s is honest margin.
 RECORDER_FINALIZE_WAIT_S=2
 
-# WatchLoop's per-app cooldown (`MeetingDetector.swift` cooldownDuration
-# = 5 s) plus a 3 s buffer so the second meeting isn't suppressed as a
-# re-detection. Bump if MeetingDetector.cooldownDuration grows.
+# The detector's per-app cooldown (`cooldownDuration` = 5 s in
+# PowerAssertionDetector.swift, the detector the simulator's meeting is found
+# by) plus a 3 s buffer so the second meeting isn't suppressed as a
+# re-detection. Bump if that cooldownDuration grows.
 INTER_MEETING_COOLDOWN_S=8
 
 # --- helpers --------------------------------------------------------------
@@ -534,12 +867,63 @@ INTER_MEETING_COOLDOWN_S=8
 log()  { printf '[e2e-app] %s\n' "$*"; }
 fail() { printf '[e2e-app] FAIL: %s\n' "$*" >&2; exit 1; }
 
+# _start_simulator <label> <simulator args...> — start the meeting simulator in
+# the background (its pid in SIM_PID), its output appended to this lane's
+# SIM_LOG under a header naming the meeting; the first start of a run empties
+# the log, so it holds this run only.
+_SIM_LOG_STARTED=""
+_start_simulator() {
+    local label="$1"
+    shift
+    if [ -z "$_SIM_LOG_STARTED" ]; then
+        : >"$SIM_LOG"
+        _SIM_LOG_STARTED=1
+    fi
+    printf '=== %s: meeting-simulator %s\n' "$label" "$*" >>"$SIM_LOG"
+    "$SIMULATOR_BIN" "$@" >>"$SIM_LOG" 2>&1 &
+    SIM_PID=$!
+}
+
 # shellcheck source=lib/e2e-helpers.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/e2e-helpers.sh"
+# Ends what a timed-out earlier step left running, then records this
+# driver for the next (see e2e_register_driver).
+e2e_register_driver
+# CI only: where a failed lane leaves its diagnostics for the workflow to
+# upload (one folder per lane, see _write_lane_diagnostics), and the marker
+# that tells this run's crash reports from older ones. Under $RUNNER_TEMP,
+# which the runner empties per job, so a run that dies before on_exit leaves
+# nothing behind for long.
+_E2E_DIAG_MARKER=""
+if [ "${GITHUB_ACTIONS:-}" = "true" ] && [ -n "${RUNNER_TEMP:-}" ]; then
+    _E2E_DIAG_MARKER="$RUNNER_TEMP/e2e-diag-marker.$$"
+    touch "$_E2E_DIAG_MARKER" 2>/dev/null || _E2E_DIAG_MARKER=""
+fi
 # For LOCALVQE_RESOURCE_GLOB, so the echo-cancellation lane's bundle check and
 # the install it checks for agree on what a model file looks like.
 # shellcheck source=lib/localvqe-resources.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/localvqe-resources.sh"
+# The v0.8.1 on-disk shapes and folder fingerprints the upgrade lane seeds and
+# compares with.
+# shellcheck source=lib/upgrade-seed.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/upgrade-seed.sh"
+
+# --protocol-repair: nothing else of this script runs. The dev app goes first,
+# since a running one holds the lane's settings and is what would keep a job in
+# flight; any dev app here is a leftover (CI runs this right after the lane).
+if [ "$PROTOCOL_REPAIR" = true ]; then
+    if pgrep -f "$_DEV_APP_PATTERN" >/dev/null 2>&1; then
+        # In CI it is the lane's own leftover; anywhere else it may be someone's
+        # session, so the same rule as the start-up guard: only when told.
+        [ "${GITHUB_ACTIONS:-}" = "true" ] || [ "$QUIT_FOREIGN_APP" = true ] \
+            || fail "[protocol-repair] the dev app is running and may be in use. Quit it yourself, or pass --quit-foreign-app if it is the lane's leftover."
+        log "[protocol-repair] quitting the running dev app"
+        quit_running_app || fail "[protocol-repair] the dev app could not be stopped"
+    fi
+    _pp_repair || fail "[protocol-repair] not everything could be undone (see the warning above; records in $_MS_STATE_DIR)"
+    log "[protocol-repair] nothing of a --protocol run is left"
+    exit 0
+fi
 
 require_command() {
     command -v "$1" >/dev/null || fail "missing command: $1"
@@ -547,15 +931,48 @@ require_command() {
 
 RPC_TOKEN=""  # populated once when the token file appears
 
-# Returns empty string + exit 0 on transient curl failure so callers in
-# `set -e` poll loops keep going. 15 s timeout covers brief main-thread
-# blocks during model load + audio teardown.
-rpc() {
-    local path="$1"
-    curl --silent --show-error --max-time 15 \
-        --header "Authorization: Bearer $RPC_TOKEN" \
-        "$RPC_BASE$path" 2>/dev/null || true
+# A /v1 job that has stopped moving: what the lanes poll for (rpc_is).
+_JOB_TERMINAL='.state == "done" or .state == "error"'
+
+# _job_parked <label> <job> — a poll_rpc predicate on GET /v1/jobs/<job>: true
+# once the job waits at speaker naming. A job that ends first (error or done)
+# can never park, so it fails the lane at once with what happened, instead of
+# being waited out.
+_job_parked() {
+    case "$(rpc_field '.state // empty')" in
+        speakerNamingPending) return 0 ;;
+        error) fail "$1: job $2 errored before reaching speaker naming: $(rpc_field '.error // "<none>"')" ;;
+        done) fail "$1: job $2 finished without parking at speaker naming (diarization produced no dialog?)" ;;
+    esac
+    return 1
 }
+
+# _await_job_done <label> <what> <job> <interval_s> <fail-fn> [poll_rpc options]
+# Waits up to PIPELINE_TIMEOUT_S for the job to reach a terminal state and
+# requires it to be done, failing through <fail-fn> (each lane has its own)
+# with the poll's status worded by rpc_why. Leaves the final GET /v1/jobs/<job>
+# body in RPC_BODY. The options go to poll_rpc before the window (--not-yet 404
+# for a job that is restored rather than enqueued).
+_await_job_done() {
+    local label="$1" what="$2" job="$3" interval="$4" failer="$5" state
+    shift 5
+    poll_rpc "/v1/jobs/$job" "$@" --each assert_app_alive --judge-deadline-read "$PIPELINE_TIMEOUT_S" "$interval" \
+        rpc_is "$_JOB_TERMINAL" \
+        || "$failer" "$(rpc_why $? "/v1/jobs/$job" "$label: $what ($job) did not reach a terminal state within ${PIPELINE_TIMEOUT_S}s")"
+    state="$(jq -r '.state' <<<"$RPC_BODY")"
+    [ "$state" = "done" ] \
+        || "$failer" "$label: $what ($job) ended as '$state', expected done. error=$(jq -r '.error // "<none>"' <<<"$RPC_BODY")"
+}
+
+# Resolve a job parked at speaker naming with a Skip, so the dialog does not
+# reopen on the next launch. Best effort, for teardown. The empty body still
+# goes out as an explicit zero Content-Length, which a POST with no body needs.
+_naming_skip() { rpc_post_status "/v1/jobs/$1/naming/skip" '' 10 >/dev/null; }
+
+# A poll_rpc --each check for teardown: non-zero (which stops the poll with
+# status 4) once the dev app is gone, instead of ending the run as
+# assert_app_alive does, so a crashed app does not cost a whole window per job.
+_dev_app_running() { pgrep -f "$_DEV_APP_PATTERN" >/dev/null 2>&1; }
 
 
 # --- Mic-only lane: audio routing ------------------------------------------
@@ -676,6 +1093,169 @@ _mic_only_self_heal_output() {
 # unhealed poisons the mic track of every later lane on this host.
 _mic_only_self_heal_output
 
+# --- Upgrade lane: seed and launch ------------------------------------------
+#
+# What v0.8.1 leaves on disk, laid out in the lane's own home (APP_HOME, a
+# mktemp dir; see `_ug_cleanup`), and the launch that starts the new build on
+# it. The on-disk shapes come from scripts/lib/upgrade-seed.sh, which says what
+# each one is derived from. The assertions are at `run_upgrade`.
+
+# The variant the lane loads, one it seeds incomplete next to it, and the
+# tokenizer the loaded one needs. Small, because the lane needs a real model
+# that loads, not a large one.
+_UG_VARIANT=openai_whisper-small
+_UG_INCOMPLETE_VARIANT=openai_whisper-base
+_UG_TOKENIZER=whisper-small
+# The account's real model folders, old and new location. What the lane's app
+# would touch there if the isolated home did not hold (this variant, its
+# download metadata and its tokenizer) is fingerprinted before and after; not
+# the whole folders, which other jobs on the same account change meanwhile.
+_UG_REAL_DOCS_HF="$HOME/Documents/huggingface"
+_UG_REAL_APP_HF="$HOME/Library/Application Support/MeetingTranscriber/huggingface"
+_ug_real_fingerprint() {
+    local base
+    for base in "$_UG_REAL_DOCS_HF" "$_UG_REAL_APP_HF"; do
+        echo "== $base"
+        upgrade_tree_fingerprint "$base/$UPGRADE_WHISPERKIT_REPO/$_UG_VARIANT"
+        upgrade_tree_fingerprint "$base/$UPGRADE_WHISPERKIT_REPO/.cache/huggingface/download/$_UG_VARIANT"
+        upgrade_tree_fingerprint "$base/$UPGRADE_TOKENIZER_ORG/$_UG_TOKENIZER"
+    done
+}
+# Where the model is cloned from: a `huggingface` folder in the current layout.
+# CI points it at the runner's pre-warmed test home; by default it is the
+# account's own app model folder. Only ever read.
+_UG_MODEL_SOURCE="${E2E_UPGRADE_MODEL_SOURCE:-$_UG_REAL_APP_HF}"
+# What the lane imports to have the queue built (see run_upgrade): short, since
+# only the restored job's transcript is read.
+_UG_TRIGGER_FIXTURE="$ROOT/app/MeetingTranscriber/Tests/Fixtures/two_speakers_en.wav"
+# The lane's own files (seed copies, fingerprints, the app's output) sit in the
+# home but outside every folder the app owns.
+_UG_LANE_DIR="$APP_HOME/.e2e-upgrade"
+_UG_DATA_DIR="$APP_HOME/Library/Application Support/MeetingTranscriber"
+_UG_DOCS_HF="$APP_HOME/Documents/huggingface"
+_UG_APP_HF="$_UG_DATA_DIR/huggingface"
+_UG_STAGING_DIR="$_UG_DATA_DIR/recordings"
+_UG_IPC_DIR="$_UG_DATA_DIR/ipc"
+_UG_PENDING_TITLE="Upgrade Seed Interrupted"
+_UG_FINISHED_TITLE="Upgrade Seed Finished"
+# A v0.8.1 speaker entry cut off mid-embedding: valid JSON up to that point,
+# so it reads as a damaged file and not as an empty one.
+_UG_SPEAKERS_SEED='[{"name":"Seed Voice","embeddings":[[0.125,-0.5,0.25'
+# Closes the network to everything but localhost, where the RPC server answers.
+# Not to measure that the app avoids the network but to make a download fail
+# loudly: WhisperKit's downloader contacts the Hub before it looks at any local
+# file (see WhisperKitLocalSnapshot), so with this profile a model that was not
+# found locally ends in a failed load instead of a quiet re-download.
+_UG_SANDBOX_PROFILE='(version 1)(allow default)(deny network-outbound (remote ip "*:*"))(allow network-outbound (remote ip "localhost:*"))'
+# The lane's settings, passed as launch arguments: they land in the argument
+# domain, which overrides the dev bundle's stored preferences for this process
+# and is never written back. Diarization and VAD are off so no FluidAudio model
+# is needed behind the closed network, protocol generation is off so no
+# transcript leaves the machine, and auto-watch is off so nothing asks for the
+# microphone: a binary started directly, as here, is not the bundle the
+# runner's grants were made for. Idle unloading is off so the launch preload,
+# which `_ug_await_model` waits for, still loads the model.
+_UG_APP_ARGS=(
+    -transcriptionEngine whisperKit -whisperKitModel "$_UG_VARIANT"
+    -whisperKitCustomModelEnabled NO -whisperLanguage de
+    -diarize NO -vadEnabled NO -protocolProvider none -autoWatch NO
+    -recordOnly NO -liveTranscriptionEnabled NO -echoCancellationEnabled NO
+    -unloadModelsWhenIdle NO
+)
+
+_ug_preflight() {
+    require_command sandbox-exec
+    require_command shasum
+    upgrade_variant_complete "$_UG_MODEL_SOURCE/$UPGRADE_WHISPERKIT_REPO/$_UG_VARIANT" \
+        && [ -f "$_UG_MODEL_SOURCE/$UPGRADE_TOKENIZER_ORG/$_UG_TOKENIZER/tokenizer.json" ] \
+        || fail "--upgrade needs a complete $_UG_VARIANT and its $_UG_TOKENIZER tokenizer under '$_UG_MODEL_SOURCE' (set E2E_UPGRADE_MODEL_SOURCE to a huggingface folder that has them; in CI that is the runner home the runner-home action pre-warms)"
+    # The profile has to close the Hub to this host's processes, or "loaded
+    # without a download" proves nothing. Checked with curl under the same
+    # profile the app gets.
+    if sandbox-exec -p "$_UG_SANDBOX_PROFILE" curl --silent --max-time 10 -o /dev/null https://huggingface.co/ 2>/dev/null; then
+        fail "--upgrade: the sandbox profile did not stop a connection to huggingface.co, so the lane could not tell a local load from a download"
+    fi
+}
+
+# Lay out the v0.8.1 data. Refuses any target outside the lane's own home.
+_ug_seed() {
+    local label="[upgrade]" d now stem
+    [ "$APP_HOME" != "$HOME" ] && e2e_is_lane_home "$APP_HOME" "$_UG_HOME_STEM" "$_UG_HOME_PARENT" \
+        || fail "$label: refusing to seed '$APP_HOME', which is not this lane's temp home"
+    for d in "$_UG_LANE_DIR" "$_UG_DOCS_HF" "$_UG_DATA_DIR" "$OUTPUT_DIR"; do
+        upgrade_path_inside "$d" "$APP_HOME" || fail "$label: refusing to seed '$d', outside the lane's home $APP_HOME"
+    done
+    mkdir -p "$_UG_LANE_DIR" "$_UG_STAGING_DIR" "$_UG_IPC_DIR" "$OUTPUT_DIR/protocols" "$RECORDINGS_DIR"
+    _ug_real_fingerprint >"$_UG_LANE_DIR/real-models.before"
+
+    # 1. The model, where v0.8.1 downloaded it. Next to it an incomplete
+    # variant (one weight file missing) and something another tool keeps in
+    # the shared folder: neither is the app's to move.
+    upgrade_seed_whisperkit "$_UG_MODEL_SOURCE" "$_UG_DOCS_HF" "$_UG_VARIANT" "$_UG_TOKENIZER" \
+        || fail "$label: could not seed the model from '$_UG_MODEL_SOURCE'"
+    local repo="$_UG_DOCS_HF/$UPGRADE_WHISPERKIT_REPO"
+    # Stand-in files: the migration judges a variant by which files exist.
+    local bundle file
+    for bundle in "${UPGRADE_REQUIRED_BUNDLES[@]}"; do
+        for file in "${UPGRADE_REQUIRED_FILES[@]}"; do
+            [ "$bundle/$file" = TextDecoder/weights/weight.bin ] && continue
+            mkdir -p "$(dirname "$repo/$_UG_INCOMPLETE_VARIANT/$bundle.mlmodelc/$file")"
+            printf 'stand-in' >"$repo/$_UG_INCOMPLETE_VARIANT/$bundle.mlmodelc/$file"
+        done
+    done
+    mkdir -p "$_UG_DOCS_HF/models/example-org/other-model"
+    printf '{"model_type":"other"}\n' >"$_UG_DOCS_HF/models/example-org/other-model/config.json"
+    upgrade_tree_fingerprint "$repo/$_UG_VARIANT" >"$_UG_LANE_DIR/variant.seeded"
+    upgrade_tree_fingerprint "$repo/.cache/huggingface/download/$_UG_VARIANT" >"$_UG_LANE_DIR/metadata.seeded"
+    upgrade_tree_fingerprint "$repo/$_UG_INCOMPLETE_VARIANT" >"$_UG_LANE_DIR/incomplete.seeded"
+    upgrade_tree_fingerprint "$_UG_DOCS_HF/models/example-org" >"$_UG_LANE_DIR/other.seeded"
+    upgrade_tree_fingerprint "$_UG_DOCS_HF/$UPGRADE_TOKENIZER_ORG" >"$_UG_LANE_DIR/tokenizer.seeded"
+    upgrade_tree_digest "$_UG_DOCS_HF/$UPGRADE_TOKENIZER_ORG/$_UG_TOKENIZER" >"$_UG_LANE_DIR/tokenizer.digest"
+
+    # 2. A speaker DB that does not decode.
+    printf '%s' "$_UG_SPEAKERS_SEED" >"$_UG_DATA_DIR/speakers.json"
+    printf '%s' "$_UG_SPEAKERS_SEED" >"$_UG_LANE_DIR/speakers.seed"
+
+    # 3. An interrupted job in the queue snapshot, its recording still in
+    # staging, plus a finished job's record and the processed-recordings
+    # ledger every v0.8.1 install has. The ledger names an older recording, as
+    # it would, so the app does not seed it afresh from the staging folder.
+    now="$(date +%s)"
+    stem="$(date -r $(( now - 600 )) +%Y%m%d_%H%M%S)_upgrade-seed"
+    _UG_SEEDED_MIX="$_UG_STAGING_DIR/${stem}_mix.wav"
+    cp "$DEFAULT_FIXTURE" "$_UG_SEEDED_MIX"
+    _UG_PENDING_ID="$(uuidgen)"
+    _UG_FINISHED_ID="$(uuidgen)"
+    _UG_FINISHED_TRANSCRIPT="$OUTPUT_DIR/protocols/$(date -r $(( now - 86400 )) +%Y%m%d_%H%M)_upgrade-seed-finished.md"
+    printf '# Transcript\n\nSeed.\n' >"$_UG_FINISHED_TRANSCRIPT"
+    jq -n --argjson job "$(upgrade_v081_pipeline_job "$_UG_PENDING_ID" "$_UG_PENDING_TITLE" transcribing "$_UG_SEEDED_MIX" $(( now - 600 )))" \
+        '[$job]' >"$_UG_IPC_DIR/pipeline_queue.json"
+    jq -n --argjson rec "$(upgrade_v081_terminal_record "$_UG_FINISHED_ID" "$_UG_FINISHED_TITLE" "$_UG_FINISHED_TRANSCRIPT")" \
+        '[$rec]' >"$_UG_IPC_DIR/terminal_jobs.json"
+    jq -n --arg p "$RECORDINGS_DIR/$(date -r $(( now - 86400 )) +%Y%m%d_%H%M%S)_older_mix.wav" \
+        '[$p]' >"$_UG_IPC_DIR/processed_recordings.json"
+    log "$label: seeded v0.8.1 data in $APP_HOME (model $_UG_VARIANT in Documents, unreadable speakers.json, job $_UG_PENDING_ID interrupted while transcribing, finished record $_UG_FINISHED_ID)"
+}
+
+# Start the deployed binary directly, inside the sandbox profile, with the
+# lane's home and settings. Directly and not with `open`, because only a
+# process this script starts can be put in the profile; that is also why the
+# lane never touches anything a TCC grant guards. Appends to the lane's log.
+_ug_launch() {
+    # The installed app serves the same port when its automation API is on.
+    # The readiness check would then time out on a token mismatch and blame
+    # this app; say what is actually in the way instead.
+    local holder
+    holder="$(lsof -nP -iTCP:9876 -sTCP:LISTEN -t 2>/dev/null | head -1 || true)"
+    [ -z "$holder" ] \
+        || fail "[upgrade]: 127.0.0.1:9876 is already served by pid $holder ($(ps -o command= -p "$holder" 2>/dev/null | cut -c1-100)); this lane's app could not answer there"
+    CFFIXED_USER_HOME="$APP_HOME" MEETINGTRANSCRIBER_DEBUG_RPC=1 MEETINGTRANSCRIBER_DEBUG_SUPPRESS_AUTOWATCH=1 \
+        nohup sandbox-exec -p "$_UG_SANDBOX_PROFILE" "$DEV_BUNDLE_DEPLOY/Contents/MacOS/MeetingTranscriber" \
+        "${_UG_APP_ARGS[@]}" >>"$_UG_LANE_DIR/app.log" 2>&1 &
+    # sandbox-exec execs the app, so this is the app's pid.
+    _UG_APP_PID=$!
+}
+
 # --- preflight ------------------------------------------------------------
 
 require_command curl
@@ -684,12 +1264,13 @@ require_command swift
 require_command codesign
 
 [ -f "$SIMULATOR_FIXTURE" ] || fail "simulator fixture not found: $SIMULATOR_FIXTURE"
+[ "$UPGRADE" = true ] && _ug_preflight
 
 # Sanity check: a virtual input device is set as default. If the runner
 # host has no built-in mic and no BlackHole/Loopback, AVAudioEngine binds
 # to a no-input device and the dual-source recorder hits a libmalloc abort
 # (observed on Mac mini hosts). Surface the misconfiguration up-front.
-if ! system_profiler SPAudioDataType 2>/dev/null | grep -A4 "Default Input" | grep -q "Input Channels"; then
+if [ "$UPGRADE" != true ] && ! system_profiler SPAudioDataType 2>/dev/null | grep -A4 "Default Input" | grep -q "Input Channels"; then
     fail "no default audio input device — install BlackHole 2ch (brew install blackhole-2ch + reboot/coreaudiod restart) and set it as the default Input in System Settings → Sound"
 fi
 
@@ -704,13 +1285,8 @@ fi
 # its command line). Other e2e-*.sh drivers are not matched: they never run
 # concurrently with this one in the workflow.
 _e2e_other_drivers() {
-    local ancestors=" $$ " pid="$$" ppid p related
-    while [ "$pid" -gt 1 ]; do
-        ppid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')"
-        [ -n "$ppid" ] || break
-        ancestors="$ancestors$ppid "
-        pid="$ppid"
-    done
+    local ancestors p
+    ancestors="$(_ancestor_pids)"
     # The name must stand as a path component or a word (`bash scripts/e2e-app.sh`,
     # `./scripts/e2e-app.sh`): a quoted mention inside some other command line,
     # such as a monitoring `pgrep -f "e2e-app.sh"`, is not a driver and must not
@@ -727,12 +1303,8 @@ _e2e_other_drivers() {
         # running this very check is one (measured: it reported itself as a
         # second driver). Walk up from the candidate and skip it if the chain
         # reaches this process.
-        pid="$p"; related=""
-        while [ -n "$pid" ] && [ "$pid" -gt 1 ]; do
-            if [ "$pid" = "$$" ]; then related=yes; break; fi
-            pid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')"
-        done
-        [ -n "$related" ] || printf '%s ' "$p"
+        case "$(_ancestor_pids "$p")" in *" $$ "*) continue ;; esac
+        printf '%s ' "$p"
     done
 }
 _other_drivers="$(_e2e_other_drivers)"
@@ -776,7 +1348,12 @@ _qf_restore_shared_state() {
     [ "$QUIT_FLUSH" = true ] && [ -n "$_QF_BACKUP_DIR" ] && [ -z "${_QF_RESTORED:-}" ] || return 0
     _QF_RESTORED=1
     [ -n "${_QF_AFPLAY_PID:-}" ] && kill "$_QF_AFPLAY_PID" 2>/dev/null || true
-    quit_running_app || log "[quit-flush] WARNING: the dev app did not stop; restoring anyway"
+    local quit_status=0
+    quit_running_app || quit_status=$?
+    case "$quit_status" in
+        1) log "[quit-flush] WARNING: the dev app did not stop; restoring anyway" ;;
+        2) log "[quit-flush] WARNING: the dev app was ended by signal, without its quit hold (see the Automation error above); restoring anyway" ;;
+    esac
     # A cycle that failed after its recording started may have a job in the
     # shared state that nothing registered yet; the quit above may have just
     # written it. Defined with the lane further down.
@@ -829,6 +1406,23 @@ _qf_release_lock() {
 }
 
 if [ "$QUIT_FLUSH" = true ]; then
+    # First, before any build, quit, backup or settings change: the unified-log
+    # precondition (see the lane header). Both modes are checked so both
+    # reasons come out at once.
+    _qf_refused="" _qf_failed=""
+    for _qf_mode in stream show; do
+        _qf_status=0
+        _qf_reason="$(unified_log_unusable "$_qf_mode")" || _qf_status=$?
+        case "$_qf_status" in
+            1) ;;
+            0) _qf_refused="$_qf_refused 'log $_qf_mode': $_qf_reason;" ;;
+            *) _qf_failed="$_qf_failed 'log $_qf_mode': $_qf_reason;" ;;
+        esac
+    done
+    [ -z "$_qf_refused" ] \
+        || fail "--quit-flush: this user ($(id -un)) may not read the unified log:$_qf_refused$_qf_failed it needs an admin user on macOS 26 (see the lane header)."
+    [ -z "$_qf_failed" ] \
+        || fail "--quit-flush: the unified log probe failed:$_qf_failed the lane needs the log (see the lane header); retry, or check logd."
     MT_LIVE_LOCK="${MT_LIVE_LOCK:-/tmp/mt-live-lock}"
     mkdir "$MT_LIVE_LOCK" 2>/dev/null \
         || fail "--quit-flush: the live lock $MT_LIVE_LOCK is held (since $(stat -f '%Sm' "$MT_LIVE_LOCK" 2>/dev/null)). Someone else is using the live app on this host; aborting without touching anything."
@@ -838,8 +1432,7 @@ if [ "$QUIT_FLUSH" = true ]; then
     # itself: once the backup exists, the lane has started to change shared
     # state (the app launch writes it), so a failure here restores too.
     trap 'if declare -F on_exit >/dev/null; then on_exit; else _qf_restore_shared_state; _qf_release_lock; [ -z "${_QF_RESTORE_FAILED:-}" ] || exit 1; fi' EXIT
-    _qf_installed="$( { pgrep -x MeetingTranscriber || true; } | while read -r p; do
-        ps -o command= -p "$p" 2>/dev/null | grep -q "MeetingTranscriber-Dev.app/" || printf '%s ' "$p"; done)"
+    _qf_installed="$(non_dev_meetingtranscriber_pids)"
     [ -z "$_qf_installed" ] \
         || fail "--quit-flush: a MeetingTranscriber that is not the dev app is running (pid(s): ${_qf_installed% }). It shares the pipeline state this lane writes and restores. Quit it first."
     log "[quit-flush] lock $MT_LIVE_LOCK held, installed app not running; the queue check and the backup follow the dev app's quit"
@@ -879,15 +1472,14 @@ if [ -n "$MIC_STALL" ]; then
         || fail "--mic-stall: a MeetingTranscriber that is not the dev app is running (pid(s): ${_installed% }). It would record the lane's synthetic meeting into the host's real folders. Quit it first; this lane does not quit it for you."
 fi
 
-_DEV_APP_PATTERN="MeetingTranscriber-Dev.app/Contents/MacOS/MeetingTranscriber"
 # The marker a driver running the app in the host's own home leaves.
 _E2E_HOST_MARKER="$HOME/Library/Application Support/MeetingTranscriber/.e2e-app-launched"
-# The one a lane with an isolated home (--mic-stall) leaves. Outside that home,
+# The one a lane with an isolated home (--mic-stall, --upgrade) leaves. Outside that home,
 # which the next run never sees: kept there, an app a failed run left behind
 # read as foreign to every later run.
 _E2E_ISOLATED_MARKER="$_MS_STATE_DIR/isolated-home-app-launched"
 _E2E_APP_MARKER="$_E2E_HOST_MARKER"
-[ -n "$MIC_STALL" ] && _E2E_APP_MARKER="$_E2E_ISOLATED_MARKER"
+[ "$APP_HOME" != "$HOME" ] && _E2E_APP_MARKER="$_E2E_ISOLATED_MARKER"
 _running_app="$( { pgrep -f "$_DEV_APP_PATTERN" || true; } | head -1)"
 if [ -n "$_running_app" ]; then
     # Whichever marker names the running app, whichever lane left it.
@@ -917,6 +1509,16 @@ fi
 # Always — even with --no-build, since UserDefaults below take effect
 # only on launch and the running RPC server would shadow the new one.
 quit_running_app
+
+# Whatever lane this is: finish what a killed --protocol run left, its
+# settings, its jobs and its files. Now, with the dev app stopped, and before
+# --quit-flush checks and backs up the shared queue, which would otherwise
+# count a lane job the repair is about to drop, or restore it at exit. Hard
+# failure when a setting does not come back: the lane that runs next would
+# launch with the stub endpoint and diarize off and report verdicts about a
+# configuration nobody chose.
+_pp_repair \
+    || fail "a killed --protocol run left something this run could not undo (see the warning above; records in $_MS_STATE_DIR). Fix what it names, then rerun."
 
 # --quit-flush: the dev app just quit may have been recording, and its quit
 # writes that recording into the shared state. So the queue check and the
@@ -1031,7 +1633,7 @@ if [ -n "$MIC_STALL" ]; then
     log "[mic-stall] deployed bundle is a fault-injection build"
 fi
 
-if [ ! -x "$SIMULATOR_BIN" ]; then
+if [ "$UPGRADE" != true ] && [ ! -x "$SIMULATOR_BIN" ]; then
     log "Building meeting-simulator"
     (cd "$SIMULATOR_PKG" && swift build -c release)
 fi
@@ -1039,7 +1641,15 @@ fi
 # Record-only lanes assert the captured app track is non-silent via
 # `mt-cli wav-verdict` (the same analyzer the browser lane uses). Only that
 # mode needs it, so build lazily to keep the processing lane unchanged.
-if { [ "$RECORD_ONLY" = true ] || [ "$MIC_ONLY" = true ] || [ "$QUIT_FLUSH" = true ] || [ -n "$MIC_STALL" ]; } && [ ! -x "$MTCLI" ]; then
+# Rebuilt when any of its sources is newer than the binary, not only when it is
+# missing: a hand-run host keeps .build across checkouts, and an mt-cli older
+# than the lane could lack a subcommand or flag it calls and fail with an
+# error that blames the app.
+_mtcli_stale() {
+    [ ! -x "$MTCLI" ] \
+        || [ -n "$(find "$MTCLI_PKG/Sources" "$MTCLI_PKG/Package.swift" "$MTCLI_PKG/Package.resolved" -newer "$MTCLI" -print -quit 2>/dev/null)" ]
+}
+if { [ "$RECORD_ONLY" = true ] || [ "$MIC_ONLY" = true ] || [ "$QUIT_FLUSH" = true ] || [ -n "$MIC_STALL" ]; } && _mtcli_stale; then
     # record-only asserts the app track carries signal; mic-only needs the same
     # analyzer for its mic track AND drives `record start/stop` through it.
     log "Building mt-cli (track silence guard + record control)"
@@ -1166,6 +1776,74 @@ if [ -n "$MIC_STALL" ]; then
     _set_dev_default protocolProvider none
 fi
 
+# The protocol lane: record the host's values, start the stub, then write, and
+# the app reads all of it at launch. The cleanup is armed before the record, as
+# the mic-stall lane does, because on_exit is installed only after the launch;
+# on_exit runs it again.
+if [ "$PROTOCOL_LANE" = true ]; then
+    require_command python3
+    # Any job the app resumes or recovers at launch would be sent to the stub
+    # and saved with its canned reply as that meeting's protocol. In CI the
+    # queue snapshot is reset before the launch (below) and the lane requires
+    # an idle app before its first job; on any other host, refuse before the
+    # lane changes any protocol setting while the queue holds an unfinished job
+    # or the staging folder holds a recording a launch could recover. Finished
+    # jobs do not count: the app drops them when it loads the snapshot.
+    if [ "${GITHUB_ACTIONS:-}" != "true" ]; then
+        _pp_data="$APP_HOME/Library/Application Support/MeetingTranscriber"
+        _pp_snapshot="$_pp_data/ipc/pipeline_queue.json"
+        if [ -f "$_pp_snapshot" ] && ! jq -e 'type == "array" and all(.[]; .state == "done" or .state == "error")' "$_pp_snapshot" >/dev/null 2>&1; then
+            fail "[protocol] the pipeline queue snapshot holds unfinished jobs (or does not parse); the app would resume them against the stub. Let them finish first. No protocol setting was changed."
+        fi
+        _pp_staged="$(find "$_pp_data/recordings" -maxdepth 1 -type f \( -name '*.wav' -o -name '*.tmp' \) 2>/dev/null | head -3)"
+        [ -z "$_pp_staged" ] \
+            || fail "[protocol] the staging folder holds recordings a launch could recover and send to the stub: $_pp_staged. Process or move them first. No protocol setting was changed."
+    fi
+    trap '_pp_cleanup' EXIT
+    mkdir -p "$_MS_STATE_DIR"
+    rm -f "$_PP_RECORD.tmp"
+    # Both domains write_dev_default writes; the container only if it exists.
+    for _pp_plist in "$_STANDARD_PLIST" "$_CONTAINER_PLIST"; do
+        [ "$_pp_plist" = "$_STANDARD_PLIST" ] || [ -f "$_pp_plist" ] || continue
+        defaults_record_keys "$_PP_RECORD.tmp" "$_pp_plist" "${_PP_KEYS[@]}" \
+            || fail "[protocol] could not record the host's protocol settings; no protocol setting was changed"
+    done
+    mv "$_PP_RECORD.tmp" "$_PP_RECORD"
+    # The count, not the values: an endpoint can name a host, and this log is
+    # public on CI.
+    log "[protocol] recorded $(grep -c . "$_PP_RECORD") host setting(s) in $_PP_RECORD (restored on exit)"
+
+    _PP_DIR="$(mktemp -d /tmp/e2e-protocol.XXXXXX)"
+    python3 "$ROOT/scripts/fixtures/openai-chat-stub.py" \
+        --port-file "$_PP_DIR/port" --log "$_PP_DIR/requests.jsonl" --mode-file "$_PP_DIR/mode" \
+        --reply "$_PP_REPLY" >"$_PP_DIR/stub.log" 2>&1 &
+    _PP_STUB_PID=$!
+    _pp_stub_listening() { [ -s "$_PP_DIR/port" ]; }
+    poll_until 10 0.2 _pp_stub_listening \
+        || fail "[protocol] the stub did not start listening within 10s: $(cat "$_PP_DIR/stub.log")"
+    _PP_PORT="$(cat "$_PP_DIR/port")"
+    _PP_ENDPOINT="http://127.0.0.1:$_PP_PORT/v1"
+    log "[protocol] stub (pid $_PP_STUB_PID) listening on $_PP_ENDPOINT"
+
+    _set_dev_default protocolProvider openAICompatible
+    _set_dev_default protocolLanguage "$_PP_LANGUAGE"
+    _set_dev_default openAIEndpoint "$_PP_ENDPOINT"
+    _set_dev_default openAIModel "$_PP_MODEL"
+    _set_dev_default openAITemperature "$_PP_TEMPERATURE" float
+    _delete_dev_default openAITopP
+    # Diarize off, so the job never parks at speaker naming and the protocol is
+    # generated in the pipeline's own stage rather than on a naming skip. The
+    # output options pin the protocol file's exact contents and name, and keep
+    # the transcript file the user message is compared with: an AI-title rename
+    # would move every artifact to a stem taken from the stub's heading.
+    _set_dev_default diarize false bool
+    _set_dev_default saveRawTranscriptSeparately true bool
+    _set_dev_default includeFullTranscriptInProtocol true bool
+    _set_dev_default useAITitleForFilenames false bool
+    defaults_mark_lane_values "$_PP_RECORD" \
+        || fail "[protocol] could not read back the lane's own settings to mark them; restoring"
+fi
+
 if [ -n "${MTT_DIARIZER_MODE:-}" ]; then
     log "Overriding diarizerMode=$MTT_DIARIZER_MODE for this run"
     _set_dev_default diarizerMode "$MTT_DIARIZER_MODE"
@@ -1207,9 +1885,15 @@ _NC_PRE_DIARIZE_STD=""
 _NC_PRE_DIARIZE_CTR=""
 _NC_PRE_NUMSPK_STD=""
 _NC_PRE_NUMSPK_CTR=""
+_NC_PRE_AUTOOPEN_STD=""
+_NC_PRE_AUTOOPEN_CTR=""
 # Temp dir holding this lane's private COPY of the fixture (see run_naming_confirm
 # for why a copy is mandatory). Cleaned up by _naming_confirm_cleanup on any exit.
 _NC_FIXTURE_DIR=""
+
+# Temp dir holding the naming-escape lane's private copy of the fixture. A
+# global, unlike the lane's other locals, so on_exit removes it on every exit.
+_NE_FIXTURE_DIR=""
 
 # Temp dir holding the echo lane's synthesised dual-source pairs. Its own mktemp
 # dir, removed by on_exit; the shipped fixtures it is built from are read-only.
@@ -1309,9 +1993,11 @@ _naming_confirm_cleanup() {
     # write -int for numSpeakers (a raw 1/0 into `-bool` errors; see the helpers).
     restore_bool_default "$_STANDARD_PLIST" diarize "$_NC_PRE_DIARIZE_STD"
     restore_int_default "$_STANDARD_PLIST" numSpeakers "$_NC_PRE_NUMSPK_STD"
+    restore_bool_default "$_STANDARD_PLIST" autoOpenSpeakerNaming "$_NC_PRE_AUTOOPEN_STD"
     if [ -f "$_CONTAINER_PLIST" ]; then
         restore_bool_default "$_CONTAINER_PLIST" diarize "$_NC_PRE_DIARIZE_CTR"
         restore_int_default "$_CONTAINER_PLIST" numSpeakers "$_NC_PRE_NUMSPK_CTR"
+        restore_bool_default "$_CONTAINER_PLIST" autoOpenSpeakerNaming "$_NC_PRE_AUTOOPEN_CTR"
     fi
     local now_diarize now_num
     now_diarize="$(read_dev_default_effective "$DEV_BUNDLE_ID" "$_CONTAINER_PLIST" diarize)"
@@ -1333,13 +2019,17 @@ if [ "$NAMING_CONFIRM" = true ] || [ "$NAMING_ESCAPE" = true ] || [ "$NAMING_SWI
     # restores each domain to exactly its own pre-lane state.
     _NC_PRE_DIARIZE_STD="$(snapshot_default "$_STANDARD_PLIST" diarize)"
     _NC_PRE_NUMSPK_STD="$(snapshot_default "$_STANDARD_PLIST" numSpeakers)"
+    _NC_PRE_AUTOOPEN_STD="$(snapshot_default "$_STANDARD_PLIST" autoOpenSpeakerNaming)"
     if [ -f "$_CONTAINER_PLIST" ]; then
         _NC_PRE_DIARIZE_CTR="$(snapshot_default "$_CONTAINER_PLIST" diarize)"
         _NC_PRE_NUMSPK_CTR="$(snapshot_default "$_CONTAINER_PLIST" numSpeakers)"
+        _NC_PRE_AUTOOPEN_CTR="$(snapshot_default "$_CONTAINER_PLIST" autoOpenSpeakerNaming)"
     fi
     log "[naming-confirm] pre-lane diarize(std='$_NC_PRE_DIARIZE_STD' ctr='$_NC_PRE_DIARIZE_CTR') numSpeakers(std='$_NC_PRE_NUMSPK_STD' ctr='$_NC_PRE_NUMSPK_CTR')"
     _set_dev_default diarize true bool
     _set_dev_default numSpeakers "$_NAMING_NUM_SPEAKERS" int
+    # The naming lanes wait for the window to open by itself.
+    _set_dev_default autoOpenSpeakerNaming true bool
     if [ "${GITHUB_ACTIONS:-}" != "true" ] && [ "$NAMING_ESCAPE" != true ]; then
         # Escape-lane runs never confirm — they dismiss — so nothing reaches
         # updateSpeakerDB and the warning would be a false alarm on the one run
@@ -1387,44 +2077,73 @@ if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
     log "CI: reset stale pipeline-queue snapshot ($_ipc_dir/pipeline_queue.json)"
 fi
 
+[ "$UPGRADE" = true ] && _ug_seed
+
+# The meeting lanes check that a finished job keeps its recording while
+# recording retention is off (`_assert_recording_kept_by_default`). Under the
+# default period of 30 days a recording minutes old is never due, so that check
+# alone would pass with the switch ignored. In CI the period is therefore set to
+# 0 days for the run, as a launch argument (nothing stored, nothing to restore):
+# the switch is then all that keeps the recording. Only in CI and only with the
+# switch not on, because with 0 days a broken switch would delete every listed
+# recording in the host's output folder, which on a developer's Mac is theirs.
+# `<integer>`: the app reads the days as `object(forKey:) as? Int`, and a bare
+# `0` arrives as a string.
+_RETENTION_LAUNCH_ARGS=()
+if [ "${GITHUB_ACTIONS:-}" = "true" ] \
+    && ! retention_reads_as_on "$(read_dev_default_effective "$DEV_BUNDLE_ID" "$_CONTAINER_PLIST" recordingRetentionEnabled)"; then
+    _RETENTION_LAUNCH_ARGS=(--args -recordingRetentionDays "<integer>0</integer>")
+    log "CI: recording retention period 0 days for this run (switch left as the host has it)"
+fi
+
 log "Launching $DEV_BUNDLE_DEPLOY"
 if [ -n "$MIC_STALL" ]; then
     # `open --env`, not a leading `env`: only the former reaches a process
     # LaunchServices starts (see the e2e-architecture skill).
     log "[mic-stall] app home $APP_HOME, microphone fault '$MIC_STALL'"
     open --env CFFIXED_USER_HOME="$APP_HOME" --env MEETINGTRANSCRIBER_E2E_MIC_FAULT="$MIC_STALL" "$DEV_BUNDLE_DEPLOY"
+elif [ "$UPGRADE" = true ]; then
+    log "[upgrade] app home $APP_HOME, network closed but for localhost"
+    _ug_launch
 elif [ "$MIC_DEVICE_CHANGE" = true ]; then
     # The fault build injects nothing unless asked, so a leftover fault bundle
     # cannot inject into a later, unrelated launch.
-    open --env MEETINGTRANSCRIBER_E2E_MIC_FAULT=device-change "$DEV_BUNDLE_DEPLOY"
+    open --env MEETINGTRANSCRIBER_E2E_MIC_FAULT=device-change "$DEV_BUNDLE_DEPLOY" \
+        ${_RETENTION_LAUNCH_ARGS[@]+"${_RETENTION_LAUNCH_ARGS[@]}"}
 else
-    open "$DEV_BUNDLE_DEPLOY"
+    # `${a[@]+...}`: bash 3.2 under `set -u` calls an empty array unbound.
+    open "$DEV_BUNDLE_DEPLOY" ${_RETENTION_LAUNCH_ARGS[@]+"${_RETENTION_LAUNCH_ARGS[@]}"}
 fi
 
-log "Waiting up to ${RPC_READY_TIMEOUT_S}s for RPC /healthz"
-# Assigns RPC_TOKEN in caller scope on success so subsequent `rpc` calls
-# carry the bearer token.
-# `rpc` ends in `|| true` so its callers can read a body without tripping
-# `set -e`, which also means it reports success for a refused connection. That
-# made this check "the token file exists", and the token file survives every
-# previous run on the host, so "RPC up" could be logged 70 ms after launch with
-# nothing listening yet. Ask curl directly and let its exit status decide.
-_rpc_ready() {
-    [ -f "$RPC_TOKEN_FILE" ] || return 1
-    RPC_TOKEN="$(cat "$RPC_TOKEN_FILE")"
-    curl --silent --fail --max-time 5 \
-        --header "Authorization: Bearer $RPC_TOKEN" \
-        "$RPC_BASE/healthz" >/dev/null 2>&1
+# A failed lane's diagnostics, written before on_exit changes anything (the
+# protocol and upgrade cleanups quit the app, the upgrade one removes its
+# home): the app's /state, queue snapshot and pipeline log, this lane's
+# simulator log and the app's crash reports since the run started, all
+# redacted for a public artifact (see e2e_write_diagnostics). CI only. Also
+# called when the app never brings its RPC server up, which fails before on_exit
+# is armed and is the case where its crash report matters most. In a subshell
+# with errexit off, so a step that fails there cannot cut on_exit short or
+# change the run's status.
+_write_lane_diagnostics() {
+    [ -n "$_E2E_DIAG_MARKER" ] || return 0
+    local dir="$RUNNER_TEMP/e2e-diag/$_LANE_SLUG"
+    ( set +e; e2e_write_diagnostics "$dir" "$_APP_SUPPORT_DIR" "$_E2E_DIAG_MARKER" "$SIM_LOG" ) || true
+    log "diagnostics of this lane written to $dir (uploaded as the e2e-diagnostics artifact)"
 }
-poll_until "$RPC_READY_TIMEOUT_S" 1 _rpc_ready \
-    || fail "RPC /healthz did not respond within ${RPC_READY_TIMEOUT_S}s"
+
+log "Waiting up to ${RPC_READY_TIMEOUT_S}s for RPC /healthz"
+poll_until "$RPC_READY_TIMEOUT_S" 1 rpc_ready \
+    || { _write_lane_diagnostics; fail "RPC /healthz did not respond within ${RPC_READY_TIMEOUT_S}s"; }
 log "RPC up"
 # Record which app this driver started, for the provenance guard above.
-_launched_app="$( { pgrep -f "$_DEV_APP_PATTERN" || true; } | head -1)"
-if [ -n "$_launched_app" ]; then
-    mkdir -p "$(dirname "$_E2E_APP_MARKER")"
-    printf '%s launched' "$_launched_app" >"$_E2E_APP_MARKER"
-fi
+_record_launched_app() {
+    _launched_app="$( { pgrep -f "$_DEV_APP_PATTERN" || true; } | head -1)"
+    if [ -n "$_launched_app" ]; then
+        mkdir -p "$(dirname "$_E2E_APP_MARKER")"
+        printf '%s launched' "$_launched_app" >"$_E2E_APP_MARKER"
+    fi
+}
+_record_launched_app
 
 
 # Single trap covers the simulator process + record-only side-effects for
@@ -1432,17 +2151,30 @@ fi
 # a kill between fork and the trap line doesn't orphan the subprocess.
 SIM_PID=""
 _ON_EXIT_RAN=""
+
+# on_exit [<status>] — the run's exit status; non-zero writes the diagnostics.
 on_exit() {
+    local status="${1:-0}"
     # Run exactly once. The INT/TERM traps below run on_exit then `exit`, and
     # that exit re-fires the EXIT trap, and without this guard on_exit would run
     # twice on a signal (harmless because every step is idempotent, but noisy).
     [ -n "$_ON_EXIT_RAN" ] && return 0
     _ON_EXIT_RAN=1
+    [ "$status" -eq 0 ] || _write_lane_diagnostics
     # Quit-flush: stop the app, remove what this run's unreleased jobs wrote,
     # and put the shared pipeline state back. First, because the restore needs
     # the app stopped, and the provenance marker below then sees it gone.
     if [ "$QUIT_FLUSH" = true ] && [ -n "$_QF_BACKUP_DIR" ]; then
         _qf_restore_shared_state
+    fi
+    # Upgrade: stop the app this lane started and remove its home, before the
+    # provenance below, which then finds the app gone. A no-op for other lanes.
+    _ug_cleanup
+    # Protocol lane: stop the stub, put the host's settings back, stop the app,
+    # drop the lane's unfinished jobs and its outputs (see `_pp_cleanup`).
+    # Before the provenance below, which then finds the app gone.
+    if [ "$PROTOCOL_LANE" = true ]; then
+        _pp_cleanup || _PP_RESTORE_FAILED=1
     fi
     # Leave the app's provenance for the next driver: still running means this
     # run kept it (--keep-app) or failed before the quit; gone means we quit it.
@@ -1458,6 +2190,8 @@ on_exit() {
         fi
     fi
     [ -n "${SIM_PID:-}" ] && kill "$SIM_PID" 2>/dev/null || true
+    [ -z "$_SIM_LOG_STARTED" ] || cp -f "$SIM_LOG" "$_SIM_LOG_LEGACY" 2>/dev/null || true
+    [ -z "$_E2E_DIAG_MARKER" ] || rm -f "$_E2E_DIAG_MARKER"
     if [ "$MIC_ONLY" = true ]; then
         # The lane turns auto-watch off; nothing else here would turn it back
         # on, and a human using the dev app on this host would find detection
@@ -1507,6 +2241,11 @@ on_exit() {
         rm -f "$CRASH_RECORDINGS/${CRASH_STEM}"* 2>/dev/null || true
         [ -n "${CRASH_MARKER:-}" ] && rm -f "$CRASH_MARKER"
     fi
+    # Naming-switch: release this run's jobs before the restores below (a skip
+    # writes the recognition log the speaker-DB restore puts back).
+    if [ "$NAMING_SWITCH" = true ]; then
+        _ns_release_jobs
+    fi
     # Naming-confirm: restore the runner's real speaker DB (CI-gated, no-op
     # locally) and the lane's diarize/numSpeakers overrides so a later run on
     # this host starts from the AppSettings defaults.
@@ -1527,6 +2266,11 @@ on_exit() {
     # (see `_ms_cleanup`). Our own mktemp dir: the model link inside it is
     # removed as a link.
     [ -n "$MIC_STALL" ] && _ms_cleanup
+    # Naming-escape: drop its fixture copy (our own mktemp dir).
+    if [ -n "${_NE_FIXTURE_DIR:-}" ] && [ -d "$_NE_FIXTURE_DIR" ]; then
+        rm -rf "$_NE_FIXTURE_DIR"
+        _NE_FIXTURE_DIR=""
+    fi
     # Echo lane: drop the synthesised pairs (our own mktemp dir, never a real
     # recordings directory).
     if [ -n "${_ECHO_FIXTURE_DIR:-}" ] && [ -d "$_ECHO_FIXTURE_DIR" ]; then
@@ -1536,16 +2280,17 @@ on_exit() {
     _qf_release_lock
     # A restore that did not match turns any run red, a passing one included.
     [ -z "${_QF_RESTORE_FAILED:-}" ] || exit 1
+    [ -z "${_PP_RESTORE_FAILED:-}" ] || exit 1
 }
 # Single cleanup hook, but the signal paths must EXIT after cleaning up: a
 # trapped INT/TERM otherwise returns into the interrupted command and execution
 # continues (e.g. the confirm would re-pollute a just-restored DB). Only the
 # EXIT trap runs cleanup-without-exit (the shell is already leaving). 130 = 128+SIGINT,
 # 143 = 128+SIGTERM, the conventional shell exit codes for those signals.
-trap on_exit EXIT
+trap 'on_exit "$?"' EXIT
 
-trap 'on_exit; exit 130' INT
-trap 'on_exit; exit 143' TERM
+trap 'on_exit 130; exit 130' INT
+trap 'on_exit 143; exit 143' TERM
 
 # The lane configures the app by writing preferences from the shell, and a write
 # that misses the domain the app resolves is completely silent: the app runs on
@@ -1561,17 +2306,12 @@ trap 'on_exit; exit 143' TERM
 # unrestored.
 if [ "$RECORD_ONLY" = true ]; then _EXPECTED_RECORD_ONLY=true; else _EXPECTED_RECORD_ONLY=false; fi
 # A 200 from /healthz is not proof the app under test is the one answering, and
-# neither is a non-empty /state: `rpc` has no --fail, so an error body would
-# satisfy a bare emptiness test and then read as a null setting, which would get
-# reported as the wrong preference domain. Require the field itself to be
-# present before believing anything about its value.
-_state_snapshot() {
-    _SNAP="$(rpc /state)"
-    [ -n "$_SNAP" ] && jq -e '.settings.recording | has("recordOnly")' <<<"$_SNAP" >/dev/null 2>&1
-}
-_SNAP=""
-poll_until 20 1 _state_snapshot \
-    || fail "/healthz answered but no /state carrying settings.recording.recordOnly arrived within 20s. Either the app came up without serving a state snapshot, or something other than the dev app is holding 127.0.0.1:9876."
+# neither is an answer from /state: one without the field would read as a null
+# setting, which would get reported as the wrong preference domain. Require the
+# field itself to be present before believing anything about its value.
+poll_state 20 1 state_is '.settings.recording | has("recordOnly")' \
+    || fail "$(state_why $? "/healthz answered but no /state carrying settings.recording.recordOnly arrived within 20s. Either the app came up without serving a state snapshot, or something other than the dev app is holding 127.0.0.1:9876.")"
+_SNAP="$STATE_BODY"
 _RESOLVED_RECORD_ONLY="$(jq -r '.settings.recording.recordOnly' <<<"$_SNAP")"
 [ "$_RESOLVED_RECORD_ONLY" = "$_EXPECTED_RECORD_ONLY" ] \
     || fail "the app resolved settings.recording.recordOnly=$_RESOLVED_RECORD_ONLY but this lane needs $_EXPECTED_RECORD_ONLY. Most likely the preference write did not reach the domain the app reads (see write_dev_default in scripts/lib/e2e-helpers.sh); the other possibility is that a different MeetingTranscriber instance is answering on 127.0.0.1:9876."
@@ -1607,9 +2347,15 @@ PRE_LAST_JOB_ID=""
 # job (see the CI reset above) fails the run before the fresh recording even
 # finishes. Poll until `lastJob.jobID` is stable across two reads (bounded
 # ~15 s), then baseline. Read-only — touches no files, safe on any machine.
+# An unanswered read is no reading at all: it used to come out as an empty id,
+# two of which looked stable and baselined "no job".
 _pre_prev="" _pre_stable=0
 for _ in $(seq 1 15); do
-    _pre_cur="$(rpc /state | jq -r '.lastJob.jobID // ""')" || _pre_cur=""
+    if ! _pre_cur="$(state_query '.lastJob.jobID // ""' 2>/dev/null)"; then
+        _pre_stable=0 _pre_prev="(no answer)"
+        sleep 1
+        continue
+    fi
     if [ "$_pre_cur" = "$_pre_prev" ]; then
         _pre_stable=$(( _pre_stable + 1 ))
         [ "$_pre_stable" -ge 2 ] && break
@@ -1619,7 +2365,14 @@ for _ in $(seq 1 15); do
     _pre_prev="$_pre_cur"
     sleep 1
 done
-PRE_LAST_JOB_ID="$(rpc /state | jq -r '.lastJob.jobID // empty')"
+# The value found stable is the baseline; only a loop that ran out without
+# settling needs another read.
+if [ "$_pre_stable" -ge 2 ]; then
+    PRE_LAST_JOB_ID="$_pre_cur"
+else
+    PRE_LAST_JOB_ID="$(state_query '.lastJob.jobID // empty')" \
+        || fail "$(state_why $? "the pre-trigger lastJob baseline")"
+fi
 log "Pre-trigger lastJob.jobID: ${PRE_LAST_JOB_ID:-<none>}"
 
 # Shared poll loop used by every flow that triggers a pipeline job
@@ -1633,9 +2386,26 @@ log "Pre-trigger lastJob.jobID: ${PRE_LAST_JOB_ID:-<none>}"
 # One jq invocation, four fields out via `|`-joined output saves 3 forks
 # per poll. `|` (not `@tsv`) keeps consecutive empty fields as boundaries
 # — bash `IFS=$'\t' read` collapses them and misparses a fully-null
-# lastJob. Trailing `|| true` survives transient curl --max-time hits
-# during model load: jq emits no output → read hits EOF → returns 1 →
-# `set -e` would otherwise kill the script silently.
+# lastJob.
+#
+# The loop is poll_state's: a tick the app does not answer (e.g. a timeout
+# during model load) is skipped and logged rather than read as empty fields,
+# and a deadline reached while it is not answering says so instead of
+# blaming the pipeline. assert_app_alive runs on every tick through --each,
+# answered or not, so a dead app fails at once instead of after the full
+# ${PIPELINE_TIMEOUT_S}s of unanswered reads. --judge-deadline-read: the
+# verdict is in the snapshot itself (a job that is new and terminal), so the
+# read that follows a gap at the deadline counts like any answered tick. That
+# lets a job finishing up to about two read bounds (2 x RPC_READ_BOUND_S)
+# past ${PIPELINE_TIMEOUT_S}s pass, which is accepted: the timeout is a hang
+# guard, not a latency budget, and an answered last tick already overruns it
+# by up to one bound.
+#
+# The poll's last read is the terminal snapshot, left in STATE_BODY, so the
+# callers' post-poll assertions read the same snapshot the verdict came from.
+# Nothing may call state_read (or state_query, poll_state, watch_state)
+# between this function's return and those reads: it would replace
+# STATE_BODY with a later snapshot.
 POLL_LJ_ID=""
 POLL_LJ_STATE=""
 _poll_for_new_lastjob_terminal() {
@@ -1647,66 +2417,92 @@ _poll_for_new_lastjob_terminal() {
     # crash-recovery lane omits the flag; its expected job IS the recovered one.
     local ignore_recovered="${2:-}"
     log "$label: polling /state every 5s for new lastJob (timeout ${PIPELINE_TIMEOUT_S}s)"
-    local deadline=$(( $(date +%s) + PIPELINE_TIMEOUT_S ))
-    local last_state="" last_id="" noted_recovered=""
+    local last_state="" last_id="" noted_recovered="" status=0
     local lj_id="" lj_state="" lj_recovered="" pipe_active="" pipe_processing="" pending_naming=""
 
-    while true; do
-        # Fail fast if the dev .app died — otherwise the loop just sees
-        # the `|| true` swallow rpc/state errors and we'd burn the full
-        # ${PIPELINE_TIMEOUT_S}s before surfacing as "no new pipeline
-        # job reached terminal state", masking the real crash.
-        assert_app_alive
-
-        lj_id=""; lj_state=""; lj_recovered=""; pipe_active=""; pipe_processing=""; pending_naming=""
-        IFS='|' read -r lj_id lj_state lj_recovered pipe_active pipe_processing pending_naming < <(
-            rpc /state | jq -r '[.lastJob.jobID // "", .lastJob.state // "", ((.lastJob.meetingTitle // "") | startswith("Recovered Recording")), .pipeline.activeJobCount, .pipeline.isProcessing, .pipeline.pendingNamingJobCount] | join("|")'
-        ) || true
-
-        # Drain speaker-naming dialogs so headless runs don't deadlock on a
-        # UI click. Fire-and-forget; the endpoint is a no-op when nothing
-        # is pending and the next tick picks up the state change.
-        if [ "${pending_naming:-0}" != "0" ] && [ -n "$pending_naming" ]; then
-            # Capture pendingNamingJobs[0].speakerCount the FIRST time we
-            # observe a pending naming job — before /action/skipNaming
-            # clears the queue. Surfaces the speaker-count Phase 1 of
-            # issue #165 promises: Sortformer mode must populate
-            # `result.embeddings` so the naming dialog sees N>0 speakers.
-            # Without this capture there's no production-chain signal that
-            # the embedding-extraction wiring is actually producing output.
-            if [ -z "${OBSERVED_NAMING_SPEAKERS:-}" ]; then
-                OBSERVED_NAMING_SPEAKERS="$(rpc /state | jq -r '.pendingNamingJobs[0].speakerCount // 0')" || OBSERVED_NAMING_SPEAKERS=0
-                log "$label:   First observed pendingNamingJobs[0].speakerCount=$OBSERVED_NAMING_SPEAKERS"
-            fi
-            log "$label:   Auto-skipping ${pending_naming} pending naming job(s) via /action/skipNaming"
-            curl --silent --show-error --max-time 5 -X POST \
-                --header "Authorization: Bearer $RPC_TOKEN" \
-                "$RPC_BASE/action/skipNaming" >/dev/null 2>&1 || true
-        fi
-
-        if [ "$lj_state" != "$last_state" ] || [ "$lj_id" != "$last_id" ]; then
-            log "$label:   pipeline.active=$pipe_active processing=$pipe_processing lastJob=$lj_id state=$lj_state pending_naming=$pending_naming"
-            last_state="$lj_state"
-            last_id="$lj_id"
-        fi
-
-        if [ -n "$ignore_recovered" ] && [ "$lj_recovered" = "true" ] \
-            && [ "$lj_id" != "$PRE_LAST_JOB_ID" ] && [ "$lj_id" != "${noted_recovered:-}" ]; then
-            log "$label:   ignoring launch-recovery job $lj_id (state=$lj_state) — waiting for the simulator-triggered job"
-            noted_recovered="$lj_id"
-        fi
-        if [ -n "$lj_id" ] && [ "$lj_id" != "$PRE_LAST_JOB_ID" ] \
-            && { [ -z "$ignore_recovered" ] || [ "$lj_recovered" != "true" ]; } \
-            && { [ "$lj_state" = "done" ] || [ "$lj_state" = "error" ]; }; then
-            break
-        fi
-
-        [ "$(date +%s)" -lt "$deadline" ] || fail "$label: no new pipeline job reached terminal state within ${PIPELINE_TIMEOUT_S}s (active=$pipe_active processing=$pipe_processing)"
-        sleep 5
-    done
+    poll_state --each assert_app_alive --judge-deadline-read "$PIPELINE_TIMEOUT_S" 5 _lastjob_tick || status=$?
+    case "$status" in
+        0) ;;
+        1) fail "$label: no new pipeline job reached terminal state within ${PIPELINE_TIMEOUT_S}s (active=$pipe_active processing=$pipe_processing)" ;;
+        *) fail "$(state_why "$status" "$label: whether a new pipeline job reached a terminal state within ${PIPELINE_TIMEOUT_S}s (last answered: active=$pipe_active processing=$pipe_processing)")" ;;
+    esac
 
     POLL_LJ_ID="$lj_id"
     POLL_LJ_STATE="$lj_state"
+}
+
+# One tick of _poll_for_new_lastjob_terminal, on an answered STATE_BODY. Reads
+# and writes that function's locals (bash dynamic scoping).
+_lastjob_tick() {
+    badge_note
+    lj_id=""; lj_state=""; lj_recovered=""; pipe_active=""; pipe_processing=""; pending_naming=""
+    IFS='|' read -r lj_id lj_state lj_recovered pipe_active pipe_processing pending_naming < <(
+        jq -r '[.lastJob.jobID // "", .lastJob.state // "", ((.lastJob.meetingTitle // "") | startswith("Recovered Recording")), .pipeline.activeJobCount, .pipeline.isProcessing, .pipeline.pendingNamingJobCount] | join("|")' <<<"$STATE_BODY"
+    ) || true
+
+    # Drain speaker-naming dialogs so headless runs don't deadlock on a
+    # UI click. Fire-and-forget; the endpoint is a no-op when nothing
+    # is pending and the next tick picks up the state change.
+    if [ "${pending_naming:-0}" != "0" ] && [ -n "$pending_naming" ]; then
+        # Capture pendingNamingJobs[0].speakerCount the FIRST time we
+        # observe a pending naming job — before /action/skipNaming
+        # clears the queue. Surfaces the speaker-count Phase 1 of
+        # issue #165 promises: Sortformer mode must populate
+        # `result.embeddings` so the naming dialog sees N>0 speakers.
+        # Without this capture there's no production-chain signal that
+        # the embedding-extraction wiring is actually producing output.
+        if [ -z "${OBSERVED_NAMING_SPEAKERS:-}" ]; then
+            OBSERVED_NAMING_SPEAKERS="$(jq -r '.pendingNamingJobs[0].speakerCount // 0' <<<"$STATE_BODY")" || OBSERVED_NAMING_SPEAKERS=0
+            log "$label:   First observed pendingNamingJobs[0].speakerCount=$OBSERVED_NAMING_SPEAKERS"
+        fi
+        log "$label:   Auto-skipping ${pending_naming} pending naming job(s) via /action/skipNaming"
+        curl --silent --show-error --max-time 5 -X POST \
+            --header "Authorization: Bearer $RPC_TOKEN" \
+            "$RPC_BASE/action/skipNaming" >/dev/null 2>&1 || true
+    fi
+
+    if [ "$lj_state" != "$last_state" ] || [ "$lj_id" != "$last_id" ]; then
+        log "$label:   pipeline.active=$pipe_active processing=$pipe_processing lastJob=$lj_id state=$lj_state pending_naming=$pending_naming"
+        last_state="$lj_state"
+        last_id="$lj_id"
+    fi
+
+    if [ -n "$ignore_recovered" ] && [ "$lj_recovered" = "true" ] \
+        && [ "$lj_id" != "$PRE_LAST_JOB_ID" ] && [ "$lj_id" != "${noted_recovered:-}" ]; then
+        log "$label:   ignoring launch-recovery job $lj_id (state=$lj_state) — waiting for the simulator-triggered job"
+        noted_recovered="$lj_id"
+    fi
+    [ -n "$lj_id" ] && [ "$lj_id" != "$PRE_LAST_JOB_ID" ] \
+        && { [ -z "$ignore_recovered" ] || [ "$lj_recovered" != "true" ]; } \
+        && { [ "$lj_state" = "done" ] || [ "$lj_state" = "error" ]; }
+}
+
+# jq filter: whether the speaker-naming window is on screen (the naming lanes).
+_NAMING_WINDOW_VISIBLE='[.windows[] | select(.id == "speaker-naming") | .isVisible] | first // false'
+
+# _read_transcript_size <label> <path> — the transcript's size into
+# TRANSCRIPT_SIZE, read under a bound, failing the lane below 101 bytes. The job's preflight step catches a
+# missing Downloads grant up front; this is the backstop for a lane run by
+# hand or a grant lost mid-job, where a bare `wc -c` once blocked behind a
+# consent prompt until the step timeout and outlived it. Called before the
+# first read of the transcript's contents in the transcript, re-import and
+# naming-confirm lanes; other reads of the output folder stay unbounded and
+# rely on the preflight.
+_read_transcript_size() {
+    local label="$1" path="$2" bound="${E2E_READ_BOUND_S:-30}" out status=0
+    out="$(run_bounded "$bound" wc -c "$path" 2>&1)" || status=$?
+    local verdict
+    verdict="$(tcc_probe_verdict "$status" "$out")"
+    # Only the real ~/Downloads is TCC-guarded; the isolated-home lanes keep
+    # their output under $TMPDIR, where a hang has some other cause.
+    case "$path" in "$HOME/Downloads/"*) ;; *) [ "$verdict" = granted ] || verdict=error ;; esac
+    case "$verdict" in
+        granted) TRANSCRIPT_SIZE="$(awk '{ print $1; exit }' <<<"$out")" ;;
+        blocked) fail "$label: reading the transcript $path did not return within ${bound}s: blocked, most likely behind a TCC consent prompt. Fix: $(tcc_fix_hint 'Files & Folders → Downloads')" ;;
+        denied) fail "$label: reading the transcript $path was refused ($out). Fix: $(tcc_fix_hint 'Files & Folders → Downloads')" ;;
+        *) fail "$label: could not read the transcript $path (exit $status, 124 = no answer within ${bound}s): $out" ;;
+    esac
+    [ "$TRANSCRIPT_SIZE" -gt 100 ] || fail "$label: transcript suspiciously short: $TRANSCRIPT_SIZE bytes (expected > 100)"
 }
 
 # Fail the lane unless the transcript reads as German. Guards the
@@ -1722,35 +2518,102 @@ assert_transcript_is_german() {
     log "$label: transcript content OK — matched $GERMAN_MARKER_MATCHED/${#GERMAN_MARKER_WORDS[@]} German words [$GERMAN_MARKER_HITS]"
 }
 
-run_one_meeting() {
+# Fail the lane unless the transcript reaches TRANSCRIPT_MIN_COVERAGE_S into
+# the recording (transcript_covered_seconds: the latest block start plus a
+# deliberately short estimate of its length). The size and language checks
+# above both pass on a transcript of the first few sentences, so a pipeline
+# that transcribes only the opening of a recording would otherwise stay green.
+# For the default fixture only: the floor is set from its length.
+assert_transcript_covers_recording() {
+    local label="$1" transcript_path="$2" covered
+    covered="$(transcript_covered_seconds "$transcript_path")" \
+        || fail "$label: transcript carries no [MM:SS] segment line, so how much of the recording it covers cannot be told. Preview:"$'\n'"$(head -c 500 "$transcript_path")"
+    [ "$covered" -ge "$TRANSCRIPT_MIN_COVERAGE_S" ] \
+        || fail "$label: the transcript reaches only about ${covered}s into the recording (its latest block start plus its words at ${TRANSCRIPT_WORDS_PER_SECOND} a second), but a recording of the 49.8 s fixture must reach at least ${TRANSCRIPT_MIN_COVERAGE_S}s. Only the opening of the recording was transcribed (a truncated recording, a pipeline that stopped after its first chunk), or the recording started very late. Preview:"$'\n'"$(tail -c 500 "$transcript_path")"
+    log "$label: transcript covers the recording to at least ${covered}s (floor ${TRANSCRIPT_MIN_COVERAGE_S}s)"
+}
+
+# Wait until the app reports a recording, right after the simulator started.
+# Without this the job poll below was the first check, and a meeting that was
+# never detected failed four minutes later as "no new pipeline job", which says
+# nothing about why. Polls through --each assert_app_alive, so a crash is named
+# as one.
+_await_recording_started() {
     local label="$1"
+    log "$label: waiting up to ${RECORDING_START_TIMEOUT_S}s for /state.watchState == \"recording\""
+    _recording_tick() { badge_note; state_is '.watchState == "recording"'; }
+    poll_state --each assert_app_alive "$RECORDING_START_TIMEOUT_S" 1 _recording_tick \
+        || fail "$(state_why $? "$label: no recording started within ${RECORDING_START_TIMEOUT_S}s of the simulator starting (last watchState: $(jq -r '.watchState // "none"' <<<"${STATE_BODY:-null}" 2>/dev/null)). Likely causes: the detector did not see the simulator's power assertion (auto-watch not on, the watch loop not running, a detector regression), or a TCC grant the recording needs is missing (Microphone, Screen & System Audio Recording) and the app is waiting on a consent prompt. See the e2e-architecture skill, runner setup steps 4 and 5.")"
+    log "$label: recording started"
+}
+
+# The menu-bar badge must have read `recording` while the meeting was recorded.
+# Seen on the same snapshots the lane polls anyway (badge_note); the recording
+# lasts the whole fixture, against a poll interval of 1 to 5 s, so a healthy
+# run cannot miss it. The shorter transcribing and diarizing states are not
+# asserted: they can pass between two polls.
+_assert_recording_badge_seen() {
+    local label="$1"
+    badge_seen recording \
+        || fail "$label: /state.badge never read 'recording' while the app was recording (badges seen: ${E2E_BADGES_SEEN:-none}); the menu bar would not show the recording"
+    log "$label: menu-bar badges seen: $E2E_BADGES_SEEN"
+}
+
+# run_one_meeting <label> [<window title>] — the window title is handed to the
+# simulator's --title; without one it shows its default. The finished job goes
+# to LAST_MEETING_JOB for the title checks below.
+LAST_MEETING_JOB=""
+# A finished job keeps its relocated audio while recording retention is off;
+# see `retention_default_verdict` for what is checked and why it waits.
+_RETENTION_GRACE_S=5
+_assert_recording_kept_by_default() {
+    local label="$1" transcript_path="$2"
+    local enabled setting mix
+    enabled="$(read_dev_default_effective "$DEV_BUNDLE_ID" "$_CONTAINER_PLIST" recordingRetentionEnabled)"
+    setting="recordingRetentionEnabled=${enabled:-<unset, default off>}"
+    mix="$RECORDINGS_DIR/$(basename "$transcript_path" .txt)_mix.wav"
+    case "$(retention_default_verdict "$enabled" "$mix" "$_RETENTION_GRACE_S")" in
+        skip) log "$label: SKIP retention default check: $setting on this host" ;;
+        kept) log "$label: recording still in $RECORDINGS_DIR ${_RETENTION_GRACE_S}s after done ($setting)" ;;
+        missing) fail "$label: no relocated recording at $mix right after the job finished ($setting)" ;;
+        deleted) fail "$label: $mix was deleted after the job finished with $setting; it must stay unless retention is switched on" ;;
+        *) fail "$label: retention_default_verdict gave no verdict for $mix" ;;
+    esac
+}
+
+run_one_meeting() {
+    local label="$1" window_title="${2:-}"
+    local -a sim_args=("$SIMULATOR_FIXTURE")
+    [ -z "$window_title" ] || sim_args+=(--title "$window_title")
     # Reset between meetings so --two-meetings captures each run's first
     # observed naming-dialog speaker count, not just meeting 1's stale value.
     OBSERVED_NAMING_SPEAKERS=""
-    log "$label: starting meeting-simulator → $SIMULATOR_FIXTURE"
-    "$SIMULATOR_BIN" "$SIMULATOR_FIXTURE" >/tmp/e2e-app-sim.log 2>&1 &
-    SIM_PID=$!
+    E2E_BADGES_SEEN=""
+    log "$label: starting meeting-simulator → $SIMULATOR_FIXTURE${window_title:+ (window title '$window_title')}"
+    _start_simulator "$label" "${sim_args[@]}"
 
+    _await_recording_started "$label"
     _poll_for_new_lastjob_terminal "$label" ignore-recovered
     local lj_id="$POLL_LJ_ID" lj_state="$POLL_LJ_STATE"
 
     log "$label: final state: $lj_state"
     local final_snapshot
-    final_snapshot="$(rpc /state)"
+    final_snapshot="$STATE_BODY"
     echo "$final_snapshot" | jq '.lastJob'
+    LAST_MEETING_JOB="$(jq -c '.lastJob' <<<"$final_snapshot")"
 
     [ "$lj_state" = "done" ] || fail "$label: lastJob.state == \"$lj_state\", expected \"done\". Error: $(jq -r '.lastJob.error // "<none>"' <<<"$final_snapshot")"
+    _assert_recording_badge_seen "$label"
 
     local transcript_path
     transcript_path="$(jq -r '.lastJob.transcriptPath // empty' <<<"$final_snapshot")"
     [ -n "$transcript_path" ] || fail "$label: lastJob.transcriptPath is empty"
     [ -f "$transcript_path" ] || fail "$label: transcript file does not exist: $transcript_path"
 
-    local transcript_size
-    transcript_size="$(wc -c <"$transcript_path" | tr -d ' ')"
-    [ "$transcript_size" -gt 100 ] || fail "$label: transcript suspiciously short: $transcript_size bytes (expected > 100)"
+    _read_transcript_size "$label" "$transcript_path"
+    _assert_recording_kept_by_default "$label" "$transcript_path"
 
-    log "$label: transcript $transcript_path ($transcript_size bytes)"
+    log "$label: transcript $transcript_path ($TRANSCRIPT_SIZE bytes)"
     log "$label: preview:"
     head -c 500 "$transcript_path" | sed 's/^/    /'
 
@@ -1767,6 +2630,7 @@ run_one_meeting() {
         log "$label: mic-device-change survival lane — skipping content keyword assertion"
     elif [ "$IS_DEFAULT_FIXTURE" = true ]; then
         assert_transcript_is_german "$label" "$transcript_path"
+        assert_transcript_covers_recording "$label" "$transcript_path"
     else
         # Custom --fixture: unknown spoken content, so keep only the size check.
         log "$label: custom fixture — skipping content keyword assertion (size check only)"
@@ -1811,6 +2675,9 @@ await_new_sidecar() {
     while true; do
         SIDECAR_PATH="$(find "$RECORDINGS_DIR" -type f -name '*_meta.json' -newer "$marker" -print 2>/dev/null | head -1)"
         [ -n "$SIDECAR_PATH" ] && break
+        # The menu-bar badge while the recording ends, for the record-only
+        # lane's no-processing check; a read the app does not answer is skipped.
+        if RPC_READ_BOUND_S=5 state_read 2>/dev/null; then badge_note; fi
         [ "$(date +%s)" -lt "$deadline" ] || fail "$label: no *_meta.json appeared in $RECORDINGS_DIR within ${RECORD_ONLY_DEADLINE_S}s"
         sleep 2
     done
@@ -1819,10 +2686,17 @@ await_new_sidecar() {
 }
 
 # The lane-independent half of the schema: shape and timestamps.
+#
+# The version is pinned on purpose, and so has to move with
+# `RecordingSidecar.currentVersion`: a consumer on another machine reads these
+# files, so a bump should be seen here. Version 3 added `micMuteIntervals`,
+# which the writer always emits (empty when the mic was never muted).
+# scripts/tests/test_sidecar_schema_version.sh fails when the two differ.
 assert_sidecar_common() {
     local label="$1" sidecar="$2" check
     check="$(jq -r '
-        if .version != 2 then "version != 2 (got: \(.version))"
+        if .version != 3 then "version != 3 (got: \(.version))"
+        elif (.micMuteIntervals | type) != "array" then "micMuteIntervals not array"
         elif (.startedAt | type) != "string" then "startedAt not string"
         elif (.stoppedAt | type) != "string" then "stoppedAt not string"
         elif (.startedAt | fromdateiso8601? // -1) < 0 then "startedAt not ISO8601"
@@ -1871,8 +2745,12 @@ assert_sidecar_track_has_signal() {
 # turns "no finished job and no finished artifact" into "no job at all", which
 # is what record-only actually promises.
 assert_pipeline_did_not_run() {
-    local label="$1" violation
-    violation="$(record_only_violation "$(rpc /state)" "$PRE_LAST_JOB_ID")"
+    local label="$1" violation snap
+    # An unanswered read used to reach record_only_violation as an empty
+    # snapshot, which with no baseline job reads as "nothing ran".
+    snap="$(state_query .)" || fail "$(state_why $? "$label: whether record-only left the pipeline idle")"
+    badge_note "$snap"
+    violation="$(record_only_violation "$snap" "$PRE_LAST_JOB_ID")"
     [ -z "$violation" ] \
         || fail "$label: $violation. Record-only must not enqueue at all, and a job still in flight is invisible to both lastJob and the transcript check, so without this the lane would report success while the pipeline was doing what it must not do."
 }
@@ -1885,6 +2763,32 @@ assert_pipeline_did_not_run() {
 # `afplay` rather than the meeting-simulator, and auto-watch off: this lane wants
 # sound, not a detectable meeting. The simulator holds a power assertion, and the
 # watch loop would start an auto recording alongside the manual one.
+#
+# The lane also carries the only live check of POST /v1/watch's refusal, which
+# is otherwise tested against fakes: it holds a manual recording, and while one
+# owns the loop a watch start must be refused with 409 and leave everything as
+# it was. The check asserts the effect, the watch state unchanged and the
+# recording still running, not just the code. It never starts watching: a
+# start rebuilds the pipeline, including staged-recording recovery against the
+# host's real staging folder, which a test must not set off. The status is
+# read with rpc_post_status because the code is the contract, and mt-cli folds
+# every refusal into one non-zero exit.
+_mic_only_assert_watch_refused() {
+    local label="$1" code state status
+    # 30 s: the endpoint may take its 20 s settle before answering. The caller
+    # has just confirmed the recording, so the state before is 'recording'.
+    code="$(rpc_post_status /v1/watch '{"action":"start"}' 30)"
+    [ "$code" = 409 ] \
+        || fail "$label: POST /v1/watch start during a manual recording answered $code, expected 409"
+    state="$(watch_state)"
+    [ "$state" = recording ] \
+        || fail "$label: after the refused watch start, /state.watchState is '$state', expected the manual recording's 'recording'"
+    status="$("$MTCLI" record)" || fail "$label: mt-cli record status failed after the refused watch start"
+    jq -e '.recording == true' >/dev/null <<<"$status" \
+        || fail "$label: the refused watch start ended the manual recording: $status"
+    log "$label: watch start refused with 409; watch state still 'recording', recording still running"
+}
+
 run_mic_only() {
     local label="[mic-only]"
 
@@ -1901,6 +2805,8 @@ run_mic_only() {
     echo "$status" | jq -e '.recording == true' >/dev/null \
         || fail "$label: /v1/record reports recording=false right after a 200 start: $status"
     log "$label: recording confirmed: $status"
+
+    _mic_only_assert_watch_refused "$label"
 
     log "$label: playing $SIMULATOR_FIXTURE into the loopback input"
     afplay "$SIMULATOR_FIXTURE" || fail "$label: afplay failed; the microphone had nothing to capture"
@@ -1972,27 +2878,20 @@ run_one_record_only_meeting() {
     rm -f "$meeting_marker"
     touch "$meeting_marker"
 
+    E2E_BADGES_SEEN=""
     log "$label: starting meeting-simulator (record-only) → $SIMULATOR_FIXTURE"
-    "$SIMULATOR_BIN" "$SIMULATOR_FIXTURE" >/tmp/e2e-app-sim.log 2>&1 &
-    SIM_PID=$!
+    _start_simulator "$label" "$SIMULATOR_FIXTURE"
+    _await_recording_started "$label"
 
     # Block until the simulator finishes playing the fixture. Exit code is
     # irrelevant; we assert on filesystem state below.
     wait "$SIM_PID" || true
     SIM_PID=""
 
-    log "$label: simulator done; polling $RECORDINGS_DIR for sidecar (timeout ${RECORD_ONLY_DEADLINE_S}s)"
-    local deadline=$(( $(date +%s) + RECORD_ONLY_DEADLINE_S ))
-    local sidecar=""
-    while true; do
-        sidecar="$(find "$RECORDINGS_DIR" -type f -name '*_meta.json' -newer "$meeting_marker" -print 2>/dev/null | head -1)"
-        [ -n "$sidecar" ] && break
-        [ "$(date +%s)" -lt "$deadline" ] || fail "$label: no *_meta.json appeared in $RECORDINGS_DIR within ${RECORD_ONLY_DEADLINE_S}s"
-        sleep 2
-    done
-
-    log "$label: found sidecar $sidecar"
-    jq -C . "$sidecar" | sed 's/^/    /'
+    log "$label: simulator done"
+    local sidecar
+    await_new_sidecar "$label" "$meeting_marker"
+    sidecar="$SIDECAR_PATH"
 
     # Schema check in one jq invocation — emits "ok" or a human-readable reason.
     local schema_check
@@ -2045,6 +2944,17 @@ run_one_record_only_meeting() {
     # the two cannot drift apart.
     assert_pipeline_did_not_run "$label"
 
+    # The menu bar agrees, a second witness read from a different field: it
+    # showed the recording, and never a processing badge, on any snapshot from
+    # the start of the recording through the sidecar and the check above. An
+    # absence, so no timing assumption: a healthy record-only run has nothing
+    # to process at all.
+    _assert_recording_badge_seen "$label"
+    local processing
+    processing="$(badges_seen_among transcribing diarizing processing)"
+    [ -z "$processing" ] \
+        || fail "$label: the menu bar showed '$processing' during a record-only meeting (badges seen: $E2E_BADGES_SEEN); record-only must not process the recording"
+
     # Surface the produced mix path so the optional reimport chain picks
     # it up without re-globbing. Reset by each caller's `local` line.
     LAST_RECORDED_MIX_PATH="$mix_path"
@@ -2054,24 +2964,18 @@ run_one_record_only_meeting() {
 
 # Re-import a previously-recorded WAV via POST /action/enqueueFile — same
 # code path the menu's "Open from Recording" entry takes. Polls /state for
-# a new lastJob in `done`, asserts transcript exists, is non-trivial, and
-# contains the expected fixture keyword. Confirms the round-trip:
+# a new lastJob in `done`, asserts transcript exists, is non-trivial, reads
+# as German and covers the recording. Confirms the round-trip:
 # recorder-produced WAV is loadable + transcribable.
 run_one_reimport() {
     local label="$1"
     local audio_path="$2"
-    local expected_phrase="${3:-meeting}"  # case-insensitive substring
 
     [ -f "$audio_path" ] || fail "$label: re-import source not found: $audio_path"
 
     log "$label: POST /action/enqueueFile path=$audio_path"
     local enq_status
-    enq_status="$(curl --silent --show-error --max-time 10 -o /dev/null -w "%{http_code}" \
-        -X POST \
-        --header "Authorization: Bearer $RPC_TOKEN" \
-        --header "Content-Type: application/json" \
-        --data "$(jq -nc --arg p "$audio_path" '{path: $p}')" \
-        "$RPC_BASE/action/enqueueFile" 2>/dev/null || echo "000")"
+    enq_status="$(rpc_post_status /action/enqueueFile "$(jq -nc --arg p "$audio_path" '{path: $p}')" 10)"
     [ "$enq_status" = "200" ] || fail "$label: enqueueFile returned HTTP $enq_status (expected 200)"
 
     _poll_for_new_lastjob_terminal "$label"
@@ -2079,7 +2983,7 @@ run_one_reimport() {
 
     log "$label: final state: $lj_state"
     local final_snapshot
-    final_snapshot="$(rpc /state)"
+    final_snapshot="$STATE_BODY"
     echo "$final_snapshot" | jq '.lastJob'
 
     [ "$lj_state" = "done" ] || fail "$label: lastJob.state == \"$lj_state\", expected \"done\". Error: $(jq -r '.lastJob.error // "<none>"' <<<"$final_snapshot")"
@@ -2089,19 +2993,24 @@ run_one_reimport() {
     [ -n "$transcript_path" ] || fail "$label: lastJob.transcriptPath is empty"
     [ -f "$transcript_path" ] || fail "$label: transcript file does not exist: $transcript_path"
 
-    local transcript_size
-    transcript_size="$(wc -c <"$transcript_path" | tr -d ' ')"
-    [ "$transcript_size" -gt 100 ] || fail "$label: transcript suspiciously short: $transcript_size bytes (expected > 100)"
+    _read_transcript_size "$label" "$transcript_path"
 
     # Content assertion: re-imported WAV came from the live recording stack,
     # so a successful round-trip means the engine actually recognised the
-    # fixture's spoken content — not just emitted any non-empty file.
-    # `meeting` is case-insensitive-robust (Parakeet may capitalise/translate;
-    # WhisperKit may emit "Meeting" or "meeting" depending on punctuation).
-    grep -qi "$expected_phrase" "$transcript_path" \
-        || fail "$label: transcript does not contain '$expected_phrase' (case-insensitive). Preview:$(printf '\n')$(head -c 500 "$transcript_path")"
+    # fixture's spoken content — not just emitted any non-empty file. The same
+    # two checks as the meeting lanes, for the same reason: the WAV is a live
+    # recording that misses a variable opening stretch, so one word of the
+    # script (this used to grep for the fixture's only English word) is a gate
+    # that the recording's start time decides, and a German check with a
+    # coverage floor is not.
+    if [ "$IS_DEFAULT_FIXTURE" = true ]; then
+        assert_transcript_is_german "$label" "$transcript_path"
+        assert_transcript_covers_recording "$label" "$transcript_path"
+    else
+        log "$label: custom fixture — skipping content assertions (size check only)"
+    fi
 
-    log "$label: transcript $transcript_path ($transcript_size bytes, contains '$expected_phrase')"
+    log "$label: transcript $transcript_path ($TRANSCRIPT_SIZE bytes)"
     log "$label: preview:"
     head -c 500 "$transcript_path" | sed 's/^/    /'
     echo
@@ -2135,13 +3044,13 @@ run_crash_recovery() {
     # recovered recording gets a fresh job id after relaunch, so this stable
     # baseline can never equal the recovered job — avoids a race where recovery
     # enqueues before we could sample a post-relaunch baseline.
-    PRE_LAST_JOB_ID="$(rpc /state | jq -r '.lastJob.jobID // empty')"
+    PRE_LAST_JOB_ID="$(state_query '.lastJob.jobID // empty')" \
+        || fail "$(state_why $? "$label: the pre-crash lastJob baseline")"
     log "$label: pre-crash baseline lastJob.jobID=${PRE_LAST_JOB_ID:-<none>}"
 
     # 1. Start a meeting so the app begins recording.
     log "$label: starting meeting-simulator -> $SIMULATOR_FIXTURE"
-    "$SIMULATOR_BIN" "$SIMULATOR_FIXTURE" >/tmp/e2e-app-sim.log 2>&1 &
-    SIM_PID=$!
+    _start_simulator "$label" "$SIMULATOR_FIXTURE"
 
     # 2. Wait until the recorder is writing the raw app temp (recording active).
     local orphan_tmp=""
@@ -2187,7 +3096,7 @@ run_crash_recovery() {
     # 6. Relaunch — recovery runs at the launch queue-build.
     log "$label: relaunching $DEV_BUNDLE_DEPLOY"
     open "$DEV_BUNDLE_DEPLOY"
-    poll_until "$RPC_READY_TIMEOUT_S" 1 _rpc_ready || fail "$label: RPC did not come back after relaunch"
+    poll_until "$RPC_READY_TIMEOUT_S" 1 rpc_ready || fail "$label: RPC did not come back after relaunch"
     log "$label: RPC back up after relaunch"
 
     # 7. Assert recovery: the recovered recording enters the pipeline. The
@@ -2199,13 +3108,8 @@ run_crash_recovery() {
     #    first, so a non-zero count here is the recovered recording. Pre-fix the
     #    orphan is deleted with no recovery → the queue stays empty (RED).
     log "$label: waiting for the recovered recording to enter the pipeline (timeout 120s)"
-    _crash_recovered_job() {
-        local n
-        n="$(rpc /state | jq -r '(.pipeline.activeJobCount // 0) + (.pipeline.pendingNamingJobCount // 0) + (.pipeline.waitingJobCount // 0)')"
-        [ "${n:-0}" -gt 0 ] 2>/dev/null
-    }
-    poll_until 120 3 _crash_recovered_job \
-        || fail "$label: orphan NOT recovered — no recovered recording entered the pipeline within 120s (recovery missing, or the orphan was deleted by launch cleanup)"
+    poll_state 120 3 state_is '((.pipeline.activeJobCount // 0) + (.pipeline.pendingNamingJobCount // 0) + (.pipeline.waitingJobCount // 0)) > 0' \
+        || fail "$(state_why $? "$label: orphan NOT recovered — no recovered recording entered the pipeline within 120s (recovery missing, or the orphan was deleted by launch cleanup)")"
     log "$label: recovered recording entered the pipeline ✅"
 
     # 8. Full chain: drive the recovered job to a terminal state (the poll loop
@@ -2223,7 +3127,7 @@ run_crash_recovery() {
     #    a recording it never crashed. Recovery titles the job after the stem it
     #    rebuilt, which is the only thing in the snapshot that names ours.
     local want_title="Recovered Recording (${stem})" got_title
-    got_title="$(rpc /state | jq -r '.lastJob.meetingTitle // ""')"
+    got_title="$(jq -r '.lastJob.meetingTitle // ""' <<<"$STATE_BODY")"
     [ "$got_title" = "$want_title" ] \
         || fail "$label: the job that finished is titled '$got_title', not '$want_title'. Something reached a terminal state, but not the recording this lane crashed — most likely an orphan left by an earlier interrupted run, recovered at the same launch."
     log "$label: recovered recording transcribed and it is ours (lastJob done) ✅"
@@ -2261,8 +3165,8 @@ run_crash_recovery() {
 # RUNNER PREREQUISITE: the shell running this needs an Accessibility grant
 # (System Settings → Privacy & Security → Accessibility), same one-time,
 # cert-independent shape as the existing mic / screen-recording grants. Checked
-# up front so a missing grant fails with its own message instead of looking like
-# a broken dismiss.
+# up front so a missing grant is reported as a skip with its own message
+# (host_skip) instead of looking like a broken dismiss.
 run_naming_escape() {
     local label="[naming-escape]"
     [ -f "$DEFAULT_FIXTURE" ] || fail "$label: 2-speaker fixture not found: $DEFAULT_FIXTURE"
@@ -2276,8 +3180,16 @@ run_naming_escape() {
     # default 120 s timeout, which reads as a hung lane rather than a missing
     # permission. So the probe wraps the *same* operation the lane performs in a
     # short explicit timeout and treats the timeout as the diagnosis.
-    local probe
-    probe="$(osascript -e 'tell application "System Events" to key code 53' 2>&1)" || true
+    local probe tcc_timeout
+    tcc_timeout="$(e2e_tcc_prompt_timeout)" || fail "$label: see the line above"
+    # The first Apple Event to System Events, so the one that raises the
+    # prompt: it honours the same setup knob as the probe below.
+    # Under a hard bound as well: a pending prompt can hold osascript before
+    # its Apple Event is sent, where `with timeout` never fires. A cut-off
+    # probe reads as the timeout it stands for.
+    probe="$(run_bounded $((tcc_timeout + 5)) osascript -e "with timeout of ${tcc_timeout} seconds" \
+        -e 'tell application "System Events" to key code 53' \
+        -e 'end timeout' 2>&1)" || { [ $? -ne 124 ] || probe="timed out (no answer within $((tcc_timeout + 5))s)"; }
     case "$probe" in
         *"not allowed"*|*"assistive"*|*"1002"*)
             # SKIP for the same reason the Automation arm skips: this is a host
@@ -2286,27 +3198,45 @@ run_naming_escape() {
             # The two grants are separate and can be half-configured — Automation
             # granted, Accessibility not — so both arms need the same treatment
             # or the lane just moves its red one step later.
-            log "$label: SKIP — this host may drive System Events but not post keystrokes."
             log "$label: cause: $probe"
-            log "$label: fix: System Settings → Privacy & Security → Accessibility, enable the entry for the shell that runs this lane (it is usually already listed, unchecked)."
-            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
-                {
-                    echo "### naming-escape lane skipped"
-                    echo
-                    echo "This host has Automation but is missing the **Accessibility** grant, so the real-Escape assertion did not run."
-                    echo "Enable the runner's shell under System Settings → Privacy & Security → Accessibility, then this lane gates normally."
-                } >> "$GITHUB_STEP_SUMMARY"
-            fi
+            host_skip naming-escape "This host may drive System Events but is missing the Accessibility grant, so the real-Escape assertion did not run. Fix: System Settings → Privacy & Security → Accessibility, enable the entry for the process that runs this lane (for this run: $(tcc_grantee); see the e2e-architecture skill, runner setup step 6)."
             return 0 ;;
     esac
     # The probe's window is short by default so a missing grant is reported in
     # seconds rather than waited out. For the one-time setup run it has to be
     # long enough for a human to answer the prompt it raises, hence the knob:
     # E2E_TCC_PROMPT_TIMEOUT=300 bash scripts/e2e-app.sh --naming-escape
-    local tcc_timeout="${E2E_TCC_PROMPT_TIMEOUT:-10}"
-    probe="$(osascript -e "with timeout of ${tcc_timeout} seconds" \
-        -e 'tell application "System Events" to get name of first process whose frontmost is true' \
-        -e 'end timeout' 2>&1)" || true
+    local probe_status attempt
+    # A timeout is what a missing Automation grant looks like, but a busy
+    # System Events looks the same, so a timeout is retried once with three
+    # times the window before it is taken as the grant. A connection that
+    # dropped (-609) or a System Events not running yet (-600) is transient
+    # and retried once too, then fails. A definite refusal (-1743) needs no
+    # retry, and any other error fails the lane.
+    local timeout_retried="" transient_retried=""
+    for attempt in 1 2 3; do
+        probe_status=0
+        probe="$(run_bounded $((tcc_timeout + 5)) osascript -e "with timeout of ${tcc_timeout} seconds" \
+            -e 'tell application "System Events" to get name of first process whose frontmost is true' \
+            -e 'end timeout' 2>&1)" || probe_status=$?
+        [ "$probe_status" -ne 124 ] || probe="timed out (no answer within $((tcc_timeout + 5))s)"
+        case "$probe" in
+            *"timed out"*|*"-1712"*)
+                [ -z "$timeout_retried" ] || break
+                timeout_retried=1
+                # Three times the window, capped at 60 s (the setup knob may
+                # already be minutes long), but never shorter than the first.
+                local longer=$((tcc_timeout * 3 > 60 ? 60 : tcc_timeout * 3))
+                tcc_timeout=$((longer > tcc_timeout ? longer : tcc_timeout))
+                log "$label: System Events did not answer; retrying once with ${tcc_timeout}s" ;;
+            *"-609"*|*"-600"*)
+                [ -z "$transient_retried" ] || break
+                transient_retried=1
+                log "$label: System Events was not reachable ($probe); retrying once"
+                sleep 2 ;;
+            *) break ;;
+        esac
+    done
     case "$probe" in
         *"timed out"*|*"-1712"*|*"not authori"*|*"-1743"*)
             # SKIP, not FAIL. The grant can only be given by clicking Allow in
@@ -2315,24 +3245,22 @@ run_naming_escape() {
             # reason unrelated to the change under test. Failing after this point
             # still fails: only the missing prerequisite is tolerated, and it is
             # reported loudly enough that nobody mistakes it for coverage.
-            log "$label: SKIP — this host cannot drive System Events (probe window ${tcc_timeout}s)."
             log "$label: cause: $probe"
-            log "$label: fix: System Settings → Privacy & Security → Automation, allow the runner's shell to control System Events (and Accessibility for keystrokes). Both prompt on first use, so run this lane once by hand in the GUI session and click Allow."
-            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
-                {
-                    echo "### naming-escape lane skipped"
-                    echo
-                    echo "This host is missing the **Automation** grant, so the real-Escape assertion did not run."
-                    echo "Grant it once in the GUI session (System Settings → Privacy & Security → Automation), then this lane gates normally."
-                } >> "$GITHUB_STEP_SUMMARY"
-            fi
+            host_skip naming-escape "This host cannot drive System Events within ${tcc_timeout}s: the Automation grant is missing, so the real-Escape assertion did not run. Fix: System Settings → Privacy & Security → Automation, allow the process that runs this lane to control System Events, and grant it Accessibility for keystrokes (for this run: $(tcc_grantee); see the e2e-architecture skill, runner setup step 6). Both prompt on first use, so run this lane once by hand in the GUI session and click Allow."
             return 0 ;;
     esac
+    [ "$probe_status" -eq 0 ] \
+        || fail "$label: the System Events preflight failed for a reason that is not a missing grant (exit $probe_status): $probe"
     log "$label: frontmost process is '$probe'"
+    # After the grants, so a missing one is still named as such: both probes
+    # above answer normally on a locked screen, the Escape then does not land.
+    if host_skip_if_screen_locked naming-escape "the real-Escape assertion"; then
+        return 0
+    fi
 
-    local fixture_dir fixture_copy
-    fixture_dir="$(mktemp -d /tmp/e2e-naming-escape-fixture.XXXXXX)"
-    fixture_copy="$fixture_dir/two_speakers_de.wav"
+    local fixture_copy
+    _NE_FIXTURE_DIR="$(mktemp -d /tmp/e2e-naming-escape-fixture.XXXXXX)"
+    fixture_copy="$_NE_FIXTURE_DIR/two_speakers_de.wav"
     cp "$DEFAULT_FIXTURE" "$fixture_copy" || fail "$label: could not copy fixture to $fixture_copy"
 
     local enq job_id
@@ -2345,52 +3273,54 @@ run_naming_escape() {
     [ -n "$job_id" ] || fail "$label: POST /v1/jobs did not return a job id (response: $enq)"
     log "$label: enqueued job $job_id"
 
-    _naming_escape_parked() {
-        [ "$(rpc "/v1/jobs/$job_id" | jq -r '.state // empty')" = "speakerNamingPending" ]
-    }
-    poll_until "$PIPELINE_TIMEOUT_S" 5 _naming_escape_parked \
-        || fail "$label: job $job_id never parked at speaker-naming within ${PIPELINE_TIMEOUT_S}s"
+    poll_rpc "/v1/jobs/$job_id" --each assert_app_alive --judge-deadline-read "$PIPELINE_TIMEOUT_S" 5 \
+        _job_parked "$label" "$job_id" \
+        || fail "$(rpc_why $? "/v1/jobs/$job_id" "$label: job $job_id never parked at speaker-naming within ${PIPELINE_TIMEOUT_S}s")"
 
-    _naming_window_visible() {
-        [ "$(rpc /state | jq -r '[.windows[] | select(.id == "speaker-naming") | .isVisible] | first // false')" = "true" ]
-    }
-    poll_until 30 2 _naming_window_visible \
-        || fail "$label: naming window never became visible"
+    poll_state 30 2 state_is "$_NAMING_WINDOW_VISIBLE" \
+        || fail "$(state_why $? "$label: naming window never became visible")"
     log "$label: naming window open, job parked"
+    # Again, since the pipeline wait above is long enough for the screen to
+    # lock; the job is released so the dialog does not reopen next launch.
+    if host_skip_if_screen_locked naming-escape "the real-Escape assertion"; then
+        _naming_skip "$job_id"
+        return 0
+    fi
 
     # Front the app so the keystroke lands on it, then Escape. No click into the
     # dialog: the point is that dismiss works without a focused field.
     local front_err
-    front_err="$(osascript -e 'with timeout of 15 seconds' \
+    # Both bounded like the probes above: the grants were just proved, but one
+    # lost mid-lane would otherwise hold osascript behind a prompt.
+    local front_s=$(( tcc_timeout > 15 ? tcc_timeout : 15 ))
+    front_err="$(run_bounded $((front_s + 5)) osascript -e "with timeout of ${front_s} seconds" \
         -e 'tell application "System Events" to tell process "MeetingTranscriber" to set frontmost to true' \
         -e 'end timeout' 2>&1)" \
-        || fail "$label: could not front the app: $front_err"
+        || fail "$label: could not front the app (124 = no answer within $((front_s + 5)) s): ${front_err:-<no output>}. If it was refused or timed out: $(tcc_fix_hint 'Automation → System Events')"
     sleep 1
     local key_err
-    key_err="$(osascript -e 'tell application "System Events" to key code 53' 2>&1)" \
-        || fail "$label: could not post Escape: $key_err"
+    key_err="$(run_bounded $((tcc_timeout + 5)) osascript -e "with timeout of ${tcc_timeout} seconds" \
+        -e 'tell application "System Events" to key code 53' \
+        -e 'end timeout' 2>&1)" \
+        || fail "$label: could not post Escape (124 = no answer within $((tcc_timeout + 5)) s): ${key_err:-<no output>}. If it was refused or timed out: $(tcc_fix_hint 'Device Control and Data Access, and Automation → System Events')"
 
-    _naming_window_gone() {
-        ! _naming_window_visible
-    }
-    poll_until 15 1 _naming_window_gone \
-        || fail "$label: Escape did not dismiss the naming window (windows=$(rpc /state | jq -c '[.windows[]|{id,isVisible}]'))"
+    # The negative check is where an unanswered read did the most harm: it read
+    # as "not visible", so a wedged app passed as a dismissed window.
+    poll_state 15 1 state_is "($_NAMING_WINDOW_VISIBLE) | not" \
+        || fail "$(state_why $? "$label: Escape did not dismiss the naming window (windows=$(jq -c '[.windows[]|{id,isVisible}]' <<<"$STATE_BODY"))")"
     log "$label: window dismissed"
 
     # The half that separates a dismiss from a Skip: the job must be untouched
     # and still resolvable. A Skip here would have committed the auto-names and
     # deleted the naming data.
-    local state
-    state="$(rpc "/v1/jobs/$job_id" | jq -r '.state // empty')"
-    [ "$state" = "speakerNamingPending" ] \
-        || fail "$label: Escape resolved the job (state=$state, expected speakerNamingPending)"
+    rpc_read "/v1/jobs/$job_id" \
+        || fail "$(rpc_why $? "/v1/jobs/$job_id" "$label: whether Escape left the job parked")"
+    rpc_is '.state == "speakerNamingPending"' \
+        || fail "$label: Escape resolved the job (HTTP $RPC_STATUS, state=$(rpc_field '.state // empty'), expected speakerNamingPending)"
     log "$label: job still parked — dismiss did not resolve it"
 
     # Leave nothing pending behind; the dialog would reopen on the next launch.
-    curl --silent --show-error --max-time 10 -X POST \
-        --header "Authorization: Bearer $RPC_TOKEN" --header "Content-Length: 0" \
-        "$RPC_BASE/v1/jobs/$job_id/naming/skip" >/dev/null 2>&1 || true
-    rm -rf "$fixture_dir"
+    _naming_skip "$job_id"
     log "$label: PASS"
 }
 
@@ -2404,8 +3334,7 @@ run_naming_confirm() {
     # dev bundle's container-plist redirect). Read the DB baseline from the
     # same snapshot.
     local snap diarize num_speakers record_only pre_db_count
-    snap="$(rpc /state)"
-    [ -n "$snap" ] || fail "$label: /state returned empty (RPC down?)"
+    snap="$(state_query .)" || fail "$(state_why $? "$label: the resolved diarization settings")"
     diarize="$(jq -r '.settings.diarization.diarize' <<<"$snap")"
     num_speakers="$(jq -r '.settings.diarization.numSpeakers' <<<"$snap")"
     record_only="$(jq -r '.settings.recording.recordOnly' <<<"$snap")"
@@ -2442,14 +3371,13 @@ run_naming_confirm() {
     # /action/skipNaming here; driving the confirm is the whole point.
     local pending_count=""
     _naming_pending() {
-        assert_app_alive
-        pending_count="$(rpc /state | jq -r --arg id "$job_id" \
-            '[.pendingNamingJobs[] | select(.jobID == $id)] | .[0].speakerCount // empty')"
+        pending_count="$(jq -r --arg id "$job_id" \
+            '[.pendingNamingJobs[] | select(.jobID == $id)] | .[0].speakerCount // empty' <<<"$STATE_BODY")"
         [ -n "$pending_count" ]
     }
     log "$label: waiting for job $job_id to reach speaker-naming (timeout ${PIPELINE_TIMEOUT_S}s)"
-    poll_until "$PIPELINE_TIMEOUT_S" 5 _naming_pending \
-        || fail "$label: job $job_id never reached speaker-naming within ${PIPELINE_TIMEOUT_S}s (diarization produced no naming dialog?)"
+    poll_state --each assert_app_alive "$PIPELINE_TIMEOUT_S" 5 _naming_pending \
+        || fail "$(state_why $? "$label: job $job_id never reached speaker-naming within ${PIPELINE_TIMEOUT_S}s (diarization produced no naming dialog?)")"
     log "$label: job parked at naming with speakerCount=$pending_count"
     [ "${pending_count:-0}" -ge 2 ] 2>/dev/null \
         || fail "$label: naming dialog speakerCount=$pending_count, expected >= 2 (numSpeakers=2 on a 2-speaker fixture)"
@@ -2463,11 +3391,10 @@ run_naming_confirm() {
     # (vacuous). Reverting NamingWindowPolicy flips floating -> false here, which
     # is what turns this lane red.
     local naming_win=""
-    # Capture the speaker-naming window's RPC projection into $naming_win;
-    # non-zero if the window is not present.
+    # Capture the speaker-naming window's projection from the poll's /state
+    # answer into $naming_win; non-zero if the window is not present.
     _naming_window() {
-        assert_app_alive
-        naming_win="$(rpc /state | jq -c '[.windows[] | select(.id == "speaker-naming")] | .[0] // empty')"
+        naming_win="$(jq -c '[.windows[] | select(.id == "speaker-naming")] | .[0] // empty' <<<"$STATE_BODY")"
         [ -n "$naming_win" ]
     }
     # Assert only the environment-STABLE pin properties. `.fullScreenAuxiliary`
@@ -2491,8 +3418,8 @@ run_naming_confirm() {
     # The window opens asynchronously (.showSpeakerNaming -> bringWindowToFront
     # on the next runloop), so poll rather than assert once.
     log "$label: asserting speaker-naming window is pinned (floating + all-Spaces)"
-    poll_until 30 2 _naming_window_pinned \
-        || fail "$label: speaker-naming window not pinned (#504 regression): $(rpc /state | jq -c '[.windows[] | select(.id=="speaker-naming")]')"
+    poll_state --each assert_app_alive 30 2 _naming_window_pinned \
+        || fail "$(state_why $? "$label: speaker-naming window not pinned (#504 regression): $(jq -c '[.windows[] | select(.id=="speaker-naming")]' <<<"$STATE_BODY")")"
     log "$label: naming window pinned OK: $naming_win"
 
     # And it must SURVIVE the app losing focus: bring another app to the front,
@@ -2502,21 +3429,23 @@ run_naming_confirm() {
     # false only AFTER deactivation, which phase 1 (app still active) cannot see.
     # RPC + the naming confirm are localhost HTTP, so leaving our menu-bar app
     # in the background does not block the rest of the lane.
-    osascript -e 'tell application "Finder" to activate' >/dev/null 2>&1 || true
+    run_bounded 5 osascript -e 'tell application "Finder" to activate' >/dev/null 2>&1 || true
     sleep 2
     # Poll rather than single-shot: a transient localhost RPC hiccup at this one
     # instant would otherwise fail the lane with a misleading "regression"
     # message. A genuine hide-on-deactivate regression stays red the whole window.
-    poll_until 20 2 _naming_window_visible_pinned \
-        || fail "$label: speaker-naming window not visible + pinned after the app was deactivated (#504 regression): $(rpc /state | jq -c '.windows')"
+    poll_state --each assert_app_alive 20 2 _naming_window_visible_pinned \
+        || fail "$(state_why $? "$label: speaker-naming window not visible + pinned after the app was deactivated (#504 regression): $(jq -c '.windows' <<<"$STATE_BODY")")"
     log "$label: naming window still visible + pinned after deactivating the app"
     # -------------------------------------------------------------------------
 
     # Read the naming choice: raw labels + auto-name suggestions + speaking time.
     local naming speaker_count
-    naming="$(curl --silent --show-error --max-time 10 \
-        --header "Authorization: Bearer $RPC_TOKEN" \
-        "$RPC_BASE/v1/jobs/$job_id/naming" 2>/dev/null || echo '{}')"
+    rpc_read "/v1/jobs/$job_id/naming" \
+        || fail "$(rpc_why $? "/v1/jobs/$job_id/naming" "$label: the naming choice")"
+    [ "$RPC_STATUS" = 200 ] \
+        || fail "$label: GET naming answered HTTP $RPC_STATUS (expected 200): $RPC_BODY"
+    naming="$RPC_BODY"
     echo "$naming" | jq '.' | sed 's/^/    /'
     speaker_count="$(jq -r '.speakers | length' <<<"$naming")"
     [ "${speaker_count:-0}" -ge 2 ] 2>/dev/null \
@@ -2538,36 +3467,18 @@ run_naming_confirm() {
     log "$label: confirming mapping: $mapping"
 
     local confirm_status
-    confirm_status="$(curl --silent --show-error --max-time 10 -o /dev/null -w '%{http_code}' \
-        -X POST \
-        --header "Authorization: Bearer $RPC_TOKEN" \
-        --header "Content-Type: application/json" \
-        --data "$(jq -nc --argjson m "$mapping" '{mapping: $m}')" \
-        "$RPC_BASE/v1/jobs/$job_id/naming" 2>/dev/null || echo '000')"
+    confirm_status="$(rpc_post_status "/v1/jobs/$job_id/naming" "$(jq -nc --argjson m "$mapping" '{mapping: $m}')" 10)"
     [ "$confirm_status" = "200" ] || fail "$label: POST naming returned HTTP $confirm_status (expected 200)"
     log "$label: naming confirmed; polling job to a terminal state"
 
     # Poll GET /v1/jobs/<id> (never /state → no auto-skip) until terminal.
-    local state=""
-    _job_terminal() {
-        assert_app_alive
-        state="$(curl --silent --show-error --max-time 10 \
-            --header "Authorization: Bearer $RPC_TOKEN" \
-            "$RPC_BASE/v1/jobs/$job_id" 2>/dev/null | jq -r '.state // empty')"
-        [ "$state" = "done" ] || [ "$state" = "error" ]
-    }
-    poll_until "$PIPELINE_TIMEOUT_S" 5 _job_terminal \
-        || fail "$label: job $job_id did not reach a terminal state within ${PIPELINE_TIMEOUT_S}s"
-
-    local final transcript_path
-    final="$(curl --silent --show-error --max-time 10 \
-        --header "Authorization: Bearer $RPC_TOKEN" \
-        "$RPC_BASE/v1/jobs/$job_id" 2>/dev/null || echo '{}')"
+    _await_job_done "$label" "job" "$job_id" 5 fail
+    local final="$RPC_BODY" transcript_path
     echo "$final" | jq '.' | sed 's/^/    /'
-    [ "$state" = "done" ] || fail "$label: job state=$state, expected done. Error: $(jq -r '.error // "<none>"' <<<"$final")"
     transcript_path="$(jq -r '.transcriptPath // empty' <<<"$final")"
     [ -n "$transcript_path" ] || fail "$label: job has no transcriptPath"
     [ -f "$transcript_path" ] || fail "$label: transcript file missing: $transcript_path"
+    _read_transcript_size "$label" "$transcript_path"
     log "$label: transcript $transcript_path"
     head -c 600 "$transcript_path" | sed 's/^/    /'
     echo
@@ -2605,14 +3516,12 @@ run_naming_confirm() {
     # a local run starts from the dev's real DB (voices may already match, so a
     # confirm updates in place with no count change). Locally, just log.
     # Retry the readback: a single transient RPC hiccup would leave post_db_count
-    # empty and turn the integer comparison into a misleading red.
-    local post_db_count="" _i
-    for _i in 1 2 3 4 5; do
-        post_db_count="$(rpc /state | jq -r '.speakerDB.count // empty' 2>/dev/null || true)"
-        [ -n "$post_db_count" ] && break
-        sleep 1
-    done
-    [ -n "$post_db_count" ] || post_db_count=0
+    # empty and turn the integer comparison into a misleading red. An app that
+    # does not answer at all fails as such.
+    local post_db_count="" db_rc=0
+    poll_state 5 1 state_is '.speakerDB.count != null' || db_rc=$?
+    [ "$db_rc" -ne 2 ] || fail "$(state_why 2 "$label: speakerDB.count after confirm")"
+    post_db_count="$(jq -r '.speakerDB.count // 0' <<<"$STATE_BODY")"
     log "$label: speakerDB.count after confirm: $post_db_count (was $pre_db_count)"
     if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
         [ "$post_db_count" -gt "$pre_db_count" ] 2>/dev/null \
@@ -2628,8 +3537,7 @@ run_naming_confirm() {
     # diagnostic); the exit-trap cleanup separately verifies the persisted
     # UserDefaults + speakers.json are restored to their pre-lane state.
     local end_snap
-    end_snap="$(rpc /state)"
-    if [ -n "$end_snap" ]; then
+    if end_snap="$(state_query . 2>/dev/null)"; then
         local end_diarize end_num end_record
         end_diarize="$(jq -r '.settings.diarization.diarize' <<<"$end_snap")"
         end_num="$(jq -r '.settings.diarization.numSpeakers' <<<"$end_snap")"
@@ -2641,6 +3549,51 @@ run_naming_confirm() {
         fi
     else
         log "$label: (could not re-read /state.settings for the runtime readback)"
+    fi
+
+    # --- Assertion 4: a later job recognises the voices just confirmed ---
+    # The point of enrolling a voice is that the next meeting names it without
+    # asking. Enqueue a second copy of the same fixture and read the suggestions
+    # its naming choice makes. A recognised job still parks at speaker naming:
+    # SpeakerNamingSession.resolveSpeakerNames stashes naming data for every
+    # job with embeddings, matched or not, and only a job enqueued with
+    # autoSkipNaming (not this route) finishes on the auto-names; so the check
+    # reads GET /v1/jobs/<id>/naming, whose `suggested` per label is the
+    # matcher's assignment. Same audio, same diarizer, so each voice sits
+    # right on the centroid the confirm stored. Enforced only in CI, for the
+    # reason Assertion 3 is: a local DB may hold other voices that win the
+    # match. The job is skipped afterwards, before the app quits and the exit
+    # trap restores the speaker DB, so its recognition-log row is undone with
+    # the rest; a skip writes no embedding.
+    local recog_copy="$_NC_FIXTURE_DIR/two_speakers_de_recognition.wav" recog_job suggestions missing="" name
+    cp "$DEFAULT_FIXTURE" "$recog_copy" || fail "$label: could not copy fixture to $recog_copy"
+    log "$label: POST /v1/jobs paths=[$recog_copy] (recognition of the confirmed voices)"
+    recog_job="$(jq -r 'select((.jobIDs | length) == 1) | .jobIDs[0]' <<<"$(rpc_post /v1/jobs "$(jq -nc --arg p "$recog_copy" '{paths: [$p]}')")" 2>/dev/null)"
+    [ -n "$recog_job" ] || fail "$label: POST /v1/jobs did not return exactly one job id for the recognition job"
+    log "$label: enqueued recognition job $recog_job"
+    poll_rpc "/v1/jobs/$recog_job" --each assert_app_alive --judge-deadline-read "$PIPELINE_TIMEOUT_S" 5 \
+        _job_parked "$label" "$recog_job" \
+        || fail "$(rpc_why $? "/v1/jobs/$recog_job" "$label: recognition job $recog_job never parked at speaker naming within ${PIPELINE_TIMEOUT_S}s")"
+    rpc_read "/v1/jobs/$recog_job/naming" \
+        || fail "$(rpc_why $? "/v1/jobs/$recog_job/naming" "$label: the recognition job's naming choice")"
+    [ "$RPC_STATUS" = 200 ] || fail "$label: GET naming of the recognition job answered HTTP $RPC_STATUS: $RPC_BODY"
+    suggestions="$(jq -c '[.speakers[].suggested]' <<<"$RPC_BODY")"
+    log "$label: recognition job suggests $suggestions for the voices confirmed as $names_json"
+    # Skipped before the verdict, so a miss does not leave it parked for the
+    # lanes after this one. Best effort, bounded well under the job poll: a
+    # skip only runs the protocol stage, and an unsettled job is the snapshot
+    # reset's to drop.
+    _naming_skip "$recog_job"
+    poll_rpc "/v1/jobs/$recog_job" --each assert_app_alive 60 2 rpc_is "$_JOB_TERMINAL" || true
+    while IFS= read -r name; do
+        jq -e --arg n "$name" 'index($n) != null' <<<"$suggestions" >/dev/null || missing="$missing '$name'"
+    done < <(jq -r '.[]' <<<"$names_json")
+    if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
+        [ -z "$missing" ] \
+            || fail "$label: a second copy of the fixture was not recognised: the voices confirmed as$missing are not among its suggestions $suggestions. Confirming enrolled the voices (Assertion 3), but matching a later job against them failed."
+        log "$label: the confirmed voices are recognised in a later job ✅"
+    elif [ -n "$missing" ]; then
+        log "$label: (local run, not enforced) not suggested:$missing"
     fi
 
     # Guard against a future regression that enqueues the shared fixture path
@@ -2663,7 +3616,7 @@ run_naming_confirm() {
 # a surviving label keeps must carry the user's typing to that label and no
 # other. See issue #700 for the defect this guards against.
 #
-# The switch is done via the dialog's segmented job picker while BOTH jobs are
+# The switch is done via the dialog's job picker while BOTH jobs are
 # still pending ("while the second dialog is showing", in the reporter's words),
 # NOT by resolving the first job. This matters and was measured: resolving the
 # first drops the picker (count 2 -> 1), which shifts the SpeakerNamingView's
@@ -2696,6 +3649,27 @@ run_naming_confirm() {
 # RUNNER PREREQUISITE: the Accessibility grant from the e2e-architecture skill's
 # runner setup. Missing, the lane skips loudly and passes, like --naming-escape.
 _NS_DIR=""
+# The job ids this lane enqueued, for the teardown below. Kept at lane level
+# because the lane function's locals are gone when the trap runs.
+_NS_JOBS=()
+# Leave none of this lane's jobs parked at speaker naming after a failure that
+# left the app running: a parked job reopens the dialog at the next launch, and
+# the persisted store hands it to a later run as its own. It cannot help once
+# the app is gone (a crash, or the quit before the trap on a pass, where the
+# lane has already skipped and confirmed its jobs). Only ids this run enqueued
+# are touched: a foreign job belongs to whichever lane produced it. Bounded per
+# job rather than by the pipeline timeout: a job still mid-pipeline would
+# otherwise hold the speaker-DB and settings restores after this for minutes,
+# and a CI cancel kills the script seconds after TERM.
+_NS_RELEASE_TIMEOUT_S=20
+_ns_release_jobs() {
+    local job
+    # `${a[@]+...}`: bash 3.2 under `set -u` calls an empty array unbound.
+    for job in ${_NS_JOBS[@]+"${_NS_JOBS[@]}"}; do
+        poll_rpc "/v1/jobs/$job" --each _dev_app_running "$_NS_RELEASE_TIMEOUT_S" 2 \
+            _echo_settled_or_skipped "$job" || true
+    done
+}
 run_naming_switch() {
     local label="[naming-switch]"
     require_command python3
@@ -2710,27 +3684,30 @@ run_naming_switch() {
 
     # Preflight the one grant this lane needs. SKIP rather than FAIL, for the
     # reason the Escape lane gives: only a person at the GUI can grant it, so a
-    # red here would blame every PR for a host prerequisite. Only this arm
-    # returns early; anything failing after it fails the lane.
-    if ! "$driver" trusted 2>/dev/null | grep -q 'trusted=true'; then
-        log "$label: SKIP — this process may not use Accessibility, so no keystroke can reach the dialog."
-        log "$label: fix: System Settings → Privacy & Security → Accessibility; it is the same grant the --naming-escape lane needs (see the e2e-architecture skill for which entry works for CI)."
-        if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
-            {
-                echo "### naming-switch lane skipped"
-                echo
-                echo "This host is missing the **Accessibility** grant for the runner, so the typing-after-switch assertion did not run."
-                echo "Grant it once in the GUI session (System Settings → Privacy & Security → Accessibility), then this lane gates normally."
-            } >> "$GITHUB_STEP_SUMMARY"
-        fi
+    # red here would blame every PR for a host prerequisite. Only the driver's
+    # explicit answer (exit 3, trusted=false) is the missing grant; a crash or
+    # any other output fails the lane, as does anything after this arm.
+    local trust trust_status=0
+    trust="$("$driver" trusted 2>&1)" || trust_status=$?
+    case "$trust_status:$trust" in
+        0:*"trusted=true"*) ;;
+        3:*"trusted=false"*) ;;
+        *) fail "$label: the Accessibility preflight did not answer (exit $trust_status): $trust" ;;
+    esac
+    if [ "$trust_status" -eq 3 ]; then
+        host_skip naming-switch "This process may not use Accessibility, so no keystroke can reach the dialog and the typing-after-switch assertion did not run. Fix: System Settings → Privacy & Security → Accessibility; it is the same grant the --naming-escape lane needs, for this run to $(tcc_grantee) (see the e2e-architecture skill, runner setup step 6)."
+        return 0
+    fi
+    # After the grant, so a missing one is still named as such: the trust check
+    # answers true on a locked screen, the app's AX windows are then not found.
+    if host_skip_if_screen_locked naming-switch "the typing-after-switch assertion"; then
         return 0
     fi
 
     # The settings the lane depends on, read back from the running process (a
     # blind `defaults read` is unreliable for the dev bundle's container redirect).
     local snap diarize num_speakers record_only
-    snap="$(rpc /state)"
-    [ -n "$snap" ] || fail "$label: /state returned empty (RPC down?)"
+    snap="$(state_query .)" || fail "$(state_why $? "$label: the resolved diarization settings")"
     diarize="$(jq -r '.settings.diarization.diarize' <<<"$snap")"
     num_speakers="$(jq -r '.settings.diarization.numSpeakers' <<<"$snap")"
     record_only="$(jq -r '.settings.recording.recordOnly' <<<"$snap")"
@@ -2752,36 +3729,46 @@ run_naming_switch() {
         --voice-speaker B --out "$_NS_DIR/pairs" --stem "$stem" 2>&1 | sed 's/^/    /' \
         || fail "$label: could not build the pairs"
 
-    # Wait for a job to park at speaker naming and stash its naming DTO in the
-    # caller's `_NS_NAMING` (bash dynamic scoping, as the echo lanes do). An
-    # errored job is reported as such instead of being waited out.
-    _ns_parked() {
-        assert_app_alive
-        local state
-        state="$(rpc "/v1/jobs/$1" | jq -r '.state // empty')"
-        case "$state" in
-            error) fail "$label: job $1 errored before reaching speaker naming: $(rpc "/v1/jobs/$1" | jq -r '.error // "<none>"')" ;;
-            done) fail "$label: job $1 finished without parking at speaker naming (diarization produced no dialog?)" ;;
-        esac
-        _NS_NAMING="$(rpc "/v1/jobs/$1/naming")"
-        jq -e '(.speakers | length) > 0' <<<"$_NS_NAMING" >/dev/null 2>&1
+    # Wait for a job to park at speaker naming (an errored or finished job fails
+    # at once, see _job_parked), then for its naming DTO, which leaves the DTO
+    # in RPC_BODY. GET .../naming answers 404 until the job is awaiting naming,
+    # so that is a "not yet" there.
+    _ns_await_parked() {
+        local which="$1" job="$2"
+        poll_rpc "/v1/jobs/$job" --each assert_app_alive --judge-deadline-read "$PIPELINE_TIMEOUT_S" 5 \
+            _job_parked "$label" "$job" \
+            || fail "$(rpc_why $? "/v1/jobs/$job" "$label: $which job $job never parked at speaker naming within ${PIPELINE_TIMEOUT_S}s")"
+        local rc=0 why
+        poll_rpc "/v1/jobs/$job/naming" --not-yet 404 --each assert_app_alive --judge-deadline-read 30 1 \
+            rpc_is '(.speakers | length) > 0' || rc=$?
+        [ "$rc" -ne 0 ] || return 0
+        why="$(rpc_why "$rc" "/v1/jobs/$job/naming" "$label: $which job $job parked, but its naming choice listed no speakers within 30s")"
+        # A 404 there also means the job left speaker naming after it was
+        # seen parked; say so rather than blame the naming choice.
+        if rpc_read "/v1/jobs/$job" && ! rpc_is '.state == "speakerNamingPending"'; then
+            # `|| state=""`: rpc_field fails on a non-200, and a bare failing
+            # assignment would end the run under set -e before the message.
+            local state
+            state="$(rpc_field '.state // empty')" || state=""
+            why="$label: $which job $job left speaker naming before its naming choice was read (now HTTP $RPC_STATUS, state '$state')"
+        fi
+        fail "$why"
     }
-    local _NS_NAMING=""
 
     # First job: several mic speakers. Enqueued alone and parked before the
     # second is enqueued, so the window opens on this one.
     local first second first_naming second_naming
     first="$(_echo_enqueue "$label" "$_NS_DIR/pairs/first" "$stem")"
+    _NS_JOBS+=("$first")
     log "$label: first pair enqueued as $first; waiting for it to park at naming (timeout ${PIPELINE_TIMEOUT_S}s)"
-    poll_until "$PIPELINE_TIMEOUT_S" 5 _ns_parked "$first" \
-        || fail "$label: first job $first never parked at speaker naming within ${PIPELINE_TIMEOUT_S}s"
-    first_naming="$_NS_NAMING"
+    _ns_await_parked first "$first"
+    first_naming="$RPC_BODY"
 
     second="$(_echo_enqueue "$label" "$_NS_DIR/pairs/second" "$stem")"
+    _NS_JOBS+=("$second")
     log "$label: second pair enqueued as $second; waiting for it to park at naming"
-    poll_until "$PIPELINE_TIMEOUT_S" 5 _ns_parked "$second" \
-        || fail "$label: second job $second never parked at speaker naming within ${PIPELINE_TIMEOUT_S}s"
-    second_naming="$_NS_NAMING"
+    _ns_await_parked second "$second"
+    second_naming="$RPC_BODY"
 
     # --- the geometry, asserted rather than assumed ------------------------
     # Sorted labels are the dialog's row order (the view sorts `data.mapping`'s
@@ -2819,11 +3806,8 @@ run_naming_switch() {
 
     # The window must be showing the FIRST job, or the switch below is no
     # switch. Its fields are enumerated from outside through AX.
-    _naming_window_visible() {
-        [ "$(rpc /state | jq -r '[.windows[] | select(.id == "speaker-naming") | .isVisible] | first // false')" = "true" ]
-    }
-    poll_until 30 2 _naming_window_visible \
-        || fail "$label: naming window never became visible"
+    poll_state 30 2 state_is "$_NAMING_WINDOW_VISIBLE" \
+        || fail "$(state_why $? "$label: naming window never became visible")"
     # Labels whose name field is currently in the window, sorted, as a JSON array.
     _ns_shown_labels() {
         "$driver" windows 2>/dev/null \
@@ -2836,47 +3820,62 @@ run_naming_switch() {
     # The picker is driven BY IDENTITY, never by a fixed ordinal. This lane does
     # not own the queue: the app recovers orphaned recordings a beat after
     # launch, and with nothing here auto-skipping naming such a job parks and
-    # takes a picker segment of its own. In its first CI run one did exactly
+    # takes a picker entry of its own. In its first CI run one did exactly
     # that and landed BETWEEN this lane's two jobs (under the pinned expected
     # speaker count a single-source recording diarizes to a lone "S1"), so a
-    # hard-coded "segment 1" selected a foreign job. A job's segment is its
+    # hard-coded "entry 1" selected a foreign job. A job's entry is its
     # position in /state.pendingNamingJobs: that array is built from the very
     # `pendingSpeakerNamingJobs` the picker's ForEach iterates, so the two
     # orders agree by construction. The order is re-read right before every
-    # press, the picker's segment count is required to equal the pending count
+    # press, the picker's entry count is required to equal the pending count
     # read, and the press is verified by the labels that appear; a bounded
     # retry absorbs a job parking between the read and the press. Foreign jobs
     # are left alone, they belong to whichever lane produced them.
     local _ns_order=""
     _ns_select_job() {
-        local job="$1" labels="$2" which="$3" attempt idx count segments out
+        local job="$1" labels="$2" which="$3" attempt idx count entries out
         for attempt in 1 2 3; do
-            _ns_order="$(rpc /state | jq -c '[.pendingNamingJobs[].jobID]')"
+            _ns_order="$(state_query '[.pendingNamingJobs[].jobID]' -c)" \
+                || fail "$(state_why $? "$label: the pending naming order")"
             idx="$(jq -r --arg id "$job" 'index($id) // -1' <<<"$_ns_order")"
             count="$(jq -r 'length' <<<"$_ns_order")"
             [ "$idx" -ge 0 ] \
                 || fail "$label: the $which job $job is no longer pending (pending order: $_ns_order)"
             [ "$count" -ge 2 ] \
                 || fail "$label: only $count pending naming job(s), so the dialog shows no job picker; both of this lane's jobs must be pending (pending order: $_ns_order)"
-            out="$("$driver" select-segment --index "$idx" 2>&1)" \
-                || fail "$label: could not select picker segment $idx for the $which job: $out"
-            segments="$(sed -n 's/^selected-segment=[0-9]* of=\([0-9]*\)$/\1/p' <<<"$out")"
-            if [ "$segments" = "$count" ] && poll_until 10 1 _ns_shows "$labels"; then
-                log "$label: $which job selected at picker segment $idx of $count (pending order: $_ns_order)"
+            out="$("$driver" select-job --index "$idx" 2>&1)" \
+                || fail "$label: could not select picker entry $idx for the $which job: $out"
+            entries="$(sed -n 's/^selected-job=[0-9]* of=\([0-9]*\)$/\1/p' <<<"$out")"
+            if [ "$entries" = "$count" ] && poll_until 10 1 _ns_shows "$labels"; then
+                log "$label: $which job selected at picker entry $idx of $count (pending order: $_ns_order)"
                 return 0
             fi
-            log "$label: attempt $attempt: picker has ${segments:-?} segment(s) vs $count pending job(s), window shows $shown; a job may have parked meanwhile, re-reading the order"
+            log "$label: attempt $attempt: picker has ${entries:-?} entry/entries vs $count pending job(s), window shows $shown; a job may have parked meanwhile, re-reading the order"
             sleep 2
         done
-        fail "$label: could not bring the $which job ($job) into the window: the picker has ${segments:-?} segment(s) but /state lists $count pending naming job(s), and the window shows $shown where $labels was expected (pending order: $_ns_order)"
+        fail "$label: could not bring the $which job ($job) into the window: the picker has ${entries:-?} entry/entries but /state lists $count pending naming job(s), and the window shows $shown where $labels was expected (pending order: $_ns_order)"
     }
 
     local pending_now pending_count
-    pending_now="$(rpc /state | jq -c '[.pendingNamingJobs[] | {jobID, meetingTitle}]')"
+    pending_now="$(state_query '[.pendingNamingJobs[] | {jobID, meetingTitle}]' -c)" \
+        || fail "$(state_why $? "$label: the pending naming jobs")"
     pending_count="$(jq -r 'length' <<<"$pending_now")"
     log "$label: pending naming jobs now: $pending_now"
     [ "$pending_count" -eq 2 ] \
         || log "$label: note: $((pending_count - 2)) pending job(s) are not this lane's (a launch-recovered recording, or one another lane left parked); selecting by identity"
+
+    # Again before the first AX read, since the two pipeline waits above are
+    # long enough for the screen to lock. Both jobs are skipped and waited out
+    # here, as the pass path does for the first: the app is quit before the
+    # exit trap, whose release then finds no app to ask, and a job still
+    # finishing at that point would stay in the persisted queue.
+    if host_skip_if_screen_locked naming-switch "the typing-after-switch assertion"; then
+        _naming_skip "$first"
+        _naming_skip "$second"
+        poll_rpc "/v1/jobs/$first" --each assert_app_alive "$PIPELINE_TIMEOUT_S" 5 rpc_is "$_JOB_TERMINAL" || true
+        poll_rpc "/v1/jobs/$second" --each assert_app_alive "$PIPELINE_TIMEOUT_S" 5 rpc_is "$_JOB_TERMINAL" || true
+        return 0
+    fi
 
     # Show the first job explicitly rather than trusting what opened: the window
     # opens on the first PENDING job, which may be a foreign one. The survivor's
@@ -2885,7 +3884,7 @@ run_naming_switch() {
     log "$label: window shows the first job ($first_count fields)"
 
     # Switch to the second job the way the reporter did: with BOTH jobs still
-    # pending, pick the other one in the dialog's segmented job picker ("while
+    # pending, pick the other one in the dialog's job picker ("while
     # the second dialog is showing"). This is what keeps one view alive across
     # the switch and so keeps its reused fields in play. Resolving the
     # first job instead would drop the picker (count 2 -> 1), which shifts the
@@ -2924,7 +3923,7 @@ run_naming_switch() {
         || fail "$label: typed '$typed' into $survivor but that field reads '$value' (the keystrokes went elsewhere)"
     other_after="$("$driver" read --identifier "$other_field" 2>/dev/null | sed -n 's/^value=//p')"
     [ "$other_after" = "$other_before" ] \
-        || fail "$label: typing into $survivor changed M_SPEAKER_00 from '$other_before' to '$other_after' (misrouted write)"
+        || fail "$label: typing into $survivor changed $other_label from '$other_before' to '$other_after' (misrouted write)"
     log "$label: '$typed' landed in $survivor and nowhere else ✅"
 
     # --- the confirmed name has to reach persistent state ----------------------
@@ -2933,17 +3932,7 @@ run_naming_switch() {
     # dialog holds. `confirm-button` is A11yID.confirmButton.
     "$driver" press --identifier "confirm-button" 2>&1 | sed 's/^/    /' \
         || fail "$label: could not press the Confirm button"
-    local state=""
-    _ns_terminal() {
-        assert_app_alive
-        state="$(rpc "/v1/jobs/$1" | jq -r '.state // empty')"
-        [ "$state" = "done" ] || [ "$state" = "error" ]
-    }
-    poll_until "$PIPELINE_TIMEOUT_S" 5 _ns_terminal "$second" \
-        || fail "$label: second job $second did not reach a terminal state within ${PIPELINE_TIMEOUT_S}s after Confirm (state=$state)"
-    local final
-    final="$(rpc "/v1/jobs/$second")"
-    [ "$state" = "done" ] || fail "$label: second job state=$state after Confirm, expected done. Error: $(jq -r '.error // "<none>"' <<<"$final")"
+    _await_job_done "$label" "second job after Confirm" "$second" 5 fail
 
     # Assert the confirmed name reached the speaker DB, read over RPC
     # (`/state.speakerDB`). This is the confirm going through end to end: the
@@ -2955,46 +3944,60 @@ run_naming_switch() {
     # such grant, which is also what lets this lane be hand-run over SSH. The
     # transcript relabel is already covered end to end by the naming-confirm lane.
     _ns_db_has_typed() {
-        assert_app_alive
-        rpc /state | jq -e --arg n "$typed" \
-            '((.speakerDB.recentNames // []) + (.speakerDB.knownSpeakerNames // [])) | index($n) != null' >/dev/null 2>&1
+        state_is '((.speakerDB.recentNames // []) + (.speakerDB.knownSpeakerNames // [])) | index($n) != null' --arg n "$typed"
     }
-    poll_until 30 2 _ns_db_has_typed \
-        || fail "$label: '$typed' never appeared in /state.speakerDB after Confirm (recent=$(rpc /state | jq -c '.speakerDB.recentNames') known=$(rpc /state | jq -c '.speakerDB.knownSpeakerNames')). The confirmed dialog contents did not enroll the voice."
+    poll_state --each assert_app_alive 30 2 _ns_db_has_typed \
+        || fail "$(state_why $? "$label: '$typed' never appeared in /state.speakerDB after Confirm (recent=$(jq -c '.speakerDB.recentNames' <<<"$STATE_BODY") known=$(jq -c '.speakerDB.knownSpeakerNames' <<<"$STATE_BODY")). The confirmed dialog contents did not enroll the voice.")"
     log "$label: '$typed' enrolled into the speaker DB after Confirm ✅"
 
     # Leave nothing parked: the first job was never resolved (the lane switched
     # away from it via the picker rather than resolving it). Skip it over RPC so
     # the dialog does not reopen on the next launch, then let it settle.
-    curl --silent --show-error --max-time 10 -X POST \
-        --header "Authorization: Bearer $RPC_TOKEN" --header "Content-Length: 0" \
-        "$RPC_BASE/v1/jobs/$first/naming/skip" >/dev/null 2>&1 || true
-    poll_until "$PIPELINE_TIMEOUT_S" 5 _ns_terminal "$first" || true
+    _naming_skip "$first"
+    poll_rpc "/v1/jobs/$first" --each assert_app_alive "$PIPELINE_TIMEOUT_S" 5 rpc_is "$_JOB_TERMINAL" || true
     log "$label: PASS"
 }
 
-# Title-source lane (issue #501): drive the app's window-title lookup with a
-# title that is NOT usable — the window title equals the app name, which the
-# lookup skips — so PowerAssertionDetector finds no meeting-window title and
-# must fall back to the clean "<app> Call" placeholder. Pre-fix the detector
-# leaked the raw IOKit assertion name ("Simulator Meeting Call in progress")
-# instead, so this assertion fails against the old code (non-vacuous). Proves
-# the real deployed detection → title-selection → job-title chain, which the
-# unit tests can only exercise through injected seams.
+# Title source (issue #501). Meeting 2 of --two-meetings, and --title-source on
+# its own by hand, drive the app's window-title lookup with a title that is NOT
+# usable: the window title equals the app name, which the lookup skips, so
+# PowerAssertionDetector finds no meeting-window title and must fall back to
+# the clean "<app> Call" placeholder. Pre-fix the detector leaked the raw IOKit
+# assertion name ("Simulator Meeting Call in progress") instead, so that
+# assertion fails against the old code (non-vacuous). Meeting 1 asserts the
+# other half, which no lane checked before: a usable window title is the one
+# the job carries. Together they prove the real deployed detection →
+# title-selection → job-title chain, which the unit tests can only exercise
+# through injected seams.
+#
+# The simulator's default --title, its app name, and the title the app makes
+# from that name when no window title is usable.
+_SIM_WINDOW_TITLE="Simulator Meeting | MeetingSimulator"
+_SIM_APP_NAME="MeetingSimulator"
+_SIM_PLACEHOLDER_TITLE="$_SIM_APP_NAME Call"
+
+# _assert_meeting_identity <label> <expected title> <why, when the title differs>
+# — the job run_one_meeting just finished carries this title and the
+# simulator's app name.
+_assert_meeting_identity() {
+    local label="$1" want="$2" why="$3" title app
+    title="$(jq -r '.meetingTitle // empty' <<<"$LAST_MEETING_JOB")"
+    app="$(jq -r '.appName // empty' <<<"$LAST_MEETING_JOB")"
+    log "$label: lastJob.meetingTitle = \"$title\", appName = \"$app\""
+    [ "$title" = "$want" ] || fail "$label: meetingTitle == \"$title\", expected \"$want\". $why"
+    [ "$app" = "$_SIM_APP_NAME" ] \
+        || fail "$label: appName == \"$app\", expected \"$_SIM_APP_NAME\": the job was not attributed to the simulator's meeting pattern"
+    log "$label: meeting title and app name as expected ✅"
+}
+
+# Why a title differs, for each of the two cases.
+_TITLE_FROM_WINDOW_WHY="The simulator's window shows a meeting title, so that is what the job should carry. The placeholder '$_SIM_PLACEHOLDER_TITLE' here means the window-title lookup found nothing: most likely the dev app lacks the Screen & System Audio Recording grant, without which macOS hides other apps' window titles (see the e2e-architecture skill, runner setup step 4); otherwise the lookup or its matcher regressed."
+_TITLE_PLACEHOLDER_WHY="The window title equalled the app name, so the title lookup should return nil and the detector substitute the placeholder; a leaked assertion name or window title means the title-source fix regressed."
+
 run_title_source() {
     local label="[title-source]"
-    log "$label: starting meeting-simulator --title MeetingSimulator (no usable window title) → $SIMULATOR_FIXTURE"
-    "$SIMULATOR_BIN" "$SIMULATOR_FIXTURE" --title "MeetingSimulator" >/tmp/e2e-app-sim.log 2>&1 &
-    SIM_PID=$!
-
-    _poll_for_new_lastjob_terminal "$label" ignore-recovered
-    [ "$POLL_LJ_STATE" = "done" ] || fail "$label: lastJob.state == \"$POLL_LJ_STATE\", expected \"done\""
-
-    local meeting_title
-    meeting_title="$(rpc /state | jq -r '.lastJob.meetingTitle // empty')"
-    log "$label: lastJob.meetingTitle = \"$meeting_title\""
-    [ "$meeting_title" = "MeetingSimulator Call" ] \
-        || fail "$label: meetingTitle == \"$meeting_title\", expected \"MeetingSimulator Call\". The window title equalled the app name, so the title lookup should return nil and the detector substitute the placeholder; a leaked assertion name or window title means the title-source fix regressed."
+    run_one_meeting "$label" "$_SIM_APP_NAME"
+    _assert_meeting_identity "$label" "$_SIM_PLACEHOLDER_TITLE" "$_TITLE_PLACEHOLDER_WHY"
     log "$label: PASS — no usable window title fell back to the clean placeholder ✅"
 }
 
@@ -3051,40 +4054,52 @@ run_mic_stall() {
     local log_start
     log_start="$(date '+%Y-%m-%d %H:%M:%S')"
     log "$label: starting meeting-simulator (looping $SIMULATOR_FIXTURE for ${MIC_STALL_MEETING_S}s)"
-    "$SIMULATOR_BIN" "$SIMULATOR_FIXTURE" --loop --duration "$MIC_STALL_MEETING_S" >/tmp/e2e-app-sim.log 2>&1 &
-    SIM_PID=$!
+    _start_simulator "$label" "$SIMULATOR_FIXTURE" --loop --duration "$MIC_STALL_MEETING_S"
 
-    _ms_recording() { [ "$(rpc /state | jq -r '.watchState // ""')" = recording ]; }
-    poll_until 60 1 _ms_recording || fail "$label: no recording started within 60s of the meeting"
+    poll_state 60 1 state_is '.watchState == "recording"' \
+        || fail "$(state_why $? "$label: no recording started within 60s of the meeting")"
     local rec_at
     rec_at="$(date +%s)"
     log "$label: recording; watching /state for the microphone stall"
 
     # Until the stall, keep what the microphone did: whether /state ever saw it
     # deliver a buffer. One jq per tick, `|`-joined for the reason given at
-    # _poll_for_new_lastjob_terminal.
-    local snap fault count mic_age app_age watch elapsed saw_mic_buffer=false
-    while true; do
-        assert_app_alive
-        snap="$(rpc /state)"
+    # _poll_for_new_lastjob_terminal. The loop is poll_state's, as there: an
+    # unanswered tick is skipped, not read as empty fields (which used to say
+    # "the recording ended"), and assert_app_alive runs on every tick. The
+    # window ends where the old loop's did, at the first tick more than
+    # MIC_STALL_LATEST_S into the recording. Unlike the lastJob poll, the
+    # deadline read is not judged: MIC_STALL_LATEST_S bounds when the stall
+    # may land, the snapshot does not say when it landed, and that read can
+    # return up to RPC_READ_BOUND_S after the window.
+    local fault="" count="" mic_age="" app_age="" watch="" elapsed=0 saw_mic_buffer=false status=0
+    _ms_stalled() {
         fault=""; count=""; mic_age=""; app_age=""; watch=""
         IFS='|' read -r fault count mic_age app_age watch < <(
-            jq -r '[.channelHealth.micFault // "", (.channelHealth.micStallCount // "" | tostring), (.channelHealth.micSecondsSinceLastBuffer // "" | tostring), (.channelHealth.appSecondsSinceLastBuffer // "" | tostring), .watchState // ""] | join("|")' <<<"$snap"
+            jq -r '[.channelHealth.micFault // "", (.channelHealth.micStallCount // "" | tostring), (.channelHealth.micSecondsSinceLastBuffer // "" | tostring), (.channelHealth.appSecondsSinceLastBuffer // "" | tostring), .watchState // ""] | join("|")' <<<"$STATE_BODY"
         ) || true
         elapsed=$(( $(date +%s) - rec_at ))
         if [ -n "$mic_age" ] && _ms_float_lt "$mic_age" 2; then saw_mic_buffer=true; fi
-        [ "$fault" = stalled ] && break
+        [ "$fault" = stalled ] && return 0
         [ "$watch" = recording ] || fail "$label: the recording ended after ${elapsed}s without the microphone ever being reported stalled (micFault='$fault')"
-        if [ "$elapsed" -gt "$MIC_STALL_LATEST_S" ]; then
+        return 1
+    }
+    poll_state --each assert_app_alive \
+        $(( rec_at + MIC_STALL_LATEST_S + 1 - $(date +%s) )) 1 _ms_stalled || status=$?
+    # On a pass, elapsed is the stalled read's; on a failure, the time now.
+    [ "$status" -eq 0 ] || elapsed=$(( $(date +%s) - rec_at ))
+    case "$status" in
+        0) ;;
+        1)
             # Which half broke: the capture layer releasing the microphone, or
             # the release reaching /state.
             if _ms_capture_log "$log_start" | grep -q "releasing the microphone"; then
                 fail "$label: the capture log shows the microphone released, but /state still reads micFault='$fault' ${elapsed}s into the recording: the stall never reached the app"
             fi
             fail "$label: no stall on /state ${elapsed}s into the recording (micFault='$fault' micSecondsSinceLastBuffer='$mic_age'), and no release in the capture log. The watchdog must release a microphone that went ${MIC_STALL_BUDGET_S}s without a buffer."
-        fi
-        sleep 1
-    done
+            ;;
+        *) fail "$(state_why "$status" "$label: whether the microphone was reported stalled within ${elapsed}s of the recording (last answered micFault='$fault' micSecondsSinceLastBuffer='$mic_age')")" ;;
+    esac
     log "$label: /state micFault=stalled micStallCount=$count after ${elapsed}s (micSecondsSinceLastBuffer='$mic_age')"
     [ "$elapsed" -ge "$MIC_STALL_EARLIEST_S" ] \
         || fail "$label: stalled after ${elapsed}s, before the ${MIC_STALL_BUDGET_S}s budget could have run out"
@@ -3100,8 +4115,8 @@ run_mic_stall() {
     # Released, not just flagged: seconds later the recording goes on, the app
     # channel still delivers, and nothing is reported against it.
     sleep 6
-    snap="$(rpc /state)"
-    local app_fault
+    local snap app_fault
+    snap="$(state_query .)" || fail "$(state_why $? "$label: the channel health 6s after the stall")"
     IFS='|' read -r fault count mic_age app_age watch app_fault < <(
         jq -r '[.channelHealth.micFault // "", (.channelHealth.micStallCount // "" | tostring), (.channelHealth.micSecondsSinceLastBuffer // "" | tostring), (.channelHealth.appSecondsSinceLastBuffer // "" | tostring), .watchState // "", .channelHealth.appFault // ""] | join("|")' <<<"$snap"
     ) || true
@@ -3157,7 +4172,7 @@ run_mic_stall() {
     # the app track.
     _poll_for_new_lastjob_terminal "$label" ignore-recovered
     local final
-    final="$(rpc /state)"
+    final="$STATE_BODY"
     jq '.lastJob' <<<"$final"
     [ "$POLL_LJ_STATE" = "done" ] \
         || fail "$label: lastJob.state == \"$POLL_LJ_STATE\", expected \"done\". Error: $(jq -r '.lastJob.error // "<none>"' <<<"$final")"
@@ -3207,6 +4222,288 @@ run_mic_stall() {
     echo
     PRE_LAST_JOB_ID="$POLL_LJ_ID"
     SIM_PID=""
+}
+
+# --- upgrade lane -------------------------------------------------------------
+#
+# Every other lane starts the app on a clean or an isolated empty home, so
+# nothing exercises the new build on the data an older release left behind,
+# and three of this release's changes act only on such data. Seeded before
+# launch by `_ug_seed` (above, with what each seed is derived from); asserted
+# here, each change from the layer that shows it:
+#   1. WhisperKit models move once from Documents/huggingface to the app's own
+#      folder (WhisperKitModelMigration): the variant being loaded moves whole,
+#      inode for inode, with its download metadata; its tokenizer is copied;
+#      it loads with the network closed, so not through a download; nothing
+#      else in the shared folder is touched, an incomplete variant included;
+#      the new folder is excluded from backup; a relaunch moves nothing.
+#   2. An undecodable speakers.json is quarantined on the first write instead
+#      of being overwritten (SpeakerMatcher.mutateDB): launch leaves it byte
+#      for byte, the first write moves it to speakers.json.corrupt-<stamp>
+#      unchanged, the DB starts empty, the user is told, the app keeps running.
+#   3. Queue snapshot and finished-job records written by v0.8.1 are read by
+#      the new folder logic (PipelineQueue.loadSnapshot, TerminalJobStore):
+#      the old record is still served; the interrupted job is restored, runs
+#      to done, its recording moves from staging to <output>/recordings and
+#      into the ledger, and neither this launch nor the next makes a second
+#      job of it.
+# Then the account's real model folders are compared with their state before
+# the seed, which is what shows the isolated home held.
+#
+# The queue is built, and the snapshot read, on the first watch start or import
+# (`PipelineController.rebuild`). The lane cannot watch (see _UG_APP_ARGS), so
+# it imports a fixture, which runs the same rebuild; that job is the "trigger"
+# below and is counted like any other.
+
+_UG_MODEL_TIMEOUT_S=300
+
+# Fail with the tail of the app's own output, which a home removed at exit
+# would otherwise take with it.
+_ug_fail() {
+    log "[upgrade] last lines of the app's output:"
+    tail -n 40 "$_UG_LANE_DIR/app.log" 2>/dev/null | sed 's/^/    /' || true
+    fail "$@"
+}
+
+# Polls until the WhisperKit engine reports the lane's variant loaded. Any
+# `downloading` seen on the way fails at once: with the network closed a
+# download cannot succeed, and its being tried at all means the local copy was
+# not found where the migration should have put it. A `loading` followed by
+# `unloaded` is a failed load, and fails at once too.
+_UG_MODEL_STATE=""
+_UG_MODEL_SEEN=""
+_ug_model_settled() {
+    local state variant
+    read -r state variant < <(jq -r '.engines.whisperKit | "\(.modelState // "") \(.modelVariant // "")"' <<<"$STATE_BODY" 2>/dev/null || true) || true
+    [ -n "$state" ] || return 1
+    [ "$state" = "$_UG_MODEL_STATE" ] || _UG_MODEL_SEEN="$_UG_MODEL_SEEN $state"
+    _UG_MODEL_STATE="$state"
+    case "$state" in
+        downloading) return 0 ;;
+        loaded) [ "$variant" = "$_UG_VARIANT" ] ;;
+        unloaded) case "$_UG_MODEL_SEEN" in *loading*) return 0 ;; esac; return 1 ;;
+        *) return 1 ;;
+    esac
+}
+_ug_await_model() {
+    local label="$1"
+    _UG_MODEL_STATE="" _UG_MODEL_SEEN=""
+    poll_state --each assert_app_alive "$_UG_MODEL_TIMEOUT_S" 1 _ug_model_settled \
+        || _ug_fail "$(state_why $? "$label: WhisperKit did not load $_UG_VARIANT within ${_UG_MODEL_TIMEOUT_S}s (states seen:${_UG_MODEL_SEEN:- none}). Only 'unloaded' seen usually means a load that failed between two polls: with the network closed, a download attempt fails within milliseconds")"
+    [ "$_UG_MODEL_STATE" = loaded ] \
+        || _ug_fail "$label: WhisperKit went '$_UG_MODEL_STATE' (states seen:$_UG_MODEL_SEEN). With the network closed that means it did not find $_UG_VARIANT in its own folder and tried the Hub"
+    log "$label: $_UG_VARIANT loaded with the network closed (states seen:$_UG_MODEL_SEEN)"
+}
+
+# Fails unless `dir` now fingerprints as recorded in `file`; with a fifth
+# argument, by that function instead (upgrade_tree_digest for a copy).
+_ug_expect_fingerprint() {
+    local label="$1" what="$2" dir="$3" file="$4" measure="${5:-upgrade_tree_fingerprint}"
+    "$measure" "$dir" >"$file.now"
+    cmp -s "$file" "$file.now" \
+        || _ug_fail "$label: $what differs ($dir): $(diff "$file" "$file.now" | head -5 | tr '\n' ' ')"
+}
+
+# The one entry in `dir` matching `pattern`, left in _UG_FOUND; fails on none
+# or several. A global rather than printed, because `_ug_fail` inside a command
+# substitution would exit only the subshell and lose the app's output tail.
+_UG_FOUND=""
+_ug_single() {
+    local label="$1" dir="$2" pattern="$3"
+    _UG_FOUND="$(find "$dir" -maxdepth 1 -name "$pattern" -print)"
+    [ -n "$_UG_FOUND" ] && [ "$(printf '%s\n' "$_UG_FOUND" | wc -l | tr -d ' ')" = 1 ] \
+        || _ug_fail "$label: expected exactly one $pattern in $dir, found: ${_UG_FOUND:-none}"
+}
+
+_ug_assert_settings() {
+    local label="[upgrade:settings]" snap
+    snap="$(state_query .)" || _ug_fail "$(state_why $? "$label: whether the app took the lane's launch arguments")"
+    jq -e --arg v "$_UG_VARIANT" '.settings.transcription.engine == "whisperKit"
+        and .settings.transcription.whisperKitModel == $v
+        and .settings.transcription.unloadModelsWhenIdle == false
+        and .settings.diarization.diarize == false and .settings.diarization.vadEnabled == false
+        and .settings.protocolGeneration.provider == "none" and .settings.detection.autoWatch == false
+        and .watchState == null' <<<"$snap" >/dev/null \
+        || _ug_fail "$label: the app did not take the lane's launch arguments: $(jq -c '{t: .settings.transcription, d: .settings.diarization.diarize, v: .settings.diarization.vadEnabled, p: .settings.protocolGeneration.provider, w: .settings.detection.autoWatch, watchState}' <<<"$snap")"
+    log "$label: launch arguments in effect (WhisperKit $_UG_VARIANT, idle unloading off, no diarization, no VAD, no protocol, not watching)"
+}
+
+_ug_assert_model() {
+    local label="[upgrade:model]"
+    local old_repo="$_UG_DOCS_HF/$UPGRADE_WHISPERKIT_REPO" new_repo="$_UG_APP_HF/$UPGRADE_WHISPERKIT_REPO"
+    _ug_await_model "$label"
+    [ ! -e "$old_repo/$_UG_VARIANT" ] \
+        || _ug_fail "$label: $_UG_VARIANT is still in Documents/huggingface after a load from the app's folder"
+    _ug_expect_fingerprint "$label" "the moved $_UG_VARIANT (inode, size or time of a file)" \
+        "$new_repo/$_UG_VARIANT" "$_UG_LANE_DIR/variant.seeded"
+    [ ! -e "$old_repo/.cache/huggingface/download/$_UG_VARIANT" ] \
+        || _ug_fail "$label: the download metadata of $_UG_VARIANT was left in Documents/huggingface"
+    _ug_expect_fingerprint "$label" "the moved download metadata" \
+        "$new_repo/.cache/huggingface/download/$_UG_VARIANT" "$_UG_LANE_DIR/metadata.seeded"
+    _ug_expect_fingerprint "$label" "the $_UG_TOKENIZER tokenizer copied to the app's folder (contents)" \
+        "$_UG_APP_HF/$UPGRADE_TOKENIZER_ORG/$_UG_TOKENIZER" "$_UG_LANE_DIR/tokenizer.digest" upgrade_tree_digest
+    _ug_expect_fingerprint "$label" "the tokenizer in Documents (it is copied, never moved)" \
+        "$_UG_DOCS_HF/$UPGRADE_TOKENIZER_ORG" "$_UG_LANE_DIR/tokenizer.seeded"
+    _ug_expect_fingerprint "$label" "the incomplete $_UG_INCOMPLETE_VARIANT" \
+        "$old_repo/$_UG_INCOMPLETE_VARIANT" "$_UG_LANE_DIR/incomplete.seeded"
+    [ ! -e "$new_repo/$_UG_INCOMPLETE_VARIANT" ] \
+        || _ug_fail "$label: the incomplete $_UG_INCOMPLETE_VARIANT appeared in the app's folder"
+    _ug_expect_fingerprint "$label" "another tool's model in the shared folder" \
+        "$_UG_DOCS_HF/models/example-org" "$_UG_LANE_DIR/other.seeded"
+    [ -z "$(find "$_UG_APP_HF" \( -name '*.incomplete' -o -name '.whisper-*.partial-*' \) -print -quit)" ] \
+        || _ug_fail "$label: partial downloads or copies were left in the app's folder"
+    # Checked on the attribute, not with `tmutil isexcluded`: that reports the
+    # whole temp dir this home lives in as excluded, so it would pass anyway.
+    xattr -p com.apple.metadata:com_apple_backup_excludeItem "$_UG_APP_HF" >/dev/null 2>&1 \
+        || _ug_fail "$label: the app's model folder is not excluded from backup"
+    log "$label: moved whole with its metadata, tokenizer copied, incomplete variant and shared content untouched, folder excluded from backup"
+}
+
+_ug_assert_speakers() {
+    local label="[upgrade:speakers]" status corrupt
+    cmp -s "$_UG_LANE_DIR/speakers.seed" "$_UG_DATA_DIR/speakers.json" \
+        || _ug_fail "$label: launching changed the unreadable speakers.json; it must stay as it is until something writes"
+    local snap
+    snap="$(state_query .)" || _ug_fail "$(state_why $? "$label: how /state reads the unreadable DB")"
+    jq -e '.speakerDB.count == 0' <<<"$snap" >/dev/null \
+        || _ug_fail "$label: /state does not read the unreadable DB as empty"
+    # Any write runs the read-modify-write that quarantines; deleting a name
+    # nobody has is the one that changes nothing else.
+    status="$(rpc_post_status /action/deleteSpeaker '{"name":"Nobody Enrolled"}')"
+    [ "$status" = 409 ] \
+        || _ug_fail "$label: a write to the unreadable DB answered $status, expected 409 (set aside and replaced)"
+    _ug_single "$label" "$_UG_DATA_DIR" 'speakers.json.corrupt-*'
+    corrupt="$_UG_FOUND"
+    cmp -s "$_UG_LANE_DIR/speakers.seed" "$corrupt" \
+        || _ug_fail "$label: the quarantined file is not the original bytes"
+    [ "$(stat -f '%Lp' "$corrupt")" = 600 ] \
+        || _ug_fail "$label: the quarantined file is not owner-only ($(stat -f '%Lp' "$corrupt"))"
+    jq -e '. == []' "$_UG_DATA_DIR/speakers.json" >/dev/null 2>&1 \
+        || _ug_fail "$label: the replacement speakers.json is not an empty DB"
+    snap="$(state_query .)" || _ug_fail "$(state_why $? "$label: whether the user was told the profiles were set aside")"
+    jq -e --arg f "$(basename "$corrupt")" '.speakerDB.count == 0
+        and any(.notifications[]; .title == "Voice profiles could not be read" and (.body | contains($f)))' \
+        <<<"$snap" >/dev/null \
+        || _ug_fail "$label: the user was not told the profiles were set aside as $(basename "$corrupt")"
+    assert_app_alive
+    log "$label: quarantined unchanged as $(basename "$corrupt"), DB empty, user notified"
+}
+
+_ug_assert_finished_record() {
+    local label="[upgrade:finished-record]"
+    rpc_read "/v1/jobs/$_UG_FINISHED_ID" \
+        || _ug_fail "$(rpc_why $? "/v1/jobs/$_UG_FINISHED_ID" "$label: whether the v0.8.1 record is still served")"
+    rpc_is '.state == "done" and .meetingTitle == $t and .transcriptPath == $p
+         and .echo.windowsScored == 12 and .echo.cancellationSeconds == null' \
+        --arg t "$_UG_FINISHED_TITLE" --arg p "$_UG_FINISHED_TRANSCRIPT" \
+        || _ug_fail "$label: GET /v1/jobs/$_UG_FINISHED_ID does not serve the v0.8.1 record: HTTP $RPC_STATUS ${RPC_BODY:-<empty body>}"
+    log "$label: v0.8.1 record still served"
+}
+
+# POST /v1/jobs for one file; the one job id it created is left in _UG_JOB_ID
+# (a global for the reason given at `_ug_single`).
+_UG_JOB_ID=""
+_ug_enqueue() {
+    local enq
+    enq="$(rpc_post /v1/jobs "$(jq -nc --arg p "$1" '{paths: [$p]}')")"
+    _UG_JOB_ID="$(jq -er 'select(.jobIDs | length == 1) | .jobIDs[0]' <<<"$enq" 2>/dev/null || true)"
+    [ -n "$_UG_JOB_ID" ] || _ug_fail "[upgrade]: POST /v1/jobs did not create exactly one job: $enq"
+}
+
+_UG_STATUS=""
+# _ug_await_done <label> <what> <job> [poll_rpc options] — waits for a job to
+# finish and requires done; leaves its status in _UG_STATUS.
+_ug_await_done() {
+    _await_job_done "$1" "$2" "$3" 2 _ug_fail "${@:4}"
+    _UG_STATUS="$RPC_BODY"
+}
+
+# The finished-job records, which every job that reaches a terminal state adds
+# to: a recovered duplicate of the restored recording would show up here.
+_ug_assert_records() {
+    local label="$1" expected="$2"
+    local records="$_UG_IPC_DIR/terminal_jobs.json"
+    jq -e --argjson n "$expected" 'length == $n' "$records" >/dev/null 2>&1 \
+        || _ug_fail "$label: expected $expected finished-job records, found: $(jq -c '[.[] | {jobID, meetingTitle, state}]' "$records" 2>/dev/null)"
+    jq -e 'all(.[]; .meetingTitle | startswith("Recovered Recording") | not)' "$records" >/dev/null \
+        || _ug_fail "$label: the seeded recording was picked up a second time as an orphan: $(jq -c '[.[] | .meetingTitle]' "$records")"
+}
+
+_ug_assert_restored_job() {
+    local label="[upgrade:restored-job]" trigger transcript relocated base
+    _ug_enqueue "$_UG_TRIGGER_FIXTURE"
+    trigger="$_UG_JOB_ID"
+    log "$label: imported the fixture as job $trigger, which builds the queue and reads the snapshot"
+    # --not-yet 404: the job is restored from the v0.8.1 snapshot when the
+    # import builds the queue, so the app may not know it on the first read.
+    _ug_await_done "$label" "the interrupted v0.8.1 job" "$_UG_PENDING_ID" --not-yet 404
+    transcript="$(jq -r '.transcriptPath // empty' <<<"$_UG_STATUS")"
+    upgrade_path_inside "$transcript" "$OUTPUT_DIR" && [ -s "$transcript" ] \
+        || _ug_fail "$label: the restored job's transcript '$transcript' is not a file under $OUTPUT_DIR"
+    transcript_is_german "$transcript" \
+        || _ug_fail "$label: the restored job's transcript is not German (matched: ${GERMAN_MARKER_HITS:-none})"
+    [ ! -e "$_UG_SEEDED_MIX" ] \
+        || _ug_fail "$label: the recording is still in staging after its job finished"
+    _ug_single "$label" "$RECORDINGS_DIR" '*_mix.wav'
+    relocated="$_UG_FOUND"
+    base="$(basename "$relocated")"
+    jq -e --arg b "/MeetingTranscriber/recordings/$base" 'any(.[]; endswith($b))' \
+        "$_UG_IPC_DIR/processed_recordings.json" >/dev/null \
+        || _ug_fail "$label: the processed-recordings ledger does not name the moved recording $base: $(cat "$_UG_IPC_DIR/processed_recordings.json")"
+    _ug_await_done "$label" "the import" "$trigger"
+    _ug_assert_records "$label" 3
+    _UG_RELOCATED_MIX="$relocated"
+    log "$label: restored, done, transcript in the output folder, recording moved to $RECORDINGS_DIR and into the ledger, no duplicate"
+}
+
+# Quit, start again on the same home, and require that nothing is migrated or
+# run a second time.
+_ug_relaunch_and_assert() {
+    local label="[upgrade:relaunch]" new_repo="$_UG_APP_HF/$UPGRADE_WHISPERKIT_REPO" trigger
+    upgrade_tree_fingerprint "$new_repo/$_UG_VARIANT" >"$_UG_LANE_DIR/variant.before-relaunch"
+    local quit_status=0
+    quit_running_app || quit_status=$?
+    case "$quit_status" in
+        1) _ug_fail "$label: could not quit the app" ;;
+        2) _ug_fail "$label: the app had to be ended by signal, without its own quit (see the Automation error above), so the relaunch would not test what a quit leaves" ;;
+    esac
+    _ug_launch
+    poll_until "$RPC_READY_TIMEOUT_S" 1 rpc_ready || _ug_fail "$label: RPC did not come back after the relaunch"
+    _record_launched_app
+    _ug_assert_settings
+    _ug_await_model "$label"
+    _ug_expect_fingerprint "$label" "$_UG_VARIANT in the app's folder (the second launch must not move or rewrite it)" \
+        "$new_repo/$_UG_VARIANT" "$_UG_LANE_DIR/variant.before-relaunch"
+    [ ! -e "$_UG_DOCS_HF/$UPGRADE_WHISPERKIT_REPO/$_UG_VARIANT" ] \
+        || _ug_fail "$label: $_UG_VARIANT reappeared in Documents/huggingface"
+    _ug_enqueue "$_UG_TRIGGER_FIXTURE"
+    trigger="$_UG_JOB_ID"
+    _ug_await_done "$label" "the second import" "$trigger"
+    _ug_assert_records "$label" 4
+    rpc_read "/v1/jobs/$_UG_PENDING_ID" \
+        || _ug_fail "$(rpc_why $? "/v1/jobs/$_UG_PENDING_ID" "$label: whether the restored job still reads as done")"
+    rpc_is '.state == "done"' \
+        || _ug_fail "$label: the restored job no longer reads as done: HTTP $RPC_STATUS ${RPC_BODY:-<empty body>}"
+    [ -f "$_UG_RELOCATED_MIX" ] \
+        || _ug_fail "$label: the moved recording $_UG_RELOCATED_MIX is gone"
+    log "$label: no second migration, no second run of the restored job"
+}
+
+_ug_assert_isolation() {
+    local label="[upgrade:isolation]"
+    _ug_expect_fingerprint "$label" "$_UG_VARIANT and its tokenizer in the account's real model folders" \
+        "" "$_UG_LANE_DIR/real-models.before" _ug_real_fingerprint
+    log "$label: $_UG_VARIANT and its tokenizer in the account's real model folders are as they were"
+}
+
+run_upgrade() {
+    _ug_assert_settings
+    _ug_assert_model
+    _ug_assert_speakers
+    _ug_assert_finished_record
+    _ug_assert_restored_job
+    _ug_relaunch_and_assert
+    _ug_assert_isolation
 }
 
 # --- echo-bleed lane ------------------------------------------------------
@@ -3264,11 +4561,7 @@ _echo_fixture_setup() {
 _echo_enqueue() {
     local label="$1" dir="$2" stem="$3"
     local enq ids
-    enq="$(curl --silent --show-error --max-time 15 -X POST \
-        --header "Authorization: Bearer $RPC_TOKEN" \
-        --header "Content-Type: application/json" \
-        --data "$(jq -nc --arg a "$dir/${stem}_app.wav" --arg m "$dir/${stem}_mic.wav" '{paths: [$a, $m]}')" \
-        "$RPC_BASE/v1/jobs" 2>/dev/null || echo '{}')"
+    enq="$(rpc_post /v1/jobs "$(jq -nc --arg a "$dir/${stem}_app.wav" --arg m "$dir/${stem}_mic.wav" '{paths: [$a, $m]}')")"
     ids="$(jq -r '.jobIDs | length' <<<"$enq" 2>/dev/null || echo 0)"
     [ "$ids" = "1" ] \
         || fail "$label: POST /v1/jobs returned $ids job(s) for one _app/_mic pair, expected 1 (response: $enq)"
@@ -3279,21 +4572,28 @@ _echo_enqueue() {
 # without one is a failure, but it has to be READ as one: polling only for the
 # verdict would turn a job that errored in its first second into a timeout, and
 # report a two-minute wait instead of the error that caused it.
-_echo_settled() {
-    assert_app_alive
-    # Writes the caller's `_ECHO_STATUS`: bash locals are dynamically scoped, so
-    # the lane declares it and this stashes the last response for the
-    # post-loop assertions. Same shape the naming lanes use.
-    _ECHO_STATUS="$(rpc "/v1/jobs/$1")"
-    jq -e '.echo != null or .state == "done" or .state == "error"' <<<"$_ECHO_STATUS" >/dev/null 2>&1
-}
+_ECHO_SETTLED='.echo != null or .state == "done" or .state == "error"'
 
-# Waits for the verdict on $1 and leaves it in $_ECHO_STATUS.
+# Segments the affected pair of --echo-bleed must have left out of its
+# transcript: the count every measured run reported, not a token 1. On the CI
+# runner it read 3 in every retained E2E (Production App) log since late August
+# 2026: 49 of 49 runs, 24 Aug to 21 Nov, across FluidAudio 0.15.5 to 0.18.3
+# (for example main runs 43807053481 and 44866705316). The fixture is
+# deterministic, but the count is a yield of segmentation and the ASR on the
+# machine that runs the lane, so a run elsewhere may read another number and a
+# model or VAD change can move it. To re-measure, read the log line
+# "[echo-bleed]: N microphone segment(s) left out of the transcript"; MEASURED
+# in scripts/tests/test_echo_suppressed_violation.sh moves with this value.
+_ECHO_BLEED_MIN_SUPPRESSED=3
+
+# Waits for the verdict on $1 and leaves it in $_ECHO_STATUS (the caller's,
+# through bash's dynamic scoping: the lane declares it for the post-loop
+# assertions, the same shape the naming lanes use).
 _echo_await_verdict() {
     local label="$1" job="$2"
-    _ECHO_STATUS=""
-    poll_until "$PIPELINE_TIMEOUT_S" 3 _echo_settled "$job" \
-        || fail "$label: job $job produced neither an echo verdict nor a terminal state within ${PIPELINE_TIMEOUT_S}s (last: $_ECHO_STATUS)"
+    poll_rpc "/v1/jobs/$job" --each assert_app_alive --judge-deadline-read "$PIPELINE_TIMEOUT_S" 3 rpc_is "$_ECHO_SETTLED" \
+        || fail "$(rpc_why $? "/v1/jobs/$job" "$label: job $job produced neither an echo verdict nor a terminal state within ${PIPELINE_TIMEOUT_S}s")"
+    _ECHO_STATUS="$RPC_BODY"
     jq -e '.echo != null' <<<"$_ECHO_STATUS" >/dev/null \
         || fail "$label: job $job reached state=$(jq -r '.state // "?"' <<<"$_ECHO_STATUS") with NO echo verdict. Every dual-source job is measured, so a missing verdict means the tracks never reached the detector. error=$(jq -r '.error // "<none>"' <<<"$_ECHO_STATUS")"
     log "$label: verdict $(jq -c '.echo' <<<"$_ECHO_STATUS")"
@@ -3305,23 +4605,14 @@ _echo_await_verdict() {
 # Best effort: this is teardown, and a job that will not settle is not this
 # lane's failure to report.
 _echo_settled_or_skipped() {
-    local state
-    state="$(rpc "/v1/jobs/$1" | jq -r '.state // empty')"
-    case "$state" in
+    case "$(rpc_field '.state // empty')" in
         done|error) return 0 ;;
-        speakerNamingPending)
-            # Same call the naming-escape lane makes; the explicit zero
-            # Content-Length matters for a POST with no body.
-            curl --silent --show-error --max-time 10 -X POST \
-                --header "Authorization: Bearer $RPC_TOKEN" \
-                --header "Content-Length: 0" \
-                "$RPC_BASE/v1/jobs/$1/naming/skip" >/dev/null 2>&1 || true
-            ;;
+        speakerNamingPending) _naming_skip "$1" ;;
     esac
     return 1
 }
 _echo_release() {
-    poll_until "$PIPELINE_TIMEOUT_S" 2 _echo_settled_or_skipped "$1" || true
+    poll_rpc "/v1/jobs/$1" --each _dev_app_running "$PIPELINE_TIMEOUT_S" 2 _echo_settled_or_skipped "$1" || true
 }
 
 # Fetches a finished job and requires it to have settled as done. Both echo
@@ -3331,11 +4622,11 @@ _echo_release() {
 # because `fail` is an `exit` and an exit inside a command substitution leaves
 # only the subshell.
 _echo_read_done() {
-    local label="$1" which="$2" job="$3" state
-    _ECHO_STATUS="$(rpc "/v1/jobs/$job")"
-    state="$(jq -r '.state // empty' <<<"$_ECHO_STATUS")"
-    [ "$state" = "done" ] \
-        || fail "$label: $which settled as '$state', expected done. error=$(jq -r '.error // "<none>"' <<<"$_ECHO_STATUS")"
+    local label="$1" which="$2" job="$3"
+    rpc_read "/v1/jobs/$job" || fail "$(rpc_why $? "/v1/jobs/$job" "$label: how the $which settled")"
+    _ECHO_STATUS="$RPC_BODY"
+    rpc_is '.state == "done"' \
+        || fail "$label: $which settled as '$(rpc_field '.state // empty')' (HTTP $RPC_STATUS), expected done. error=$(rpc_field '.error // "<none>"')"
 }
 
 # Asserts a verdict was computed over enough windows to mean anything. Shared
@@ -3350,7 +4641,7 @@ _echo_assert_scored() {
 
 run_echo_bleed() {
     local label="[echo-bleed]"
-    # Stashed by _echo_settled through bash's dynamic scoping (see there).
+    # Stashed by _echo_await_verdict and _echo_read_done through bash's dynamic scoping (see there).
     local _ECHO_STATUS=""
     require_command python3
 
@@ -3370,7 +4661,7 @@ run_echo_bleed() {
     local affected_status="$_ECHO_STATUS"
 
     jq -e '.echo.detected == true' <<<"$affected_status" >/dev/null \
-        || fail "$label: affected pair NOT detected. The microphone track is the app track delayed 15 ms at unit gain, which is the condition itself: $(jq -c '.echo' <<<"$affected_status")"
+        || fail "$label: affected pair NOT detected. Its microphone track carries the app track delayed 15 ms at bleed gain 1.0, with a room tail and a slow gain swing on top, beside gated local speech, which is the condition itself: $(jq -c '.echo' <<<"$affected_status")"
     # Measured 4 of 4 windows on this fixture. Asserting a floor well under that
     # keeps the lane from re-litigating the threshold, while still failing if the
     # verdict decays to a single lucky window.
@@ -3419,9 +4710,11 @@ run_echo_bleed() {
     # bleed copy is not stable enough to grep for, while "how many microphone
     # segments were left out" is exactly the effect, and it is the number a fleet
     # caller reads.
-    jq -e '.echo.suppressedSegments >= 1' <<<"$final" >/dev/null \
-        || fail "$label: affected pair had nothing suppressed. Its microphone track IS the app track, so every microphone segment is a duplicate: $(jq -c '.echo' <<<"$final")"
-    log "$label: $(jq -r '.echo.suppressedSegments' <<<"$final") microphone segment(s) left out of the transcript ✅"
+    local violation
+    violation="$(echo_suppressed_violation "$final" "$_ECHO_BLEED_MIN_SUPPRESSED")"
+    [ -z "$violation" ] \
+        || fail "$label: affected pair: $violation. Either a duplicate of the far end reached the transcript, or segmentation or the ASR changed what this pair yields and the floor _ECHO_BLEED_MIN_SUPPRESSED needs re-measuring: $(jq -c '.echo' <<<"$final")"
+    log "$label: $(jq -r '.echo.suppressedSegments' <<<"$final") microphone segment(s) left out of the transcript (floor $_ECHO_BLEED_MIN_SUPPRESSED) ✅"
 
     # The control that stops this from being "drop the microphone track". Without
     # it the lane passes against a build that removes the user's own words from
@@ -3541,7 +4834,7 @@ _echo_removed_state() {
 
 run_echo_cancel() {
     local label="[echo-cancel]"
-    # Stashed by _echo_settled through bash's dynamic scoping (see there).
+    # Stashed by _echo_await_verdict and _echo_read_done through bash's dynamic scoping (see there).
     local _ECHO_STATUS=""
     require_command python3
     _echo_require_model "$label"
@@ -3680,7 +4973,215 @@ run_echo_cancel() {
     log "$label: PASS"
 }
 
+# --- protocol lane ------------------------------------------------------------
+#
+# No other lane asserts that the protocol stage produces a protocol. The runner
+# leaves the provider at its default, the Claude CLI, which is installed there
+# but not logged in for the runner account, so every live lane logs "Protocol
+# generation failed — transcript saved" and passes on the transcript alone. This
+# lane points the OpenAI-compatible provider at a local stub (set up before the
+# launch, see the PROTOCOL_LANE block there) and asserts both outcomes of the
+# stage. It imports through POST /v1/jobs rather than recording: an import runs
+# the same PipelineQueue stages, protocol generation included, and needs no
+# audio device, so the lane takes seconds.
+#
+# Two jobs, the stub's answer switched between them through its mode file:
+#   1. it answers: the one request it got is the expected one, the job is done
+#      with no protocol warning, and protocolPath names a file in the output
+#      folder holding exactly the reply followed by the transcript;
+#   2. it answers HTTP 500: the job is still done, with the "transcript saved"
+#      warning, no protocolPath and no protocol file beside the transcript.
+# The second is what shows the first phase's checks tell the two outcomes apart.
+
+_PP_STATUS=""
+_PP_NEW_REQUESTS=""
+_PP_TRANSCRIPT=""
+_PP_PROTOCOL=""
+
+_pp_request_count() {
+    if [ -f "$_PP_DIR/requests.jsonl" ]; then wc -l <"$_PP_DIR/requests.jsonl" | tr -d ' '; else echo 0; fi
+}
+
+# Register a job's outputs for removal, in the on-disk record `_pp_repair`
+# reads, so a killed run's files go too: its transcript and protocol and the
+# per-stem sidecars SpeakerNamingStore keeps in recordings/ (its
+# sidecarSuffixes and namingJSONSuffix, restated here by value). Only when the
+# paths changed since the last tick; a duplicate is harmless.
+_PP_REGISTERED=""
+_pp_register_outputs() {
+    local f stem suffix paths
+    paths="$(jq -r '.transcriptPath, .protocolPath | select(. != null)' <<<"$_PP_STATUS" 2>/dev/null)"
+    [ -n "$paths" ] && [ "$paths" != "$_PP_REGISTERED" ] || return 0
+    _PP_REGISTERED="$paths"
+    while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        printf '%s\n' "$f" >>"$_PP_OUTPUTS_RECORD"
+        if [ "${f%.txt}" != "$f" ]; then
+            stem="$(basename "${f%.txt}")"
+            for suffix in _16k.wav _app_16k.wav _mic_16k.wav _segments.json _naming.json; do
+                printf '%s\n' "$RECORDINGS_DIR/$stem$suffix" >>"$_PP_OUTPUTS_RECORD"
+            done
+        fi
+    done <<<"$paths"
+}
+
+# A poll_rpc predicate. Writes `_PP_STATUS` and registers the outputs on every
+# answered tick, so a job that times out after saving its transcript still has
+# it removed.
+_pp_terminal() {
+    [ "$RPC_STATUS" = 200 ] || return 1
+    _PP_STATUS="$RPC_BODY"
+    _pp_register_outputs
+    rpc_is "$_JOB_TERMINAL"
+}
+
+# Import one fixture copy and wait for the job to settle. Leaves the final
+# GET /v1/jobs/<id> body in `_PP_STATUS` and the stub's log lines for this job
+# in `_PP_NEW_REQUESTS` (its outputs are registered for removal while it is
+# polled). Also leaves the job's two paths in `_PP_TRANSCRIPT` and
+# `_PP_PROTOCOL` (empty when null).
+_pp_run_job() {
+    local label="$1" fixture="$2" before enq job
+    before="$(_pp_request_count)"
+    enq="$(rpc_post /v1/jobs "$(jq -nc --arg p "$fixture" '{paths: [$p]}')")"
+    job="$(jq -er 'select(.jobIDs | length == 1) | .jobIDs[0]' <<<"$enq" 2>/dev/null || true)"
+    [ -n "$job" ] || fail "$label: POST /v1/jobs did not create exactly one job (response: $enq)"
+    log "$label: enqueued job $job"
+    printf '%s\n' "$job" >>"$_PP_JOBS_RECORD"
+    _PP_STATUS=""
+    poll_rpc "/v1/jobs/$job" --each assert_app_alive --judge-deadline-read "$PIPELINE_TIMEOUT_S" 2 _pp_terminal \
+        || fail "$(rpc_why $? "/v1/jobs/$job" "$label: job $job did not settle within ${PIPELINE_TIMEOUT_S}s")"
+    _PP_NEW_REQUESTS="$(tail -n +"$(( before + 1 ))" "$_PP_DIR/requests.jsonl" 2>/dev/null || true)"
+    _PP_TRANSCRIPT="$(jq -r '.transcriptPath // empty' <<<"$_PP_STATUS")"
+    _PP_PROTOCOL="$(jq -r '.protocolPath // empty' <<<"$_PP_STATUS")"
+    log "$label: job settled: $(jq -c '{state, warnings, transcriptPath, protocolPath, error}' <<<"$_PP_STATUS")"
+    [ "$(jq -r '.state' <<<"$_PP_STATUS")" = "done" ] \
+        || fail "$label: job $job settled as '$(jq -r '.state' <<<"$_PP_STATUS")', expected done. error=$(jq -r '.error // "<none>"' <<<"$_PP_STATUS")"
+}
+
+# Exactly one request per job: the generator retries only on a 400 that names
+# max_completion_tokens, so a second request would mean something else asked.
+_pp_assert_one_request() {
+    local label="$1" n
+    n="$(grep -c . <<<"$_PP_NEW_REQUESTS" || true)"
+    [ "$n" = 1 ] || fail "$label: the stub got $n request(s) for this job, expected exactly 1: $(jq -c 'del(.body)' <<<"$_PP_NEW_REQUESTS" 2>/dev/null)"
+}
+
+run_protocol_lane() {
+    local label="[protocol]"
+    local fixture="$ROOT/app/MeetingTranscriber/Tests/Fixtures/two_speakers_en.wav"
+    [ -f "$fixture" ] || fail "$label: fixture missing: $fixture"
+
+    # The running app's own resolved view: a write that missed its domain would
+    # otherwise send the lane's jobs to the host's real provider.
+    local snap
+    snap="$(state_query .)" || fail "$(state_why $? "$label: whether the app resolved the lane's settings")"
+    jq -e --arg ep "$_PP_ENDPOINT" --arg model "$_PP_MODEL" --arg lang "$_PP_LANGUAGE" \
+        --argjson temp "$_PP_TEMPERATURE" '
+        .settings.protocolGeneration as $p | .settings.output as $o
+        | $p.provider == "openAICompatible" and $p.openAIEndpoint == $ep and $p.openAIModel == $model
+          and $p.language == $lang and $p.openAITemperature == $temp and $p.openAITopP == null
+          and .settings.diarization.diarize == false
+          and $o.saveRawTranscriptSeparately == true and $o.includeFullTranscriptInProtocol == true
+          and $o.useAITitleForFilenames == false' \
+        <<<"$snap" >/dev/null \
+        || fail "$label: the app did not resolve the lane's settings: $(jq -c '{protocol: .settings.protocolGeneration, diarize: .settings.diarization.diarize, output: (.settings.output | {saveRawTranscriptSeparately, includeFullTranscriptInProtocol, useAITitleForFilenames})}' <<<"$snap")"
+    # A custom prompt need not mention the language, so only the built-in one
+    # is held to naming it; the placeholder check applies either way.
+    local language_in_prompt=true
+    if [ "$(jq -r '.settings.output.hasCustomPrompt' <<<"$snap")" = "true" ]; then
+        language_in_prompt=false
+        log "$label: a custom protocol prompt is installed; not requiring it to name the language"
+    fi
+    log "$label: app resolved provider=openAICompatible endpoint=$_PP_ENDPOINT model=$_PP_MODEL language=$_PP_LANGUAGE"
+
+    # Copies, one per job, so neither job shares a path with the other or with
+    # the shared fixture (same reasoning as the naming-confirm lane).
+    cp "$fixture" "$_PP_DIR/protocol-ok.wav"
+    cp "$fixture" "$_PP_DIR/protocol-500.wav"
+
+    # Nothing but this lane's jobs may reach the stub: a job the launch resumed
+    # or recovered has either already called it or is about to.
+    # Read fresh and twice in a row, since recovery enqueues off the main actor
+    # a beat after launch.
+    # "In a row" must not span a stretch the app did not answer: a job could be
+    # enqueued and finish inside it. The predicate runs only on answered ticks,
+    # so the gap is seen from the --each hook, which runs before every read: a
+    # previous tick that never reached the predicate resets the count. The
+    # verdict, including the deadline retry, is poll_state's.
+    local busy="" idle_reads=0 prev_answered=1 idle_rc=0
+    _pp_gap_resets_idle() {
+        assert_app_alive
+        [ "$prev_answered" -eq 1 ] || idle_reads=0
+        prev_answered=0
+    }
+    _pp_idle_twice() {
+        prev_answered=1
+        busy="$(jq -r '(.pipeline.activeJobCount // 0) + (.pipeline.pendingNamingJobCount // 0) + (.pipeline.waitingJobCount // 0)' <<<"$STATE_BODY" 2>/dev/null)"
+        if [ "$busy" = 0 ] && [ "$(_pp_request_count)" = 0 ]; then idle_reads=$(( idle_reads + 1 )); else idle_reads=0; fi
+        [ "$idle_reads" -ge 2 ]
+    }
+    poll_state --each _pp_gap_resets_idle 20 1 _pp_idle_twice || idle_rc=$?
+    [ "$idle_rc" -eq 0 ] \
+        || fail "$(state_why "$idle_rc" "$label: the app is not idle before the lane's first job (pipeline jobs: ${busy:-?}, stub requests so far: $(_pp_request_count)); a job the launch resumed or recovered would be sent to the stub")"
+
+    # --- 1. the stub answers --------------------------------------------------
+    printf 'ok' >"$_PP_DIR/mode"
+    _pp_run_job "$label [ok]" "$_PP_DIR/protocol-ok.wav"
+    local transcript="$_PP_TRANSCRIPT" protocol="$_PP_PROTOCOL" warned problems
+    warned="$(jq -r '.warnings[]? | select(test("protocol"; "i"))' <<<"$_PP_STATUS")"
+    [ -z "$warned" ] || fail "$label [ok]: the job carries a protocol warning: $warned"
+    [ -n "$transcript" ] && [ -f "$transcript" ] \
+        || fail "$label [ok]: no transcript file (transcriptPath='$transcript'), so the user message cannot be checked"
+    _pp_assert_one_request "$label [ok]"
+    problems="$(openai_stub_request_violations "$_PP_NEW_REQUESTS" "$(jq -nc --rawfile t "$transcript" \
+        --arg model "$_PP_MODEL" --arg lang "$_PP_LANGUAGE" --argjson temp "$_PP_TEMPERATURE" \
+        --argjson lip "$language_in_prompt" \
+        '{path: "/v1/chat/completions", model: $model, language: $lang, transcript: $t,
+          temperature: $temp, topP: null, languageInPrompt: $lip}')")" \
+        || fail "$label [ok]: could not check the stub's request: $(jq -c 'del(.body)' <<<"$_PP_NEW_REQUESTS" 2>/dev/null)"
+    [ -z "$problems" ] || fail "$label [ok]: the chat-completions request is not the expected one:"$'\n'"$problems"
+    log "$label [ok]: the request carried the model, the sampling override, the language and the transcript ✅"
+    [ -n "$protocol" ] || fail "$label [ok]: protocolPath is null although the stub answered"
+    [ "$(dirname "$protocol")" = "$OUTPUT_DIR/protocols" ] && [ "${protocol%.md}" != "$protocol" ] \
+        || fail "$label [ok]: protocolPath '$protocol' is not a .md file in $OUTPUT_DIR/protocols"
+    [ -f "$protocol" ] || fail "$label [ok]: protocolPath names a file that does not exist: $protocol"
+    # What generateProtocol saves with includeFullTranscriptInProtocol on: the
+    # reply, a rule, and the transcript the request carried.
+    { printf '%s' "$_PP_REPLY"; printf '\n\n---\n\n## Full Transcript\n\n'; cat "$transcript"; } >"$_PP_DIR/expected.md"
+    cmp -s "$_PP_DIR/expected.md" "$protocol" \
+        || fail "$label [ok]: the protocol file is not the stub's reply followed by the transcript. diff:"$'\n'"$(diff "$_PP_DIR/expected.md" "$protocol" | head -20)"
+    log "$label [ok]: $protocol holds the stub's reply and the transcript ✅"
+
+    # --- 2. the stub fails ----------------------------------------------------
+    printf 'http500' >"$_PP_DIR/mode"
+    _pp_run_job "$label [500]" "$_PP_DIR/protocol-500.wav"
+    transcript="$_PP_TRANSCRIPT" protocol="$_PP_PROTOCOL"
+    _pp_assert_one_request "$label [500]"
+    # That the stub really served this job a 500, so the warning below is the
+    # app's answer to a failed call and not to something else going wrong.
+    [ "$(jq -r '"\(.mode)/\(.status)"' <<<"$_PP_NEW_REQUESTS")" = "http500/500" ] \
+        || fail "$label [500]: the stub did not answer this job's request with a 500: $(jq -c 'del(.body)' <<<"$_PP_NEW_REQUESTS")"
+    jq -e 'any(.warnings[]?; . == "Protocol generation failed — transcript saved")' <<<"$_PP_STATUS" >/dev/null \
+        || fail "$label [500]: the job lacks the 'Protocol generation failed — transcript saved' warning: $(jq -c '.warnings' <<<"$_PP_STATUS")"
+    [ -z "$protocol" ] || fail "$label [500]: protocolPath is '$protocol' although the stub answered 500"
+    [ -n "$transcript" ] && [ -f "$transcript" ] \
+        || fail "$label [500]: the transcript was not kept (transcriptPath='$transcript')"
+    [ ! -e "${transcript%.txt}.md" ] || fail "$label [500]: a protocol file exists beside the transcript: ${transcript%.txt}.md"
+    log "$label [500]: done with the 'transcript saved' warning, transcript kept, no protocol file ✅"
+    log "$label: PASS"
+}
+
 # --- quit-flush lane (issue #745) -------------------------------------------
+#
+# NOT wired into CI; run by hand. On macOS 26 the non-admin runner user can
+# neither `log stream` ("Must be admin to run 'stream' command") nor `log show`
+# ("Could not open local log store: Operation not permitted"), and two of the
+# checks below read the unified log: the persistent-log streamer counts and the
+# AppKit trace of the double quit. Wiring it needs an admin runner or
+# assertions that do not read the log. The lane checks that precondition before
+# it changes anything, and stops with that message rather than failing later
+# as an app regression.
 #
 # A quit has to finish the recording in progress, hand it to the pipeline and
 # wait for the snapshot write that hand-over produces before the process exits.
@@ -3781,7 +5282,11 @@ _qf_app_pid() {
 _qf_app_gone() { [ -z "$(_qf_app_pid)" ]; }
 _qf_streamers_of() { ps -axo pid=,ppid=,command= | streamer_pids "$1"; }
 _qf_has_streamer() { [ -n "$(_qf_streamers_of "$1")" ]; }
-_qf_quit() { osascript -e "tell application id \"$DEV_BUNDLE_ID\" to quit"; }
+# The quits below are timed by the lane (see the double-quit cycle), so they
+# keep their shape and only get a generous cap: a pending Automation prompt
+# would otherwise hold osascript, and the step, open. A capped one reports 124.
+_QF_OSA_BOUND_S=60
+_qf_quit() { run_bounded "$_QF_OSA_BOUND_S" osascript -e "tell application id \"$DEV_BUNDLE_ID\" to quit"; }
 
 # Exactly one persistent-log streamer under the running app; leaves its pid in
 # _QF_STREAMER_PID. Waits for the first, then looks again a moment later: a
@@ -3816,7 +5321,7 @@ _qf_relaunch() {
     if [ -z "$opened" ]; then
         open -n "$DEV_BUNDLE_DEPLOY" || fail "$label: could not relaunch $DEV_BUNDLE_DEPLOY"
     fi
-    poll_until "$RPC_READY_TIMEOUT_S" 1 _rpc_ready || fail "$label: RPC did not come back after the relaunch"
+    poll_until "$RPC_READY_TIMEOUT_S" 1 rpc_ready || fail "$label: RPC did not come back after the relaunch"
     _launched_app="$(_qf_app_pid)"
     printf '%s launched' "$_launched_app" >"$_E2E_APP_MARKER"
     log "$label: relaunched (pid $_launched_app)"
@@ -3855,7 +5360,7 @@ _qf_cycle() {
         # 0.3 s apart found the app already gone), so only back-to-back events
         # reach it while it is held. The second reply is the answer AppKit gave
         # that request.
-        osascript -e 'ignoring application responses' \
+        run_bounded "$_QF_OSA_BOUND_S" osascript -e 'ignoring application responses' \
             -e "tell application id \"$DEV_BUNDLE_ID\" to quit" \
             -e 'end ignoring' \
             -e "tell application id \"$DEV_BUNDLE_ID\" to quit" >"$out1" 2>&1 &
@@ -3869,7 +5374,7 @@ _qf_cycle() {
 
     _qf_exited() { ! _pid_is_alive "$app_pid"; }
     poll_until "$_QF_EXIT_DEADLINE_S" 0.2 _qf_exited \
-        || fail "$label: the app (pid $app_pid) did not exit within ${_QF_EXIT_DEADLINE_S}s of the quit. The quit is being held open past every budget, or a second quit cancelled it."
+        || fail "$label: the app (pid $app_pid) did not exit within ${_QF_EXIT_DEADLINE_S}s of the quit. The quit is being held open past every budget, a second quit cancelled it, or the quit never arrived. osascript output so far: '$(tr '\n' ' ' <"$out1")' (empty while it is still waiting: the bound holds the output until it returns). Only -1743 there, or a quit that never shows in the app's log, points at the Automation grant: $(tcc_fix_hint 'Automation → MeetingTranscriber-Dev')"
     t_exit="$(date +%s)"
     log "$label: app exited about $(( t_exit - t0 ))s after the quit"
     # Before any assertion: a failure below must still clean up and restore
@@ -3947,15 +5452,11 @@ _qf_cycle() {
 
     # And the next launch restores it under its title.
     _qf_relaunch "$label"
-    # Polled: the restore runs when auto-watch starts, a beat after RPC is up.
-    local dto=""
-    _qf_restored() {
-        dto="$(rpc "/v1/jobs/$_QF_JOB_ID")"
-        [ "$(jq -r '.meetingTitle // empty' <<<"$dto" 2>/dev/null || true)" = "$_QF_TITLE" ]
-    }
-    poll_until 30 1 _qf_restored \
-        || fail "$label: after the relaunch GET /v1/jobs/$_QF_JOB_ID does not return the job with its title within 30s (last: ${dto:-<no response>})"
-    log "$label: restored after relaunch: $(jq -c '{jobID, state, meetingTitle}' <<<"$dto")"
+    # Polled: the restore runs when auto-watch starts, a beat after RPC is up,
+    # so a 404 until then is an answer ("not restored yet"), not a gap.
+    poll_rpc "/v1/jobs/$_QF_JOB_ID" --not-yet 404 --judge-deadline-read 30 1 rpc_is '.meetingTitle == $t' --arg t "$_QF_TITLE" \
+        || fail "$(rpc_why $? "/v1/jobs/$_QF_JOB_ID" "$label: after the relaunch GET /v1/jobs/$_QF_JOB_ID does not return the job with its title within 30s")"
+    log "$label: restored after relaunch: $(jq -c '{jobID, state, meetingTitle}' <<<"$RPC_BODY")"
     _QF_CYCLE_ACTIVE=""
 }
 
@@ -4000,8 +5501,12 @@ _qf_release_jobs() {
             [ -n "$f" ] && _QF_OWNED_PATHS+=("$f")
         done < <(_qf_job_file_paths "$job")
         _echo_release "$job"
-        dto="$(rpc "/v1/jobs/$job")"
-        state="$(jq -r '.state // empty' <<<"$dto")"
+        if ! rpc_read "/v1/jobs/$job"; then
+            log "[quit-flush] NOTE: no answer from the app about job $job, so its files stay where they are"
+            continue
+        fi
+        dto="$RPC_BODY"
+        state="$(rpc_field '.state // empty')" || state=""
         if [ "$state" != "done" ]; then
             log "[quit-flush] NOTE: job $job settled as '${state:-unknown}', not done; it stays in the queue until dismissed in the app. error=$(jq -r '.error // "<none>"' <<<"$dto")"
             continue
@@ -4119,11 +5624,19 @@ elif [ "$QUIT_FLUSH" = true ]; then
     run_quit_flush
 elif [ -n "$MIC_STALL" ]; then
     run_mic_stall
+elif [ "$UPGRADE" = true ]; then
+    run_upgrade
+elif [ "$PROTOCOL_LANE" = true ]; then
+    run_protocol_lane
 elif [ "$TWO_MEETINGS" = true ]; then
+    # Meeting 1 with a usable window title, meeting 2 without one: the two
+    # halves of the title source (see run_title_source).
     run_one_meeting "[1/2]"
+    _assert_meeting_identity "[1/2]" "$_SIM_WINDOW_TITLE" "$_TITLE_FROM_WINDOW_WHY"
     log "Sleeping ${INTER_MEETING_COOLDOWN_S}s for WatchLoop cooldown before meeting 2"
     sleep "$INTER_MEETING_COOLDOWN_S"
-    run_one_meeting "[2/2]"
+    run_one_meeting "[2/2]" "$_SIM_APP_NAME"
+    _assert_meeting_identity "[2/2]" "$_SIM_PLACEHOLDER_TITLE" "$_TITLE_PLACEHOLDER_WHY"
 else
     run_one_meeting "meeting"
 fi

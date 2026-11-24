@@ -1,3 +1,4 @@
+import AudioTapLib
 @testable import MeetingTranscriber
 import XCTest
 
@@ -352,6 +353,10 @@ final class SpeakerNamingSessionTests: XCTestCase {
             recorder.transitions.append(newState)
         }
 
+        func finishWithAcceptedAutoNames(jobID: UUID) {
+            updateJobState(id: jobID, to: .done, error: nil)
+        }
+
         func addWarning(id _: UUID, _: String) {}
 
         func setNamingMetadata(
@@ -365,7 +370,7 @@ final class SpeakerNamingSessionTests: XCTestCase {
             provenance _: SampleProvenance,
         ) {}
 
-        func generateProtocol(jobID _: UUID, transcript _: String, title _: String, protocolsDir _: URL) async {
+        func generateProtocol(jobID _: UUID, transcript _: String, title _: String, protocolsDir _: URL, speakerNames _: [String]) async {
             recorder.generateProtocolEntered += 1
             await withCheckedContinuation { recorder.protocolGate = $0 }
         }
@@ -378,9 +383,9 @@ final class SpeakerNamingSessionTests: XCTestCase {
             throw DiarizationError.notAvailable
         }
 
-        func renderLabeledTranscript(
+        func renderLabeledTranscript( // swiftlint:disable:this function_parameter_count
             run _: DiarizationRun, cachedSegments _: [TimestampedSegment],
-            isDualSource _: Bool, autoNames _: [String: String], note _: String?,
+            isDualSource _: Bool, autoNames _: [String: String], note _: String?, micMuted _: [MicMuteInterval],
         ) -> String? {
             nil
         }

@@ -26,6 +26,7 @@
 //                                  to the app, then print the field's value as read back
 //   read   --identifier AXID       print the element's AX value
 //   press  --identifier AXID       perform AXPress on the element (buttons)
+//   select-job --index N           pick the Nth meeting (0-based) in the naming window's job menu
 //
 // Output is `key=value` lines. Exit codes: 0 ok, 2 usage, 3 not trusted,
 // 4 app not running, 5 element not found, 6 focus or frontmost verification
@@ -47,7 +48,7 @@ func argument(_ name: String) -> String? {
 
 func usage() -> Never {
     FileHandle.standardError.write(Data(
-        "usage: drive-naming-field.swift trusted|windows|focus|type|read|press [--bundle-id ID] [--identifier AXID] [--text T]\n".utf8,
+        "usage: drive-naming-field.swift trusted|windows|tree|focus|type|read|press|select-job [--bundle-id ID] [--identifier AXID] [--text T] [--index N]\n".utf8,
     ))
     exit(2)
 }
@@ -162,7 +163,7 @@ case "windows":
 case "tree":
     // Diagnostic: role/subrole/title/value/identifier for every element under
     // each window. Not used by the lane; kept for inspecting the AX shape of a
-    // control the lane needs to drive (e.g. the segmented job picker).
+    // control the lane needs to drive (e.g. the job picker).
     for window in windows(of: app) {
         print("window=\(string(window, kAXTitleAttribute) ?? "")")
         walk(window) { element, depth in
@@ -177,34 +178,106 @@ case "tree":
         }
     }
 
-case "select-segment":
-    // Select the Nth segment (0-based) of the first segmented/radio group in
-    // any window, by AXPress on that child. Used to switch the job picker
-    // between two still-pending naming jobs without resolving either.
+case "select-job":
+    // Select the Nth entry (0-based) of the naming window's job picker, a
+    // SwiftUI menu Picker (AXPopUpButton), by pressing it open and then
+    // pressing the menu item. Used to switch between two still-pending naming
+    // jobs without resolving either. Found by its identifier
+    // (`A11yID.namingJobPicker`); the naming view holds no other pop-up
+    // button, so the first one in the "Name Speakers" window is the fallback
+    // if the identifier does not reach the AX element, or lands on a wrapping
+    // element rather than the pop-up itself. Other windows (Settings) have
+    // pop-ups of their own, so the fallback does not look there.
     guard let idxStr = argument("--index"), let idx = Int(idxStr) else { usage() }
-    // The job picker is a SwiftUI segmented Picker → AXRadioGroup with an EMPTY
-    // identifier. The naming view also holds a `rerun-mode-picker` radio group,
-    // so match on the empty id to target the job picker specifically.
-    var group: AXUIElement?
-    for window in windows(of: app) where group == nil {
+    let popUpRole = kAXPopUpButtonRole as String
+    var picker = find(identifier: "naming-job-picker", in: app)
+        .map(\.0)
+        .flatMap { string($0, kAXRoleAttribute) == popUpRole ? $0 : nil }
+    for window in windows(of: app) where picker == nil && string(window, kAXTitleAttribute) == "Name Speakers" {
         walk(window) { element, _ in
-            let role = string(element, kAXRoleAttribute) ?? ""
-            let id = string(element, kAXIdentifierAttribute) ?? ""
-            if (role == (kAXRadioGroupRole as String) || role == "AXTabGroup" || role == "AXSegmentedControl"), id.isEmpty {
-                group = element
+            if string(element, kAXRoleAttribute) == popUpRole {
+                picker = element
                 return false
             }
             return true
         }
     }
-    guard let group else { fail(5, "no unidentified segmented/radio group (job picker) found in any window") }
-    let segments = children(group)
-    guard idx >= 0, idx < segments.count else {
-        fail(5, "segment index \(idx) out of range (group has \(segments.count) segments)")
+    guard let picker else { fail(5, "no job picker (pop-up button) found in any window") }
+    // The menu's items, exposed as AXMenu > AXMenuItem under the pop-up only
+    // while the menu is open; empty while it is closed.
+    func menuItems() -> [AXUIElement] {
+        children(picker)
+            .filter { string($0, kAXRoleAttribute) == (kAXMenuRole as String) }
+            .flatMap { children($0) }
+            .filter { string($0, kAXRoleAttribute) == (kAXMenuItemRole as String) }
     }
-    let result = AXUIElementPerformAction(segments[idx], kAXPressAction as CFString)
-    guard result == .success else { fail(8, "AXPress on segment \(idx) failed: \(result.rawValue)") }
-    print("selected-segment=\(idx) of=\(segments.count)")
+    // Polls every 0.1 s until the menu is open (`true`) or closed (`false`),
+    // for at most `seconds`; returns the items seen last.
+    func awaitMenu(open: Bool, within seconds: Double) -> [AXUIElement] {
+        // A wall-clock deadline, not a sum of sleeps: an AX read can block
+        // while the app tracks the menu, and the bound must still hold.
+        let deadline = Date().addingTimeInterval(seconds)
+        var items = menuItems()
+        while items.isEmpty == open, Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.1)
+            items = menuItems()
+        }
+        return items
+    }
+    // Closes an open menu the way AX offers it: the pop-up itself has only
+    // AXPress, the items carry AXCancel (the pop-up answers AXCancel with
+    // "action unsupported" and the menu stays).
+    func cancelMenu(via item: AXUIElement) {
+        _ = AXUIElementPerformAction(item, kAXCancelAction as CFString)
+    }
+    // Waits until no menu is exposed under the pop-up, cancelling one that
+    // lingers. After an item press the menu stays exposed for about 350 ms
+    // (measured at 50 ms steps on one machine, macOS 27.2, whether or not the
+    // entry was already the one shown), and the lane's next call arrives
+    // within that window. The selection survives the cancel (the dialog keeps
+    // the newly chosen job's fields).
+    func ensureMenuClosed(_ when: String) {
+        let lingering = awaitMenu(open: false, within: 1.0)
+        guard !lingering.isEmpty else { return }
+        cancelMenu(via: lingering[0])
+        guard awaitMenu(open: false, within: 1.0).isEmpty else {
+            fail(8, "the job picker's menu stayed open \(when); the next press would be swallowed")
+        }
+    }
+    // Press the pop-up only while its menu is closed. AXPress on an OPEN
+    // pop-up removes the menu from the tree but leaves the picker deaf to
+    // further presses (about 3 s after a lingering post-selection menu,
+    // indefinitely after a fully opened one, until an Escape key reaches the
+    // app), which is what "menu has 0 items" then reports. So the same
+    // invariant holds at entry as at exit: whatever an earlier call left
+    // exposed is closed first, then the menu is opened afresh.
+    ensureMenuClosed("before entry \(idx) could be selected")
+    // `.cannotComplete` has not been observed here; it is tolerated rather
+    // than failed because the items polled below are the check that the menu
+    // opened, so a press that did nothing fails there.
+    let opened = AXUIElementPerformAction(picker, kAXPressAction as CFString)
+    guard opened == .success || opened == .cannotComplete else {
+        fail(8, "AXPress on the job picker failed: \(opened.rawValue)")
+    }
+    // The menu is built when it opens; give it a moment to appear.
+    let items = awaitMenu(open: true, within: 2.0)
+    guard !items.isEmpty else {
+        fail(5, "the job picker's menu did not open: no menu items appeared under the pop-up within 2 s of pressing it")
+    }
+    guard idx >= 0, idx < items.count else {
+        cancelMenu(via: items[0])
+        fail(5, "job index \(idx) out of range (menu has \(items.count) items)")
+    }
+    // `.cannotComplete` as on the open press; here the lane's entry count and
+    // labels are the check.
+    let result = AXUIElementPerformAction(items[idx], kAXPressAction as CFString)
+    guard result == .success || result == .cannotComplete else {
+        cancelMenu(via: items[0])
+        fail(8, "AXPress on menu item \(idx) failed: \(result.rawValue)")
+    }
+    // Leave the menu closed for the next call.
+    ensureMenuClosed("after selecting entry \(idx)")
+    print("selected-job=\(idx) of=\(items.count)")
 
 case "read":
     guard let id = identifier else { usage() }

@@ -22,7 +22,7 @@ final class AppStateTests: XCTestCase { // swiftlint:disable:this type_body_leng
         testLogDir = try makeTempDirectory(prefix: "AppStateTests")
         let suite = "AppStateTests-\(getpid())-\(UUID().uuidString)"
         settings = try AppSettings(
-            defaults: XCTUnwrap(UserDefaults(suiteName: suite)),
+            defaults: XCTUnwrap(DefaultsSuite.open(suite)),
             defaultOutputDir: testLogDir.appendingPathComponent("output", isDirectory: true),
         )
         addTeardownBlock { DefaultsSuite.remove(suite) }
@@ -43,9 +43,9 @@ final class AppStateTests: XCTestCase { // swiftlint:disable:this type_body_leng
     ) -> AppState {
         let logs: URL = logDir ?? testLogDir
         return AppState(
+            pipelineEnvironment: IsolatedQueueEnvironment.make(logDir: logs, initialQueue: queue),
             settings: settings,
             notifier: notifier,
-            pipelineEnvironment: IsolatedQueueEnvironment.make(logDir: logs, initialQueue: queue),
         )
     }
 
@@ -133,6 +133,35 @@ final class AppStateTests: XCTestCase { // swiftlint:disable:this type_body_leng
         try await loop.startManualRecording(pid: 1234, appName: "Chrome", title: "Meeting")
         defer { loop.stop() }
         XCTAssertFalse(state.isWatching)
+    }
+
+    // MARK: - Mic mute
+
+    func testMicMuteToggleIsNilWithoutAMutableRecording() {
+        let (state, _) = makeState()
+        XCTAssertNil(state.micMuteToggle)
+        state.watching.watchLoop = makeTestWatchLoop().0
+        XCTAssertNil(state.micMuteToggle)
+    }
+
+    func testMicMuteToggleMutesTheRecording() async throws {
+        let (state, _) = makeState()
+        let (loop, recorder) = makeTestWatchLoop()
+        recorder.canMuteMic = true
+        state.watching.watchLoop = loop
+        try await loop.startManualRecording(pid: getpid(), appName: "Chrome", title: "Meeting")
+        defer { loop.stop() }
+
+        try XCTUnwrap(state.micMuteToggle)()
+        XCTAssertTrue(recorder.isMicMuted)
+        XCTAssertTrue(state.isMicMuted)
+    }
+
+    func testMicMuteShortcutFollowsTheSetting() {
+        let (state, _) = makeState()
+        XCTAssertNil(state.micMuteShortcut)
+        state.settings.micMuteHotkey = GlobalHotkey(keyCode: 46, modifiers: [.control, .option], characters: "m")
+        XCTAssertEqual(state.micMuteShortcut?.modifiers, [.control, .option])
     }
 
     // MARK: - currentStateLabel
@@ -276,7 +305,7 @@ final class AppStateTests: XCTestCase { // swiftlint:disable:this type_body_leng
 
     // MARK: - toggleWatching: start path (async)
 
-    // toggleWatching() spawns a Task { @MainActor }. We yield once to let it run.
+    // toggleWatching() spawns a Task { @MainActor }; the tests poll with waitFor until it ran.
     // In CI, Permissions.ensureMicrophoneAccess() returns false immediately (no bundle),
     // but toggleWatching() ignores the return value so WatchLoop is always created.
 
@@ -312,14 +341,14 @@ final class AppStateTests: XCTestCase { // swiftlint:disable:this type_body_leng
         state.watching.watchLoop = loop
         try await loop.startManualRecording(pid: 42, appName: "Chrome", title: "Meeting")
 
-        state.watching.stopManualRecording()
+        await state.watching.stopManualRecording()
 
         XCTAssertNil(state.watching.watchLoop)
     }
 
-    func testStopManualRecordingWhenNoLoopIsNoOp() {
+    func testStopManualRecordingWhenNoLoopIsNoOp() async {
         let (state, _) = makeState()
-        state.watching.stopManualRecording() // must not crash
+        await state.watching.stopManualRecording() // must not crash
         XCTAssertNil(state.watching.watchLoop)
     }
 
@@ -419,25 +448,45 @@ final class AppStateTests: XCTestCase { // swiftlint:disable:this type_body_leng
     }
 
     #if !APPSTORE
+        /// The persistent log streamer writes the user's diagnostics folder and
+        /// spawns `log stream`, so it is the app's entry point that starts it,
+        /// not `init`, which every test that needs an `AppState` runs.
+        func testConstructionStartsNoPersistentLogStreamer() {
+            let state = makeAppState()
+            XCTAssertNil(state.persistentLogStreamer)
+        }
+
         func testBuildDebugRPCServerReturnsWiredServer() {
             let (state, _) = makeState()
             // Exercises buildDebugRPCServer's wiring, including the /v1 automation
             // closures (enqueueReturningIDs + jobStatus). Construction does not
             // start a listener, so boundPort is nil until start() is called.
-            let server = state.buildDebugRPCServer()
+            let server = state.buildDebugRPCServer(token: "test-token", tokenFile: nil)
             XCTAssertNil(server.boundPort)
         }
 
+        /// The token file handed to `buildDebugRPCServer` reaches the server, so
+        /// the `AppState`-built server publishes its token where clients read it.
+        func testBuildDebugRPCServerPublishesItsTokenToTheGivenFile() async throws {
+            let (state, _) = makeState()
+            let url = makeTempFile(suffix: "-rpc-token")
+            // The server writes the file before it reports its port, so once
+            // this returns the file must hold the token.
+            _ = try await startWiredServer(state, token: "wired-token", tokenFile: url)
+            XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), "wired-token")
+            let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
+            XCTAssertEqual((attrs[.posixPermissions] as? Int) ?? -1, 0o600)
+        }
+
         /// Boots the `AppState`-wired server on an OS-assigned port and returns
-        /// its base URL. Shared by the two socket tests below, which are separate
-        /// only because one function cannot hold both under the length cap.
+        /// its base URL. Shared by the socket tests around it.
         /// `DebugRPCServerIntegrationTests.startServer` cannot stand in: it
         /// builds a bare `DebugRPCServer`, and driving the `AppState`-built one
         /// is the whole point here.
         private func startWiredServer(
-            _ state: AppState, token: String,
+            _ state: AppState, token: String, tokenFile: URL?,
         ) async throws -> (server: DebugRPCServer, baseURL: URL) {
-            let server = state.buildDebugRPCServer(port: 0, token: token)
+            let server = state.buildDebugRPCServer(token: token, tokenFile: tokenFile, port: 0)
             server.start()
             addTeardownBlock { await server.stop() }
             for _ in 0 ..< 50 {
@@ -455,7 +504,7 @@ final class AppStateTests: XCTestCase { // swiftlint:disable:this type_body_leng
         func testBuildDebugRPCServerServesV1OverSocket() async throws {
             let (state, _) = makeState()
             let token = "appstate-rpc-e2e-token"
-            let baseURL = try await startWiredServer(state, token: token).baseURL
+            let baseURL = try await startWiredServer(state, token: token, tokenFile: nil).baseURL
 
             func send(_ method: String, _ path: String, body: Data? = nil) async throws -> Int {
                 var req = URLRequest(url: baseURL.appendingPathComponent(path))
@@ -545,7 +594,7 @@ final class AppStateTests: XCTestCase { // swiftlint:disable:this type_body_leng
             // the 200 distinguishes the wired control closure from `.failed`.
             state.permissions.handle(HealthCheckResult(screenRecording: .healthy, microphone: .denied))
             let token = "appstate-rpc-record-token"
-            let baseURL = try await startWiredServer(state, token: token).baseURL
+            let baseURL = try await startWiredServer(state, token: token, tokenFile: nil).baseURL
 
             var req = URLRequest(url: baseURL.appendingPathComponent("v1/record"))
             req.httpMethod = "POST"
@@ -700,22 +749,25 @@ final class AppStateTests: XCTestCase { // swiftlint:disable:this type_body_leng
 
     // MARK: - pipeline.makeQueue
 
-    func testMakeQueueHasDiarizationFactory() throws {
+    // `makeQueue` always passes both factories, so what is worth pinning is
+    // what they produce. The output folder is pinned in
+    // `PipelineControllerOutputFolderTests`.
+
+    func testMakeQueueDiarizesInTheConfiguredMode() throws {
         let (state, _) = makeState()
         let queue = try XCTUnwrap(state.pipeline.makeQueue())
-        XCTAssertNotNil(queue.diarizationFactory)
+        settings.diarizerMode = .sortformer
+        XCTAssertEqual(try XCTUnwrap(queue.diarizationFactory)().mode, .sortformer)
     }
 
-    func testMakeQueueHasProtocolGeneratorFactory() throws {
+    func testMakeQueueBuildsTheConfiguredProtocolGenerator() throws {
         let (state, _) = makeState()
         let queue = try XCTUnwrap(state.pipeline.makeQueue())
-        XCTAssertNotNil(queue.protocolGeneratorFactory)
-    }
-
-    func testMakeQueueSetsOutputDir() throws {
-        let (state, _) = makeState()
-        let queue = try XCTUnwrap(state.pipeline.makeQueue())
-        XCTAssertNotNil(queue.outputDir)
+        let factory = try XCTUnwrap(queue.protocolGeneratorFactory)
+        settings.protocolProvider = .openAICompatible
+        XCTAssertTrue(factory() is OpenAIProtocolGenerator)
+        settings.protocolProvider = .none
+        XCTAssertNil(factory(), "no provider must mean no protocol generation")
     }
 
     // MARK: - makeProtocolGenerator
@@ -724,6 +776,27 @@ final class AppStateTests: XCTestCase { // swiftlint:disable:this type_body_leng
         settings.protocolProvider = .openAICompatible
         let state = makeAppState()
         XCTAssertTrue(state.pipeline.makeProtocolGenerator() is OpenAIProtocolGenerator)
+    }
+
+    func testMakeProtocolGeneratorOpenAIPassesAPIKeyPlacementFromSettings() throws {
+        settings.protocolProvider = .openAICompatible
+        settings.openAIAPIKeyPlacement = .customHeader
+        settings.openAIAPIKeyHeaderName = "x-api-key"
+        let state = makeAppState()
+
+        let generator = try XCTUnwrap(state.pipeline.makeProtocolGenerator() as? OpenAIProtocolGenerator)
+        XCTAssertEqual(generator.apiKeyPlacement, .customHeader)
+        XCTAssertEqual(generator.apiKeyHeaderName, "x-api-key")
+    }
+
+    func testMakeProtocolGeneratorOpenAIPassesSamplingOverridesFromSettings() throws {
+        settings.protocolProvider = .openAICompatible
+        settings.openAITemperature = 0.3
+        let state = makeAppState()
+
+        let generator = try XCTUnwrap(state.pipeline.makeProtocolGenerator() as? OpenAIProtocolGenerator)
+        XCTAssertEqual(generator.temperature, 0.3)
+        XCTAssertNil(generator.topP, "an unset override must reach the generator as nil")
     }
 
     #if !APPSTORE
@@ -753,8 +826,171 @@ final class AppStateTests: XCTestCase { // swiftlint:disable:this type_body_leng
         state.pipeline.queue.onJobStateChange?(job, .transcribing, .done)
 
         XCTAssertEqual(notifier.calls.count, 1)
-        XCTAssertEqual(notifier.calls[0].title, "Protocol Ready")
+        XCTAssertEqual(notifier.calls[0].title, "Meeting Notes Ready")
         XCTAssertEqual(notifier.calls[0].body, "Sprint Review")
+    }
+
+    /// With auto-open off this notification is the only prompt for a meeting
+    /// waiting for names.
+    func testConfigureCallbacksSpeakerNamesWaitingFiresNotification() throws {
+        let tmpDir = try makeTempDirectory(prefix: "appstate_names_waiting")
+        let (state, notifier) = makeIsolatedState(logDir: tmpDir)
+        state.pipeline.configureCallbacks()
+
+        state.pipeline.queue.onSpeakerNamesWaiting?([makeJob(title: "Sprint Review")])
+        state.pipeline.queue.onSpeakerNamesWaiting?([makeJob(title: "Sprint Review"), makeJob(title: "Standup")])
+
+        XCTAssertEqual(notifier.calls.map(\.title), ["Name Speakers", "Name Speakers"])
+        guard notifier.calls.count == 2 else { return }
+        XCTAssertEqual(
+            notifier.calls[0].body,
+            "\"Sprint Review\" is waiting for speaker names. Open Name Speakers... in the menu bar.",
+        )
+        XCTAssertEqual(notifier.calls[1].body, "2 meetings are waiting for speaker names. Open Name Speakers... in the menu bar.")
+    }
+
+    func testConfigureCallbacksFailedNotesFireTheFailedNotification() throws {
+        let tmpDir = try makeTempDirectory(prefix: "appstate_notes_failed")
+        let (state, notifier) = makeIsolatedState(logDir: tmpDir)
+        state.pipeline.configureCallbacks()
+        var job = makeJob(title: "Sprint Review")
+        job.notesFailure = .timedOut
+
+        state.pipeline.queue.onJobStateChange?(job, .generatingProtocol, .done)
+
+        XCTAssertEqual(notifier.calls.map(\.title), ["Meeting Notes Failed"])
+    }
+
+    /// Off, the value other than the default: with the default this would pass
+    /// even if the callback ignored the setting.
+    func testConfigureCallbacksFailedNotesWithTheSettingOffFireTranscriptSaved() throws {
+        let tmpDir = try makeTempDirectory(prefix: "appstate_notes_failed_off")
+        let (state, notifier) = makeIsolatedState(logDir: tmpDir)
+        state.settings.notifyOnMeetingNotesFailure = false
+        state.pipeline.configureCallbacks()
+        var job = makeJob(title: "Sprint Review")
+        job.notesFailure = .timedOut
+
+        state.pipeline.queue.onJobStateChange?(job, .generatingProtocol, .done)
+
+        XCTAssertEqual(notifier.calls.map(\.title), ["Transcript Saved"])
+    }
+
+    func testConfigureCallbacksNotionOnlyProtocolFiresProtocolNotification() throws {
+        let tmpDir = try makeTempDirectory(prefix: "appstate_notion_callbacks")
+        let (state, notifier) = makeIsolatedState(logDir: tmpDir)
+        state.pipeline.configureCallbacks()
+        var job = makeJob(title: "Sprint Review")
+        job.recordNotionPage(
+            NotionPageResult(pageID: "page-1", url: "https://www.notion.so/page-1"),
+            databaseID: "database-1",
+        )
+        job.finishNotionExport(succeeded: true)
+
+        state.pipeline.queue.onJobStateChange?(job, .generatingProtocol, .done)
+
+        XCTAssertEqual(notifier.calls.count, 1)
+        XCTAssertEqual(notifier.calls[0].title, "Meeting Notes Ready")
+    }
+
+    /// A voice whose embedding is NaN/Inf is left out of the speaker DB. The
+    /// user named that speaker, so they need telling the voice was not kept,
+    /// once per job however often the job is confirmed again.
+    func testUnusableVoiceIsNotifiedOncePerJob() throws {
+        let tmpDir = try makeTempDirectory(prefix: "appstate_callbacks")
+        let (state, notifier) = makeIsolatedState(logDir: tmpDir)
+        state.pipeline.configureCallbacks()
+        let queue = state.pipeline.queue
+        let job = makeJob(title: "Sprint Review")
+        queue.insertJobForTesting(job)
+        let matcher = SpeakerMatcher(dbPath: tmpDir.appendingPathComponent("speakers.json"))
+        let confirm = {
+            queue.updateSpeakerDB(
+                matcher: matcher,
+                mapping: ["SPEAKER_0": "Alice", "SPEAKER_1": "Bob"],
+                embeddings: ["SPEAKER_0": [1, 0, 0], "SPEAKER_1": [.nan, 0, 0]],
+                speakingTimes: [:],
+                provenance: SampleProvenance(jobID: job.id),
+            )
+        }
+
+        confirm()
+        confirm()
+
+        XCTAssertEqual(notifier.calls.map(\.title), ["Voice not saved"])
+        XCTAssertTrue(notifier.calls[0].body.contains("Bob"), notifier.calls[0].body)
+        XCTAssertFalse(notifier.calls[0].body.contains("Alice"), notifier.calls[0].body)
+        XCTAssertTrue(notifier.calls[0].body.contains("Sprint Review"), notifier.calls[0].body)
+    }
+
+    /// A later confirmation of the same job (late naming, a re-run) can leave
+    /// out a different name; that one has not been reported yet.
+    func testANewlyUnusableVoiceOfTheSameJobIsStillNotified() throws {
+        let tmpDir = try makeTempDirectory(prefix: "appstate_callbacks")
+        let (state, notifier) = makeIsolatedState(logDir: tmpDir)
+        state.pipeline.configureCallbacks()
+        let queue = state.pipeline.queue
+        let job = makeJob()
+        queue.insertJobForTesting(job)
+        let matcher = SpeakerMatcher(dbPath: tmpDir.appendingPathComponent("speakers.json"))
+        let confirm = { (unusable: String) in
+            queue.updateSpeakerDB(
+                matcher: matcher,
+                mapping: ["SPEAKER_0": "Alice", "SPEAKER_1": unusable],
+                embeddings: ["SPEAKER_0": [1, 0, 0], "SPEAKER_1": [.nan, 0, 0]],
+                speakingTimes: [:],
+                provenance: SampleProvenance(jobID: job.id),
+            )
+        }
+
+        confirm("Bob")
+        confirm("Carol")
+        confirm("Bob")
+
+        XCTAssertEqual(notifier.calls.count, 2)
+        XCTAssertTrue(notifier.calls[0].body.contains("Bob"))
+        XCTAssertTrue(notifier.calls[1].body.contains("Carol") && !notifier.calls[1].body.contains("Bob"))
+    }
+
+    /// With nothing saved the matcher already reports the DB; a per-voice
+    /// notice on top would imply the other names were kept.
+    func testUnusableVoiceIsNotNotifiedWhenNothingWasSaved() throws {
+        let tmpDir = try makeTempDirectory(prefix: "appstate_callbacks")
+        let (state, notifier) = makeIsolatedState(logDir: tmpDir)
+        state.pipeline.configureCallbacks()
+        let job = makeJob()
+        state.pipeline.queue.insertJobForTesting(job)
+        let dbPath = tmpDir.appendingPathComponent("speakers.json")
+        try Data("[]".utf8).write(to: dbPath)
+        try makeUnreadable(dbPath)
+
+        state.pipeline.queue.updateSpeakerDB(
+            matcher: SpeakerMatcher(dbPath: dbPath) { _ in },
+            mapping: ["SPEAKER_0": "Alice", "SPEAKER_1": "Bob"],
+            embeddings: ["SPEAKER_0": [1, 0, 0], "SPEAKER_1": [.nan, 0, 0]],
+            speakingTimes: [:],
+            provenance: SampleProvenance(jobID: job.id),
+        )
+
+        XCTAssertTrue(notifier.calls.isEmpty)
+    }
+
+    func testUsableVoicesAreNotNotified() throws {
+        let tmpDir = try makeTempDirectory(prefix: "appstate_callbacks")
+        let (state, notifier) = makeIsolatedState(logDir: tmpDir)
+        state.pipeline.configureCallbacks()
+        let job = makeJob()
+        state.pipeline.queue.insertJobForTesting(job)
+
+        state.pipeline.queue.updateSpeakerDB(
+            matcher: SpeakerMatcher(dbPath: tmpDir.appendingPathComponent("speakers.json")),
+            mapping: ["SPEAKER_0": "Alice"],
+            embeddings: ["SPEAKER_0": [1, 0, 0]],
+            speakingTimes: [:],
+            provenance: SampleProvenance(jobID: job.id),
+        )
+
+        XCTAssertTrue(notifier.calls.isEmpty)
     }
 
     func testConfigureCallbacksErrorFiresNotification() throws {
@@ -763,17 +999,8 @@ final class AppStateTests: XCTestCase { // swiftlint:disable:this type_body_leng
         let (state, notifier) = makeIsolatedState(logDir: tmpDir)
         state.pipeline.configureCallbacks()
 
-        var job = makeJob()
-        job = PipelineJob(
-            meetingTitle: job.meetingTitle,
-            appName: job.appName,
-            mixPath: job.mixPath,
-            appPath: nil,
-            micPath: nil,
-            micDelay: 0,
-        )
         // Simulate a job with an error string
-        let errorJob = jobWithError(job, message: "Transcription failed")
+        let errorJob = jobWithError(makeJob(), message: "Transcription failed")
         state.pipeline.queue.onJobStateChange?(errorJob, .transcribing, .error)
 
         XCTAssertEqual(notifier.calls.count, 1)
@@ -852,11 +1079,29 @@ final class AppStateTests: XCTestCase { // swiftlint:disable:this type_body_leng
         XCTAssertTrue(queue.diarizeEnabled)
     }
 
+    /// Off, the value other than the default: with the default this would pass
+    /// even if `makeQueue()` dropped the setting.
+    func testMakeQueueUsesAutoOpenSpeakerNamingFromSettings() throws {
+        let (state, _) = makeState()
+        state.settings.autoOpenSpeakerNaming = false
+        XCTAssertFalse(try XCTUnwrap(state.pipeline.makeQueue()).autoOpensSpeakerNaming)
+    }
+
     func testMakeQueueUsesMicLabelFromSettings() throws {
         let (state, _) = makeState()
         state.settings.micName = "Speaker A"
         let queue = try XCTUnwrap(state.pipeline.makeQueue())
         XCTAssertEqual(queue.micLabel, "Speaker A")
+    }
+
+    /// An empty name is what the Settings caption advised; the stored
+    /// value stays as it is, the queue resolves it to the default label.
+    func testMakeQueueFallsBackToMeForEmptyMicName() throws {
+        let (state, _) = makeState()
+        state.settings.micName = ""
+        let queue = try XCTUnwrap(state.pipeline.makeQueue())
+        XCTAssertEqual(queue.micLabel, "Me")
+        XCTAssertEqual(state.settings.micName, "", "the stored setting is not rewritten")
     }
 
     func testMakeQueueUsesNumSpeakersFromSettings() throws {
@@ -865,16 +1110,25 @@ final class AppStateTests: XCTestCase { // swiftlint:disable:this type_body_leng
         let queue = try XCTUnwrap(state.pipeline.makeQueue())
         XCTAssertEqual(queue.numSpeakers, 4)
     }
+
+    /// Values other than the one-day default: with the default this would pass
+    /// even if `makeQueue()` dropped the setting and the queue fell back to it.
+    func testMakeQueueUsesStaleNamingTimeoutFromSettings() throws {
+        let (state, _) = makeState()
+        state.settings.staleNamingTimeout = .never
+        XCTAssertNil(try XCTUnwrap(state.pipeline.makeQueue()).staleNamingMaxAge)
+
+        state.settings.staleNamingTimeout = .sevenDays
+        XCTAssertEqual(try XCTUnwrap(state.pipeline.makeQueue()).staleNamingMaxAge, 7 * 86400)
+    }
 }
 
 // MARK: - Private helpers
 
-/// Returns a copy of `job` with the error field set via updateJobState simulation.
-/// Since PipelineJob is a struct and error is set by PipelineQueue internally,
-/// we construct a new job and set the error via the queue's updateJobState.
+/// Returns a copy of `job` with its error set, as the queue sets it on a
+/// failed job.
 @MainActor
 private func jobWithError(_ job: PipelineJob, message: String) -> PipelineJob {
-    // PipelineJob.error is var but directly settable since it's internal
     var copy = job
     copy.error = message
     return copy

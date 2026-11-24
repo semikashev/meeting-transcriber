@@ -113,4 +113,124 @@ final class WatchLoopTimingTests: XCTestCase {
                 + "grace window had elapsed.",
         )
     }
+
+    // MARK: - Back-to-back calls (issue #765)
+
+    private static let teamsCall = PowerAssertionFixture.teamsCall
+
+    /// A detector whose assertions follow `timeline` on the virtual clock:
+    /// each entry holds from its offset until the next entry's.
+    private func timelineDetector(
+        _ clock: TestClock,
+        _ timeline: [(from: TimeInterval, assertions: [Int32: [[String: Any]]])],
+    ) -> PowerAssertionDetector {
+        let start = clock.now
+        let detector = PowerAssertionDetector()
+        detector.windowListProvider = { [] }
+        detector.assertionProvider = {
+            let elapsed = clock.now.timeIntervalSince(start)
+            return timeline.last { $0.from <= elapsed }?.assertions ?? [:]
+        }
+        return detector
+    }
+
+    private func timedLoop(
+        _ detector: PowerAssertionDetector,
+        _ clock: TestClock,
+        recorderFactory: @escaping @MainActor () async -> any RecordingProvider = { makeMockRecorder() },
+    ) -> WatchLoop {
+        WatchLoop(
+            detector: detector, recorderFactory: recorderFactory,
+            pollInterval: 0.05, endGracePeriod: 0.5, maxDuration: 30,
+            nowProvider: { clock.now }, sleepProvider: { await clock.sleep(for: $0) },
+        )
+    }
+
+    func testWaitForMeetingEndStopsWhenTheAppMovesToANewCallWithinGrace() async throws {
+        let clock = TestClock()
+        let loop = timedLoop(timelineDetector(clock, [
+            (0, Self.teamsCall(1, 2, 1234)),
+            (1.0, [:]), // gap shorter than the grace
+            (1.2, Self.teamsCall(3, 4, 1234)),
+        ]), clock)
+        let virtualStart = clock.now
+
+        let reason = try await loop.waitForMeetingEnd(makeMeeting())
+
+        XCTAssertEqual(reason, .replacedByNewCall)
+        XCTAssertLessThan(clock.now.timeIntervalSince(virtualStart), 1.5, "must stop when the new call appears")
+    }
+
+    func testWaitForMeetingEndKeepsRecordingWhenTheSameCallComesBack() async throws {
+        let clock = TestClock()
+        let loop = timedLoop(timelineDetector(clock, [
+            (0, Self.teamsCall(1, 2, 1234)),
+            (1.0, [:]),
+            (1.2, Self.teamsCall(1, 2, 1234)),
+            (2.0, [:]),
+        ]), clock)
+        let virtualStart = clock.now
+
+        let reason = try await loop.waitForMeetingEnd(makeMeeting())
+
+        XCTAssertEqual(reason, .ended)
+        XCTAssertGreaterThanOrEqual(clock.now.timeIntervalSince(virtualStart), 2.5)
+    }
+
+    /// The whole loop: two back-to-back calls become two recordings, and the
+    /// second starts while its call is still running. The detector's cooldown
+    /// runs on wall-clock time, so if it were applied after the split the
+    /// virtual timeline would race past the second call before detection
+    /// resumed, and only one recording would start.
+    func testBackToBackCallsBecomeTwoRecordings() async {
+        let clock = TestClock()
+        let virtualStart = clock.now
+        var recorders: [MockRecorder] = []
+        var recordingStarts: [TimeInterval] = []
+        let loop = timedLoop(timelineDetector(clock, [
+            (0, Self.teamsCall(1, 2, 1234)),
+            (1.0, [:]),
+            (1.2, Self.teamsCall(3, 4, 1234)),
+            (3.0, [:]),
+        ]), clock) {
+            recordingStarts.append(clock.now.timeIntervalSince(virtualStart))
+            let recorder = makeMockRecorder()
+            recorders.append(recorder)
+            return recorder
+        }
+        loop.permissionChecker = { .allHealthy }
+        var transitions: [WatchLoop.State] = []
+        var splitTransitions: [WatchLoop.State] = []
+        loop.onStateChange = { _, new, cause in
+            transitions.append(new)
+            if cause == .callSplit { splitTransitions.append(new) }
+        }
+
+        loop.start()
+        // Wall-clock bail-out: a watch task that exits or parks outside
+        // clock.sleep would otherwise leave this loop spinning forever.
+        let deadline = Date().addingTimeInterval(10)
+        while clock.now.timeIntervalSince(virtualStart) < 5, Date() < deadline {
+            await Task.yield()
+        }
+        loop.stop()
+
+        XCTAssertEqual(recorders.count, 2, "each call must get its own recording")
+        XCTAssertTrue(recorders.allSatisfy(\.stopCalled))
+        // Channel health, the live-caption flush and the "Meeting Detected"
+        // notification all hang on entering `.recording`, so the second call
+        // must enter it too rather than inherit the first call's phase.
+        XCTAssertEqual(
+            transitions.count { $0 == .recording }, 2,
+            "each recording must be entered by its own transition, got \(transitions)",
+        )
+        // Only the step out of the first call is the split; the final stop is not.
+        XCTAssertEqual(splitTransitions, [.watching], "got \(transitions)")
+        if recordingStarts.count == 2 {
+            XCTAssertGreaterThan(recordingStarts[1], 1.2)
+            // The end poll sees the switch within one poll; re-confirming the
+            // call from scratch would add two more.
+            XCTAssertLessThan(recordingStarts[1], 1.3, "the second recording must start right after the switch")
+        }
+    }
 }

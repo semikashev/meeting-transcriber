@@ -12,6 +12,9 @@ prefix. The `/v1` surface carries a stability contract; the unversioned debug
 endpoints (`/state`, `/metrics`, `/screenshot`, `/action/*`) are inspection-only
 and may change without notice.
 
+The inspection-only `/state` response's `lastJob` also exposes the optional
+`export` object described under [JobStatusDTO](#jobstatusdto).
+
 ## Availability
 
 - **Homebrew / direct build only.** The whole server is compiled out of the App
@@ -33,15 +36,20 @@ Two layers of defense, both enforced on every request:
 1. **Bearer token.** Send `Authorization: Bearer <token>`. The token is a
    64-character hex string (32 bytes of entropy) stored at
    `~/Library/Application Support/MeetingTranscriber/.rpc-token` (mode `0600`).
-   It is generated on first launch and reused across launches. Toggling the
-   server off then on rotates the token (invalidating any previously leaked
-   value). A missing or wrong token returns `401`. Comparison is constant-time.
+   A new token is written every time the server starts: at each app launch
+   with the API on, and each time the toggle is switched off and back on. The
+   file is replaced just after the server starts listening, and the old value
+   stops working with the server it belonged to, so read the file when you make
+   the request (or again after a `401`) rather than keeping a copy. A missing or
+   wrong token returns `401`. Comparison is constant-time.
 2. **Origin / Host guard.** Any request carrying a non-empty browser `Origin`
-   header (other than the literal `null`) is rejected with `403`, which blocks
+   header, the literal `null` included, is rejected with `403`, which blocks
    CSRF and DNS-rebinding from a page running locally. The `Host` header, when
    present, must be `127.0.0.1` or `localhost` (with or without the port), else
-   `403`. `curl` and native CLIs send neither header, so they pass; browsers do,
-   so they are kept out.
+   `403`. The match is exact and case-sensitive (`Host: LOCALHOST:9876` is
+   refused). `curl` and native CLIs send no `Origin` and a `Host` naming the
+   loopback address they connect to, so they pass; a browser page sends an
+   `Origin`, so it is kept out.
 
 Read the token into a shell variable for the examples below:
 
@@ -63,6 +71,9 @@ per connection; exceeding it closes the connection without sending a response.
 | `GET`  | `/v1/jobs/<id>/naming` | Read the pending speaker-naming choice for a job. |
 | `POST` | `/v1/jobs/<id>/naming` | Confirm speaker names for a job. |
 | `POST` | `/v1/jobs/<id>/naming/skip` | Skip naming for a job (accept auto-assigned names). |
+| `POST` | `/v1/jobs/<id>/notes/retry` | Generate a job's failed meeting notes again from its transcript. |
+| `POST` | `/v1/jobs/notes/retry` | The same for every job whose meeting notes failed. |
+| `POST` | `/v1/jobs/notes/generate` | Generate meeting notes for saved transcripts (`.txt`), one job per file. |
 | `GET`  | `/v1/watch` | Read whether the app is watching for meetings. |
 | `POST` | `/v1/watch` | Start, stop or toggle meeting watching. |
 | `GET`  | `/v1/record` | Read whether a microphone-only recording is running. |
@@ -154,8 +165,13 @@ curl -sS -X POST "$BASE/v1/jobs" \
 Read a job's current status. Answers for both live (in-flight) jobs and finished
 jobs that have already been reaped from the in-memory queue: terminal records
 are persisted to a small file-backed store (cap 200, owner-only) that survives
-both the queue's 60-second cleanup of finished jobs and an app restart. A slow
-poller therefore never loses the transcript/protocol paths.
+both the queue's 60-second cleanup of finished jobs (deferred while a native
+menu is open) and an app restart. A job whose Notion export failed stays in the
+queue and terminal store for retry even when its original audio is gone. After
+a successful export retry, the normal 60-second cleanup starts. Until then the
+job is held until **Discard Notion Retry** in the menu; its audio sidecars are
+released as soon as it finishes, because the retry only reads the Markdown. A slow poller
+therefore never loses the transcript/protocol paths.
 
 Responses:
 
@@ -220,6 +236,106 @@ Responses:
 - `409 Conflict` if the job exists but is not awaiting naming.
 - `404 Not Found` if the id is unknown.
 
+### POST /v1/jobs/&lt;id&gt;/notes/retry
+
+Generate the meeting notes of a finished job again, when the first attempt
+failed (the job is `done` with the warning "Protocol generation failed —
+transcript saved"). Runs from the saved transcript only: no transcription, no
+diarization. The job goes back to `waiting` under the **same id** and runs in
+turn with the rest of the queue, so poll `GET /v1/jobs/<id>` until it is `done`
+again; `protocolPath` is set once the notes are saved. The job keeps the
+"Protocol generation failed" warning until then, so a second failure leaves it
+retryable, warning included. A retry still waiting when the app quits is still
+a notes-only retry after the relaunch. Nothing retries by itself.
+
+Such a job stays in the queue, past the 60-second cleanup and across a restart,
+until it is retried or dismissed in the menu.
+
+The same holds for a notes-only job (a retry, or one from
+`POST /v1/jobs/notes/generate`) that ended `done` without notes for one of two
+reasons, each named by a warning on the job: the meeting notes provider was
+switched to None while the job waited ("Choose a meeting notes provider in
+Settings → Output to make the meeting notes"), or the transcript could not be
+read when the job ran ("The saved transcript could not be read, so no meeting
+notes were made"). Both stay in the queue and can be retried through this
+route. The retry is refused with `409` while no provider is chosen or the
+transcript file is missing. A transcript that is there but cannot be read
+(blank, not UTF-8, or too large) is accepted with `200` and ends `done` with
+the same warning again, so a client should read the job's warnings rather
+than retry until the answer changes.
+
+Responses:
+
+- `200 OK` with the job's [JobStatusDTO](#jobstatusdto) (`state: waiting`).
+- `409 Conflict` if the job exists but has no failed notes to retry, or the
+  retry was refused. A refusal adds a warning to the job: the meeting notes
+  provider is None (Settings → Output), notes already exist next to the
+  transcript (they are never overwritten, and the job stops offering the
+  retry), or the transcript is gone (the job keeps offering it).
+- `404 Not Found` if the id is unknown.
+
+```bash
+curl -sS -X POST "$BASE/v1/jobs/<id>/notes/retry" -H "Authorization: Bearer $TOKEN"
+```
+
+### POST /v1/jobs/notes/retry
+
+The same for every job whose meeting notes failed, in queue order. They run one
+after another.
+
+Responses:
+
+- `200 OK` with `{"jobIDs":[...]}`, the jobs whose retry started; empty when
+  there were none.
+
+```bash
+curl -sS -X POST "$BASE/v1/jobs/notes/retry" -H "Authorization: Bearer $TOKEN"
+```
+
+### POST /v1/jobs/notes/generate
+
+Generate meeting notes for transcripts already on disk, such as meetings from
+before the notes were set up, or whose notes failed and whose job is gone. The
+counterpart of the menu's **Generate Meeting Notes from Transcript…**. One job
+per file, run in turn with the rest of the queue: notes only, no transcription.
+The notes are saved next to each transcript as `<name>.md`. The transcript
+itself is never moved, renamed or removed. A name that starts with the app's
+`yyyyMMdd_HHmm` stamp gives the notes their meeting date.
+
+Request body:
+
+```json
+{ "paths": ["/abs/20261030_0900_standup.txt", "/abs/20261031_1400_review.txt"] }
+```
+
+Responses:
+
+- `200 OK` with `{ "jobIDs": [...], "notesExist": [...], "unreadable": [...], "alreadyQueued": [...] }`:
+  the jobs created, in the order given, and the paths left out. `notesExist`
+  are transcripts with a `.md` of the same name next to them (never
+  overwritten); `unreadable` are paths that are not a `.txt`, missing, empty or
+  larger than 16 MiB; `alreadyQueued` are paths given twice, or already waiting
+  in a notes-only job. Poll each job with `GET /v1/jobs/<id>`. A job whose
+  transcript gains notes, or cannot be read when it runs, or whose provider
+  was switched to None while it waited, ends `done` without notes and with a
+  warning that says why; notes are never overwritten. `protocolPath` is what
+  tells a job that saved notes from one that did not: it is set only then.
+  A job that ended for the provider or the unreadable transcript, or whose
+  model call failed, stays in the queue and can be retried with
+  `POST /v1/jobs/<id>/notes/retry` (see above); one whose
+  transcript gained notes leaves the queue like any finished job.
+  The request posts no user notification; the response is the answer.
+- `400 Bad Request` if `paths` is missing/empty or the body is undecodable.
+- `409 Conflict` if the meeting notes provider is None (Settings → Output):
+  nothing is queued.
+
+```bash
+curl -sS -X POST "$BASE/v1/jobs/notes/generate" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"paths":["/Users/me/Documents/MeetingTranscriber/protocols/20261030_0900_standup.txt"]}'
+```
+
 ### GET /v1/watch
 
 Read whether the app is currently watching for meetings. Returns a
@@ -271,10 +387,15 @@ Responses:
   explain the refusal. Only `start` and a `toggle` that resolves to a start can
   return this.
 - `503 Service Unavailable` — the action was attempted but the state did not
-  settle within 20 seconds. In practice this means an unanswered microphone
-  permission dialog: the first watch start on a fresh install blocks on it, and
-  on a menu-bar-only app that dialog can sit unnoticed behind other windows.
-  Answer it and retry. Note that a *denied* microphone does not produce a `503`
+  settle within 20 seconds. In practice this means one of two things. An
+  unanswered microphone permission dialog: the first watch start on a fresh
+  install blocks on it, and on a menu-bar-only app that dialog can sit unnoticed
+  behind other windows. Answer it and retry. Or a start right after a stop that
+  ended a recording: the start waits until that recording is mixed and queued,
+  which for a long recording can take longer than 20 seconds, and every watch
+  action sent meanwhile, a stop too, waits for that start. Once the mix is done
+  watching starts by itself, unless a manual recording began in the meantime;
+  retry after that and you find it on. Note that a *denied* microphone does not produce a `503`
   — watching starts regardless, because app audio records without it, so you get
   `200` with `watching: true`. Check the badge or `permissionsHealthy` for that.
 - `400 Bad Request` — the body is not JSON, or `action` is not one of the three
@@ -374,10 +495,13 @@ Scope and limits:
 - The key map is in-memory per server instance (a bounded FIFO, cap 1024).
   Toggling the server off then on clears it; the dedup window is one session,
   which is all retry-dedup needs.
-- The key is recorded after the job is created, so this dedupes **sequential**
-  retries (a client re-sending after a response or a timeout, the common case).
-  Two same-key requests racing in-flight can both enqueue. Reserve-before-work
-  hardening is a planned follow-up.
+- The key is recorded as soon as the job is created. For `/v1/transcribe` that
+  is before the blocking wait, so a client that gives up on its own HTTP timeout
+  and re-sends while the first request is still waiting gets that job's current
+  status (`202` while it runs) rather than a second job. This dedupes
+  **sequential** retries (a client re-sending after a response or a timeout, the
+  common case). Two same-key requests arriving before either has created its job
+  can both enqueue. Reserve-before-work hardening is a planned follow-up.
 
 ## Data shapes
 
@@ -390,7 +514,12 @@ Scope and limits:
   "meetingTitle": "Daily Standup",
   "transcriptPath": "/Users/me/.../standup.md",
   "protocolPath": "/Users/me/.../standup-protocol.md",
-  "error": null,
+  "export": {
+    "destination": "notion",
+    "status": "completed",
+    "id": "7f4d3a2b1c0e4f5a8b9c6d7e8f0a1b2c",
+    "url": "https://app.notion.com/p/7f4d3a2b1c0e4f5a8b9c6d7e8f0a1b2c"
+  },
   "warnings": [],
   "echo": {
     "detected": true,
@@ -398,7 +527,9 @@ Scope and limits:
     "windowsScored": 34,
     "windowsAffected": 21,
     "suppressedSegments": 12,
-    "removed": false
+    "removed": false,
+    "cancellationSeconds": 41.2,
+    "micDelaySeconds": 0.02
   }
 }
 ```
@@ -408,8 +539,29 @@ Scope and limits:
   `error`; a user retry can move an `error` job back to `waiting` under the same
   id (see `GET /v1/jobs/<id>` above).
 - `transcriptPath` / `protocolPath`: absolute paths, present once produced
-  (`protocolPath` stays `null` when protocol generation is disabled or skipped).
-- `error`: a message string when `state == "error"`, else `null`.
+  (`protocolPath` stays absent when protocol generation is disabled or skipped).
+- `export`: absent when no export was attempted, including export switched on but
+  not configured, which `warnings` explains. `destination` is `notion`. `status` is
+  `in_progress`, `failed` or `completed`. `id` appears as soon as the page exists, so
+  a failed or interrupted export can be retried against it. `url` appears only after the export
+  completes, which can be after `state` is `done`: the export runs in the background,
+  so poll while `status` is `in_progress`. `POST /v1/transcribe` does not wait for
+  it: it returns once `state` is terminal, with the export still `in_progress` if
+  Notion has not finished. One export is stopped after ten minutes and ends as
+  `failed`, which the menu can retry. A successful Notion-only export has no `protocolPath`; use
+  `url` to open the page.
+- A done job with `export.status: "failed"` can be retried from its local
+  Markdown backup using the menu's **Retry Notion Export** action. This reads
+  the saved protocol and reuses the page ID when the same database is selected;
+  it does not rerun transcription or protocol generation. The action is enabled
+  only while Notion export is enabled and the backup file exists. If the file is
+  unreadable or empty, the retry stays failed and the job gains a warning. A
+  completed job restored with `in_progress` status is changed to `failed`, with a
+  warning saying the app quit during the export. The status and warning in this
+  response are updated when retry succeeds. With **Skip local markdown** on, a
+  successful retry removes the backup and `protocolPath` is then absent.
+- `error`: a message string when `state == "error"`, else absent. Like every
+  optional job field, a field without a value is omitted rather than sent as `null`.
 - `warnings`: zero or more non-fatal warning strings (for example a partial
   diarization failure on one track).
 - `echo`: the echo-bleed verdict, see below. Absent for a single-source job and
@@ -432,7 +584,15 @@ reports it here.
   carry the same audio.
 - `windowsScored` / `windowsAffected`: the counts the share is computed from. A
   verdict needs a minimum of both before it claims anything, so a share alone is
-  not the whole decision.
+  not the whole decision. Nor is it the only route to one: a recording is also
+  judged affected when the share is high over just the windows the far end was
+  talking in, or when most windows peak at one stable lag even though few of them
+  correlate strongly. So `"detected": true` can come with a share under 15 %.
+- `micDelaySeconds`: the offset, in seconds, between the two tracks' starts that
+  the measurement was aligned to (positive means the microphone started later),
+  as the recorder estimated it and clamped to the same range the mix uses.
+  Absent on a verdict recorded before this field existed, which is not the same
+  as `0`.
 - `suppressedSegments`: how many microphone segments were left out of the written
   transcript because the app track already carries them. `0` when nothing was
   removed, which includes every recording that was never analysed.
@@ -451,6 +611,18 @@ reports it here.
   could not be put in place. The job's `warnings` carry which one in prose. A
   caller counting how often the feature fails to deliver wants the field; a
   caller diagnosing one recording wants the warning.
+- `cancellationSeconds`: wall-clock seconds the canceller spent on the
+  microphone track, for a confirmed run and for a declined one alike. Absent
+  means the canceller never processed the track, and absent is not `0`: a zero
+  would read as a run that cost nothing. That population is narrower than
+  `removed`'s: a missing model and a run that failed write `"removed": false`
+  and leave this key out, so `false` without it is a run that never got going,
+  and `false` with it is a run the self-check or the file swap turned down.
+  The same number is logged locally as the `echoCancelling` stage event behind
+  the Settings processing averages; this field is its per-job home, the one a
+  caller tallying `removed` reads in the same object. Together they are the two
+  numbers a decision to default the feature on rests on: how often it delivers,
+  and what it costs against the length of a recording.
 
 **The two remedies do not compose, and cancellation wins.** Cancellation removes
 the far end from the microphone audio; the dedup drops microphone transcript
@@ -588,7 +760,7 @@ as `null`, following the same convention as the other DTOs.
 | `401` | Missing or wrong bearer token. |
 | `403` | Rejected by the Origin or Host guard. |
 | `404` | Unknown job id. Also `GET /v1/jobs/<id>/naming` when the job is not awaiting naming (the GET folds wrong-state into `404`; the POST naming routes use `409` instead). |
-| `409` | Confirm/skip naming on a job that exists but is not awaiting naming. Also `POST /v1/watch` while a manual recording owns the watch loop, and `POST /v1/record` while any other recording owns it. |
+| `409` | Confirm/skip naming on a job that exists but is not awaiting naming. Also `POST /v1/jobs/<id>/notes/retry` on a job with no failed notes to retry, or whose retry was refused, and `POST /v1/jobs/notes/generate` while the notes provider is None. Also `POST /v1/watch` while a manual recording owns the watch loop, and `POST /v1/record` while any other recording owns it. |
 | `412` | `POST /v1/record` only: nothing would be captured ("No Microphone" is set, or the mic permission is denied/broken). Stable until a setting changes, so do not retry. |
 | `503` | `POST /v1/watch` and `POST /v1/record`: the action was attempted and did not take. On `/v1/watch` that means the state did not settle within 20 seconds; on `/v1/record` also a recorder that would not start, or a stop whose audio could not be handed to the pipeline. Retryable, unlike `412`. On `/v1/watch` a *denied* microphone gives `200`, not this; on `/v1/record` it gives `412`. |
 
@@ -698,9 +870,11 @@ side.
   next launch keys on artefacts an app-audio tap leaves behind, and a
   microphone-only recording leaves none. Known limitation, not a regression.
 - **`mt-cli` covers inspection plus watch and record control.** The bundled
-  `tools/mt-cli` client wraps the debug endpoints (`state`, `healthz`,
-  `screenshot`, `open-settings`, `close-settings`) plus `mt-cli watch` and
-  `mt-cli record`; an `mt-cli transcribe` front for the job endpoints is a
+  `tools/mt-cli` client wraps debug endpoints (`state`, `healthz`,
+  `screenshot`, `ui-tree`, `ui-press`, `open-settings`, `close-settings`,
+  `confirm-browser-consent`, and the speaker actions `seed-speaker`,
+  `rename-speaker`, `delete-speaker`, `merge-speakers`), an offline
+  `wav-verdict` check, plus `mt-cli watch` and `mt-cli record`; an `mt-cli transcribe` front for the job endpoints is a
   planned follow-up. For now drive the rest of `/v1` with `curl` or any HTTP
   client.
 

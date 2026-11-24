@@ -18,10 +18,20 @@ struct StoredSpeaker: Codable, Identifiable {
     /// non-centroid entries of `samples`). Used as fallback match anchors.
     let embeddings: [[Float]]
     /// Weighted mean of the samples that count toward it. The primary match
-    /// anchor. nil until a sample with known, sufficient speech exists.
+    /// anchor. nil until a sample with known, sufficient speech exists, and for
+    /// legacy entries, which match on their samples alone until their first
+    /// confirmation makes the mean of those samples the seed.
     let centroid: [Float]?
     /// Number of confirmations `centroid` averages.
     let centroidSampleCount: Int
+    /// True while a non-legacy entry has only samples that cannot count toward
+    /// the centroid (short ones, or of unknown length), which unlike a legacy
+    /// entry's samples must never seed it. Derived from the history; persisted
+    /// only while true, so an entry without a history keeps it across a load.
+    var awaitsQualifyingSample: Bool {
+        centroid == nil && !samples.isEmpty && samples.allSatisfy { $0.centroidWeight == 0 }
+    }
+
     /// Wall-clock time when this speaker was last confirmed by the user via
     /// `updateDB`. Used to rank suggestion chips by recency. nil for entries
     /// migrated from older DB versions that didn't track usage.
@@ -67,6 +77,7 @@ struct StoredSpeaker: Codable, Identifiable {
         embeddings: [[Float]],
         centroid: [Float]? = nil,
         centroidSampleCount: Int = 0,
+        awaitsQualifyingSample: Bool = false,
         lastUsed: Date? = nil,
         useCount: Int = 0,
         isSynthetic: Bool = false,
@@ -75,6 +86,7 @@ struct StoredSpeaker: Codable, Identifiable {
             name: name,
             samples: Self.migratedSamples(
                 embeddings: embeddings, centroid: centroid, centroidSampleCount: centroidSampleCount,
+                awaitsQualifyingSample: awaitsQualifyingSample,
             ),
             lastUsed: lastUsed,
             useCount: useCount,
@@ -111,9 +123,9 @@ struct StoredSpeaker: Codable, Identifiable {
         else { return (recent, nil, 0) }
         let contributors = samples.filter { $0.centroidWeight > 0 && $0.embedding.count == dim }
         // Samples of an entry that never had a centroid seed one only once a
-        // real sample joins them: the lazy seeding older versions did on the
-        // first qualifying confirmation.
-        guard contributors.contains(where: { $0.origin != .migratedSample }) else { return (recent, nil, 0) }
+        // confirmation joins them, of any length: the seed is then a match
+        // anchor, which a short sample in the FIFO never becomes part of.
+        guard samples.contains(where: { $0.origin != .migratedSample }) else { return (recent, nil, 0) }
         let total = contributors.reduce(0) { $0 + $1.centroidWeight }
         if contributors.count == 1 {
             return (recent, contributors[0].embedding, total)
@@ -130,17 +142,23 @@ struct StoredSpeaker: Codable, Identifiable {
 
     static func migratedSamples(
         embeddings: [[Float]], centroid: [Float]?, centroidSampleCount: Int,
+        awaitsQualifyingSample: Bool = false,
     ) -> [VoiceSample] {
         var samples: [VoiceSample] = []
-        if let centroid, !centroid.isEmpty {
+        // An all-zero centroid has no direction and counts as absent: merging
+        // two centroids with a count of 0 used to write one. A count of 0
+        // beside a real centroid, from the same merges, counts as one sample.
+        if let centroid, centroid.contains(where: { $0 != 0 }) {
             samples.append(VoiceSample(
                 embedding: centroid, origin: .migratedCentroid, centroidWeight: max(centroidSampleCount, 1),
                 id: VoiceSample.migratedID(centroid, origin: .migratedCentroid, index: 0),
             ))
         }
         // Without a centroid the recent samples are what older versions seeded
-        // one from; with one they were already averaged into it.
-        let sampleWeight = samples.isEmpty ? 1 : 0
+        // one from; with one they were already averaged into it. An entry that
+        // awaits its first qualifying sample holds short ones only, and those
+        // never seed.
+        let sampleWeight = samples.isEmpty && !awaitsQualifyingSample ? 1 : 0
         samples += embeddings.enumerated().map { index, embedding in
             VoiceSample(
                 embedding: embedding, origin: .migratedSample, centroidWeight: sampleWeight,
@@ -184,18 +202,34 @@ struct StoredSpeaker: Codable, Identifiable {
             self.init(name: name, samples: samples, lastUsed: lastUsed, useCount: useCount, isSynthetic: isSynthetic)
             return
         }
-        let embeddings: [[Float]] = if let multi = try? container.decode([[Float]].self, forKey: .embeddings) {
-            multi
-        } else if let single = try? container.decode([Float].self, forKey: .embedding) {
-            [single]
-        } else {
-            []
+        // The first voice field that decodes wins; a damaged `embeddings`
+        // beside a valid legacy `embedding` therefore still loads with the
+        // legacy voice. Neither present (or both null) means no samples. A
+        // field that is present but does not decode, with no usable one beside
+        // it, throws: the entry is then dropped and kept in the copied-aside
+        // file rather than loaded with its voice silently gone.
+        let multi = Result { try container.decodeIfPresent([[Float]].self, forKey: .embeddings) }
+        let single = Result { try container.decodeIfPresent([Float].self, forKey: .embedding) }
+        let embeddings: [[Float]]
+        switch (multi, single) {
+        case let (.success(samples?), _):
+            embeddings = samples
+
+        case let (_, .success(sample?)):
+            embeddings = [sample]
+
+        case (.success(nil), .success(nil)):
+            embeddings = []
+
+        case let (.failure(error), _), let (_, .failure(error)):
+            throw error
         }
         try self.init(
             name: name,
             embeddings: embeddings,
             centroid: container.decodeIfPresent([Float].self, forKey: .centroid),
             centroidSampleCount: container.decodeIfPresent(Int.self, forKey: .centroidSampleCount) ?? 0,
+            awaitsQualifyingSample: container.decodeIfPresent(Bool.self, forKey: .awaitsQualifyingSample) ?? false,
             lastUsed: lastUsed,
             useCount: useCount,
             isSynthetic: isSynthetic,
@@ -204,7 +238,7 @@ struct StoredSpeaker: Codable, Identifiable {
 
     private enum CodingKeys: String, CodingKey {
         case name, embeddings, embedding, centroid, centroidSampleCount,
-             lastUsed, useCount, isSynthetic, samples
+             awaitsQualifyingSample, lastUsed, useCount, isSynthetic, samples
     }
 
     func encode(to encoder: any Encoder) throws {
@@ -216,6 +250,9 @@ struct StoredSpeaker: Codable, Identifiable {
         try container.encodeIfPresent(centroid, forKey: .centroid)
         if centroidSampleCount > 0 {
             try container.encode(centroidSampleCount, forKey: .centroidSampleCount)
+        }
+        if awaitsQualifyingSample {
+            try container.encode(awaitsQualifyingSample, forKey: .awaitsQualifyingSample)
         }
         try container.encodeIfPresent(lastUsed, forKey: .lastUsed)
         // Skip when 0 so entries that pre-date recency tracking round-trip
@@ -246,6 +283,15 @@ struct StoredSpeaker: Codable, Identifiable {
     /// future additions don't have to be threaded through the rename site.
     func renamed(to newName: String) -> Self {
         Self(name: newName, samples: samples, lastUsed: lastUsed, useCount: useCount, isSynthetic: isSynthetic)
+    }
+}
+
+extension SpeakerMatcher {
+    /// Synthetic entries (RPC `seedSpeaker`) carry random embeddings — letting
+    /// them participate in matching would let any caller with RPC access poison
+    /// auto-naming. Drop them before scoring.
+    func matchableSpeakers() -> [StoredSpeaker] {
+        loadDB().filter { !$0.isSynthetic }
     }
 }
 

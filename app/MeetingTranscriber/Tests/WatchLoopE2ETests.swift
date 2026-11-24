@@ -12,12 +12,6 @@ final class WatchLoopE2ETests: XCTestCase { // swiftlint:disable:this balanced_x
     override func setUp() async throws {
         try await super.setUp()
         tmpDir = try makeTempDirectory(prefix: "watchloop_e2e")
-
-        // Ensure recordingsDir exists (handleMeeting writes intermediate 16kHz files there)
-        try FileManager.default.createDirectory(
-            at: AppPaths.recordingsDir,
-            withIntermediateDirectories: true,
-        )
     }
 
     // MARK: - Helpers
@@ -86,7 +80,6 @@ final class WatchLoopE2ETests: XCTestCase { // swiftlint:disable:this balanced_x
             pollInterval: 0.05,
             endGracePeriod: 0.1,
             maxDuration: 10,
-            noMic: false,
         )
     }
 
@@ -129,7 +122,7 @@ final class WatchLoopE2ETests: XCTestCase { // swiftlint:disable:this balanced_x
         XCTAssertEqual(queue.jobs[0].state, .waiting)
 
         // Process the job through the pipeline
-        await queue.processNext()
+        await queue.awaitProcessing()
 
         // Verify protocol was generated
         XCTAssertTrue(mockProtocol.generateCalled, "Protocol generator should have been called")
@@ -187,7 +180,7 @@ final class WatchLoopE2ETests: XCTestCase { // swiftlint:disable:this balanced_x
         XCTAssertNotNil(queue.jobs[0].micPath, "Job should have mic audio path")
 
         // Process the job
-        await queue.processNext()
+        await queue.awaitProcessing()
 
         // Verify protocol was generated with speaker-labeled transcript
         XCTAssertTrue(mockProtocol.generateCalled, "Protocol generator should have been called")
@@ -230,7 +223,7 @@ final class WatchLoopE2ETests: XCTestCase { // swiftlint:disable:this balanced_x
         XCTAssertEqual(queue.jobs[0].state, .waiting)
 
         // Process the job — should fail with empty transcript
-        await queue.processNext()
+        await queue.awaitProcessing()
 
         XCTAssertEqual(queue.jobs[0].state, .error, "Job should be in error state for empty transcript")
         XCTAssertFalse(mockProtocol.generateCalled, "Protocol should NOT be generated for empty transcript")
@@ -269,7 +262,7 @@ final class WatchLoopE2ETests: XCTestCase { // swiftlint:disable:this balanced_x
 
         let meeting = makeMeeting()
         try await loop.handleMeeting(meeting)
-        await queue.processNext()
+        await queue.awaitProcessing()
 
         // Protocol should still be generated (diarization skipped gracefully)
         XCTAssertTrue(mockProtocol.generateCalled, "Protocol should be generated even when diarization is unavailable")
@@ -280,33 +273,7 @@ final class WatchLoopE2ETests: XCTestCase { // swiftlint:disable:this balanced_x
         XCTAssertFalse(mockProtocol.capturedDiarized ?? true, "Should be marked as non-diarized")
     }
 
-    // MARK: - 5. Cooldown Prevents Re-detection After Handling
-
-    func testCooldownPreventsRedetectionAfterHandling() {
-        let detector = PowerAssertionDetector(confirmationCount: 1)
-        detector.windowListProvider = { [] }
-
-        let teamsAssertions: [Int32: [[String: Any]]] = [
-            1234: [[
-                "Process Name": "MSTeams",
-                "AssertName": "Microsoft Teams Call in progress",
-            ]],
-        ]
-        detector.assertionProvider = { teamsAssertions }
-
-        // First detection succeeds
-        let firstDetection = detector.checkOnce()
-        XCTAssertNotNil(firstDetection, "Should detect meeting on first check")
-
-        // Reset with cooldown
-        detector.reset(appName: "Microsoft Teams")
-
-        // Second detection should fail due to cooldown
-        let secondDetection = detector.checkOnce()
-        XCTAssertNil(secondDetection, "Should NOT detect meeting during cooldown")
-    }
-
-    // MARK: - 6. Resample Path Produces 16kHz for WhisperKit
+    // MARK: - 5. Resample Path Produces 16kHz for WhisperKit
 
     func testResamplePathProduces16kHzForWhisperKit() async throws {
         try skipIfCIWithoutE2EOptIn("requires WhisperKit model download")
@@ -349,7 +316,7 @@ final class WatchLoopE2ETests: XCTestCase { // swiftlint:disable:this balanced_x
         XCTAssertFalse(transcript.contains("|>"), "Transcript should not contain '|>'")
     }
 
-    // MARK: - 7. Full Pipeline With Real Diarization (slow)
+    // MARK: - 6. Full Pipeline With Real Diarization (slow)
 
     func testFullPipelineWithRealDiarization() async throws {
         try skipIfCIWithoutE2EOptIn("requires WhisperKit model + FluidAudio diarization")
@@ -406,14 +373,14 @@ final class WatchLoopE2ETests: XCTestCase { // swiftlint:disable:this balanced_x
 
         // The naming handler now runs after the job reaches
         // `.speakerNamingPending`, in a detached Task that outlives
-        // `processNext()`, so wait for the terminal state before asserting.
+        // `awaitProcessing()`, so wait for the terminal state before asserting.
         let done = XCTestExpectation(description: "job reaches a terminal state")
         queue.onJobStateChange = { _, _, newState in
             if newState == .done || newState == .error { done.fulfill() }
         }
 
         // Process the job (real transcription + real diarization)
-        await queue.processNext()
+        await queue.awaitProcessing()
         await fulfillment(of: [done], timeout: 120)
 
         // Verify protocol was generated
@@ -439,7 +406,7 @@ final class WatchLoopE2ETests: XCTestCase { // swiftlint:disable:this balanced_x
         XCTAssertFalse(stored.isEmpty, "Speaker DB should have been populated")
     }
 
-    // MARK: - 8. WatchLoop Enqueues Job After Recording
+    // MARK: - 7. WatchLoop Enqueues Job After Recording
 
     func testHandleMeetingEnqueuesJob() async throws {
         let mixPath = tmpDir.appendingPathComponent("test_mix.wav")

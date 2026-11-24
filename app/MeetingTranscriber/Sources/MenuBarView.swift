@@ -18,21 +18,45 @@ struct MenuBarView: View {
     /// to avoid on the picker.
     let manualRecordingPendingOrActive: Bool
     let onStopManualRecording: (() -> Void)?
-    let onOpenLastProtocol: () -> Void
-    let onOpenProtocol: (URL) -> Void
+    var isMicMuted = false
+    /// Non-nil while a recording with an open microphone is running.
+    var onToggleMicMute: (() -> Void)?
+    /// The global shortcut, which replaces the item's default when one is set.
+    var micMuteShortcut: KeyboardShortcut?
+
+    /// Free by default: "Record Microphone" holds ⌘M, and is hidden while recording.
+    var micMuteItemShortcut: KeyboardShortcut {
+        micMuteShortcut ?? KeyboardShortcut("m")
+    }
+
+    let onOpenProtocol: (JobOpenTarget) -> Void
     let onOpenProtocolsFolder: () -> Void
     /// Opens the Protocols window: the folder as a list, with delete.
-    let onOpenProtocols: () -> Void
+    var onOpenProtocols: () -> Void = {}
     let onOpenSettings: () -> Void
     let onNameSpeakers: (() -> Void)?
     let onProcessFiles: () -> Void
     /// The "Show Captions" item is the same switch as Settings → Transcription
     /// → "Show caption overlay", one click from the menu bar for a bar that is
     /// in the way mid-call; transcription keeps running either way.
-    let captionOverlay: CaptionOverlayItem
-    let onToggleCaptionOverlay: () -> Void
+    var captionOverlay: CaptionOverlayItem = .unavailable
+    var onToggleCaptionOverlay: () -> Void = {}
     let onDismissJob: (UUID) -> Void
     let onQuit: () -> Void
+    /// The browser whose recording-consent prompt is open, nil when none is.
+    /// Mirrors the notification in the menu so a prompt hidden by Focus, screen
+    /// sharing or a notification style of None can still be answered (issue #814).
+    var pendingConsentApp: String?
+    /// Answers the open prompt: true records, false declines.
+    var onAnswerPendingConsent: (Bool) -> Void = { _ in }
+    /// Whether Notion export is on. A job that has a page URL but was exported
+    /// before the setting was turned off still falls back to it when no local
+    /// file exists; `JobOpenTarget` owns that rule.
+    var notionExportEnabled: Bool = false
+    /// Picks transcripts and queues meeting notes for each.
+    var onGenerateNotesFromTranscripts: () -> Void = {}
+    /// Whether the live-caption models are still loading.
+    var captionsPreparing: Bool = false
 
     private var state: TranscriberState {
         status?.state ?? .idle
@@ -64,6 +88,7 @@ struct MenuBarView: View {
         statusHeader
         meetingInfo
         errorInfo
+        consentPrompt
 
         Divider()
 
@@ -93,6 +118,12 @@ struct MenuBarView: View {
 
             if let detail = status?.detail, !detail.isEmpty {
                 Text(detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            if captionsPreparing {
+                Text(LiveCaptionsWarmup.preparingMenuText)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -127,6 +158,28 @@ struct MenuBarView: View {
         }
     }
 
+    @ViewBuilder private var consentPrompt: some View {
+        if let app = pendingConsentApp {
+            Divider()
+            Text("Meeting detected in \(app)")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 4)
+            Button {
+                onAnswerPendingConsent(true)
+            } label: {
+                Label("Record This Meeting", systemImage: "record.circle.fill")
+            }
+            .accessibilityIdentifier(A11yID.menuRecordPendingConsent)
+            Button {
+                onAnswerPendingConsent(false)
+            } label: {
+                Label("Don't Record", systemImage: "xmark.circle")
+            }
+            .accessibilityIdentifier(A11yID.menuDeclinePendingConsent)
+        }
+    }
+
     @ViewBuilder private var watchControls: some View {
         Button {
             onStartStop()
@@ -138,6 +191,20 @@ struct MenuBarView: View {
             }
         }
         .keyboardShortcut("s")
+
+        if let onToggleMicMute {
+            Button {
+                onToggleMicMute()
+            } label: {
+                if isMicMuted {
+                    Label("Unmute Mic in Recording", systemImage: "mic.fill")
+                } else {
+                    Label("Mute Mic in Recording", systemImage: "mic.slash.fill")
+                }
+            }
+            .keyboardShortcut(micMuteItemShortcut)
+            .help("Only affects this recording. People on the call can still hear you.")
+        }
 
         if let onStopManualRecording {
             Button {
@@ -190,6 +257,17 @@ struct MenuBarView: View {
             Label("Process Audio/Video Files...", systemImage: "doc.badge.plus")
         }
         .keyboardShortcut("p")
+
+        // Not in the App Store build: the notes are written next to the picked
+        // file, and the sandbox grants the picked file only, not its folder.
+        #if !APPSTORE
+            Button {
+                onGenerateNotesFromTranscripts()
+            } label: {
+                Label("Generate Meeting Notes from Transcript...", systemImage: "doc.text")
+            }
+            .accessibilityIdentifier(A11yID.generateNotesFromTranscriptButton)
+        #endif
     }
 
     private var queueHeader: QueueHeader {
@@ -200,6 +278,7 @@ struct MenuBarView: View {
         if !pipelineQueue.jobs.isEmpty {
             Divider()
             Label(queueHeader.title, systemImage: queueHeader.systemImage)
+            retryAllMeetingNotesButton
 
             ForEach(Array(pipelineQueue.jobs.enumerated()), id: \.element.id) { index, job in
                 // A native separator, not a grouping view: each job is a run of
@@ -212,14 +291,20 @@ struct MenuBarView: View {
     }
 
     @ViewBuilder private var protocolActions: some View {
-        if let protocolPath = status?.protocolPath {
+        let completedTarget = JobOpenTarget.resolve(
+            for: pipelineQueue.completedJobs.last,
+            preferNotion: notionExportEnabled,
+        )
+        let target = completedTarget ?? status?.protocolPath.map { path in
+            JobOpenTarget.file(URL(fileURLWithPath: path))
+        }
+        if let target {
             Button {
-                onOpenLastProtocol()
+                onOpenProtocol(target)
             } label: {
-                Label("Open Last Protocol", systemImage: "doc.text")
+                Label(target.lastProtocolLabel, systemImage: target.systemImage)
             }
             .keyboardShortcut("o")
-            .disabled(protocolPath.isEmpty)
         }
 
         Button {
@@ -232,21 +317,28 @@ struct MenuBarView: View {
         Button {
             onOpenProtocolsFolder()
         } label: {
-            Label("Open Protocols Folder", systemImage: "folder")
+            Label("Open Notes Folder", systemImage: "folder")
         }
     }
 
     @ViewBuilder private var updateSection: some View {
-        if let update = updateChecker?.availableUpdate {
+        if let updateChecker, let update = updateChecker.availableUpdate {
+            let route = updateChecker.installRoute(for: update)
             Divider()
             Button {
-                NSWorkspace.shared.open(update.dmgURL ?? update.htmlURL)
+                route.perform()
             } label: {
-                Label(
-                    "Update Available: \(update.tagName)",
-                    systemImage: "arrow.down.circle.fill",
-                )
+                Label(updateTitle(update, route: route), systemImage: "arrow.down.circle.fill")
             }
+        }
+    }
+
+    /// The menu closes on click, so the title has to say up front that the
+    /// item copies a command rather than opening a download.
+    private func updateTitle(_ update: ReleaseInfo, route: UpdateInstallRoute) -> String {
+        switch route {
+        case .homebrew: "Update Available: \(update.tagName) (Copy brew Command)"
+        case .download: "Update Available: \(update.tagName)"
         }
     }
 
@@ -281,8 +373,9 @@ struct MenuBarView: View {
         Text(job.meetingTitle)
         jobStateLabel(job)
 
-        if job.state == .done, let path = job.protocolPath ?? job.transcriptPath {
-            Button("Open") { onOpenProtocol(path) }
+        if job.state == .done,
+           let target = JobOpenTarget.resolve(for: job, preferNotion: notionExportEnabled) {
+            Button(target.jobActionLabel) { onOpenProtocol(target) }
         }
         if job.state == .speakerNamingPending {
             Button("Name Speakers") { onNameSpeakers?() }
@@ -292,8 +385,11 @@ struct MenuBarView: View {
             Button("Cancel") { pipelineQueue.cancelJob(id: job.id) }
         }
         retryButton(job, index: index)
+        notesRetryButton(job, index: index)
+        notionRetryButton(job, index: index)
         if job.state == .done || job.state == .error || job.state == .speakerNamingPending {
-            Button("Dismiss") { onDismissJob(job.id) }
+            Button(job.notionExportStatus == .failed ? "Discard Notion Retry" : "Dismiss") { onDismissJob(job.id) }
+                .disabled(job.notionExportStatus == .inProgress)
         }
     }
 
@@ -307,12 +403,46 @@ struct MenuBarView: View {
         }
     }
 
+    /// Generates failed meeting notes again from the saved transcript.
+    @ViewBuilder
+    private func notesRetryButton(_ job: PipelineJob, index: Int) -> some View {
+        if job.hasRetryableMeetingNotes {
+            Button("Retry Meeting Notes") { pipelineQueue.retryMeetingNotes(id: job.id) }
+                .accessibilityIdentifier(A11yID.jobNotesRetryButton(index))
+        }
+    }
+
+    /// Offered once more than one meeting is waiting for a retry; with one, the
+    /// job's own row does the same. Enabled, so `MenuStageProgressUpdater`
+    /// never takes it for a job title.
+    @ViewBuilder private var retryAllMeetingNotesButton: some View {
+        let count = pipelineQueue.jobsWithRetryableMeetingNotes.count
+        if count > 1 {
+            Button("Retry All Meeting Notes (\(count))") { pipelineQueue.retryAllMeetingNotes() }
+                .accessibilityIdentifier(A11yID.retryAllMeetingNotesButton)
+        }
+    }
+
+    @ViewBuilder
+    private func notionRetryButton(_ job: PipelineJob, index: Int) -> some View {
+        if job.state == .done, job.hasPendingNotionExport {
+            Button("Retry Notion Export") {
+                Task { await pipelineQueue.retryNotionExport(id: job.id) }
+            }
+            .accessibilityIdentifier(A11yID.jobNotionRetryButton(index))
+            .disabled(!notionExportEnabled || !job.hasRetryableNotionBackup)
+            .help(notionExportEnabled ? "" : "Enable Notion export in Settings → Output to retry.")
+        }
+    }
+
     @ViewBuilder
     private func jobStateLabel(_ job: PipelineJob) -> some View {
         if StageKind(jobState: job.state) != nil {
             MenuStageProgressLabel(text: MenuStageProgressUpdater.progressText(job: job, queue: pipelineQueue))
         } else if job.state == .error, let msg = job.error {
             Text(msg)
+        } else if job.state == .done, job.notionExportStatus == .inProgress {
+            Text("Exporting to Notion…")
         } else if job.state == .done, !job.warnings.isEmpty {
             Text(job.warnings.joined(separator: "; "))
         } else {

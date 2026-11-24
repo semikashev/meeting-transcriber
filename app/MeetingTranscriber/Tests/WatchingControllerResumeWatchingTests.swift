@@ -39,7 +39,7 @@ final class WatchingControllerResumeWatchingTests: XCTestCase {
         XCTAssertFalse(existingLoop.isActive, "the loop taken over from is stopped")
         XCTAssertFalse(controller.isWatching, "not watching while the microphone records")
 
-        controller.stopManualRecording()
+        await controller.stopManualRecording()
         await waitFor(controller.isWatching, timeout: .seconds(3))
 
         XCTAssertTrue(controller.isWatching, "watching must come back on its own")
@@ -55,7 +55,7 @@ final class WatchingControllerResumeWatchingTests: XCTestCase {
 
         controller.startManualRecording(pid: 1234, appName: "Chrome", title: "Standup")
         await waitFor(controller.watchLoop?.isManualRecording == true, timeout: .seconds(2))
-        controller.stopManualRecording()
+        await controller.stopManualRecording()
         await waitFor(controller.isWatching, timeout: .seconds(3))
 
         XCTAssertTrue(controller.isWatching)
@@ -90,7 +90,7 @@ final class WatchingControllerResumeWatchingTests: XCTestCase {
 
         controller.startMicrophoneRecording()
         await waitFor(controller.watchLoop?.isManualRecording == true, timeout: .seconds(2))
-        controller.stopManualRecording()
+        await controller.stopManualRecording()
         // Give a wrongly scheduled start every chance to land before asserting.
         try? await Task.sleep(nanoseconds: 300_000_000)
 
