@@ -2,7 +2,7 @@ import SwiftUI
 
 /// Content of the Protocols window: the output folder as a list, with delete
 /// and merge. Owns the rows; they are rescanned whenever the window opens or
-/// acts.
+/// acts, and when a job starts or finishes.
 struct ProtocolsWindow: View {
     let appState: AppState
     @State private var protocolEntries: [ProtocolEntry] = []
@@ -10,6 +10,7 @@ struct ProtocolsWindow: View {
     var body: some View {
         ProtocolsWindowView(
             entries: protocolEntries,
+            busyStems: busyStems,
             onOpen: { entry in
                 if let url = entry.protocolURL ?? entry.transcriptURL { NSWorkspace.shared.open(url) }
             },
@@ -23,21 +24,19 @@ struct ProtocolsWindow: View {
             },
             onRefresh: rescanProtocols,
             onMerge: mergeProtocolEntries,
+            onGenerateNotes: generateNotes,
         )
     }
 
-    /// Stems a pipeline job still refers to: anything not finished, plus the
-    /// jobs parked on speaker naming, whose 16 kHz sidecar the naming session
-    /// reads back. Deleting under those would break the job.
+    private var busyStems: Set<String> {
+        ProtocolLibrary.busyStems(of: appState.pipeline.queue.jobs, merging: appState.pipeline.mergingStems)
+    }
+
     private func rescanProtocols() {
-        let busy = Set(appState.pipeline.queue.jobs
-            .filter { $0.state != .done && $0.state != .error }
-            .compactMap(\.namingSlug))
-            .union(appState.pipeline.mergingStems)
         let dir = appState.settings.effectiveOutputDir
         let accessing = dir.startAccessingSecurityScopedResource()
         defer { if accessing { dir.stopAccessingSecurityScopedResource() } }
-        protocolEntries = ProtocolLibrary.scan(outputDir: dir, busyStems: busy)
+        protocolEntries = ProtocolLibrary.scan(outputDir: dir, busyStems: busyStems)
     }
 
     private func mergeProtocolEntries(_ request: SessionMergeRequest) {
@@ -57,6 +56,12 @@ struct ProtocolsWindow: View {
             }
             rescanProtocols()
         }
+    }
+
+    private func generateNotes(for entry: ProtocolEntry) {
+        guard let transcript = entry.transcriptURL else { return }
+        appState.pipeline.makeNotes(forTranscript: transcript)
+        rescanProtocols()
     }
 
     private func removeProtocolEntry(_ entry: ProtocolEntry, scope: ProtocolRemovalScope) {
