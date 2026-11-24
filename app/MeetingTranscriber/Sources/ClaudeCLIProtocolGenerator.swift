@@ -173,6 +173,7 @@
                 logger.error("claude_cli_rejected_tool_restriction exit=\(exitCode, privacy: .public)")
                 return makeFailureError(exitCode: exitCode, stderrText: toolRestrictionRejectedMessage(publicMessage))
             }
+            if let refusal = refusalError(status: resultEvent?.apiErrorStatus, message: publicMessage) { return refusal }
             let error = makeFailureError(exitCode: exitCode, stderrText: publicMessage)
             let rejected = rejectedNoSessionPersistence(stderr: stderrText, message: publicMessage, arguments: arguments)
             return rejected ? NoSessionPersistenceRejected(error: error) : error
@@ -307,6 +308,9 @@
             let errors: [String]
             let result: String?
             let terminalReason: String?
+            /// HTTP status of the API's refusal (`api_error_status`), nil for
+            /// any other end and from a CLI that does not report it.
+            var apiErrorStatus: Int?
         }
 
         /// Parse a stream-json terminal `result` line. Returns nil for every
@@ -333,7 +337,10 @@
             let errors = (obj["errors"] as? [Any])?.compactMap { $0 as? String } ?? []
             let result = obj["result"] as? String
             let terminalReason = obj["terminal_reason"] as? String
-            return ResultEventInfo(isError: isError, errors: errors, result: result, terminalReason: terminalReason)
+            return ResultEventInfo(
+                isError: isError, errors: errors, result: result, terminalReason: terminalReason,
+                apiErrorStatus: obj["api_error_status"] as? Int,
+            )
         }
 
         /// The CLI's own diagnostic sentence for a failed run, sourced from
@@ -421,7 +428,7 @@
 
         /// Strip `CLAUDECODE` (avoid nested-session detection by the child
         /// CLI), force `disableAutoMemoryVariable` and `safeModeVariable` to
-        /// `1` (see there), and prepend `searchPaths` to `PATH` (app bundles
+        /// `1` and cap `retryWaitLimitVariable` (see there), and prepend `searchPaths` to `PATH` (app bundles
         /// inherit a minimal `PATH`). `anthropicAPIKey`, when non-empty and not
         /// already set in `baseEnvironment`, is injected so the subprocess
         /// can authenticate via API key instead of the CLI's own OAuth
@@ -439,6 +446,7 @@
             env.removeValue(forKey: "CLAUDECODE")
             env[disableAutoMemoryVariable] = "1"
             env[safeModeVariable] = "1"
+            env[retryWaitLimitVariable] = retryWaitLimitMilliseconds
             let extraPaths = searchPaths.joined(separator: ":")
             env["PATH"] = "\(extraPaths):\(env["PATH"] ?? "/usr/bin:/bin")"
             if env["ANTHROPIC_API_KEY"]?.isEmpty ?? true,
