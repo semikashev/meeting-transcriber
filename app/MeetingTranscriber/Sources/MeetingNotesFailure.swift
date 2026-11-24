@@ -10,6 +10,10 @@ enum MeetingNotesFailure: String, Codable, Equatable {
     /// The Claude CLI answered that it is not signed in.
     case claudeSignedOut
     case claudeNotFound
+    /// The Claude account's usage limit is reached; it resets by itself.
+    case claudeUsageLimit
+    /// The Claude API refused the connection, usually for its network.
+    case claudeBlocked
     case claudeFailed
     case timedOut
     case empty
@@ -37,6 +41,10 @@ enum MeetingNotesFailure: String, Codable, Equatable {
 
             case .cliNotFound: self = .claudeNotFound
 
+            case .cliUsageLimit: self = .claudeUsageLimit
+
+            case .cliBlocked: self = .claudeBlocked
+
             case .timeout: self = .timedOut
         #endif
 
@@ -57,6 +65,8 @@ enum MeetingNotesFailure: String, Codable, Equatable {
         switch self {
         case .claudeSignedOut: "The Claude CLI is not signed in"
         case .claudeNotFound: "The Claude CLI was not found"
+        case .claudeUsageLimit: "The Claude usage limit is reached"
+        case .claudeBlocked: "Claude refused the connection from this network (HTTP 403); check the VPN"
         case .claudeFailed: "The Claude CLI stopped with an error"
         case .timedOut: "The notes provider took too long"
         case .empty: "The notes provider returned no text"

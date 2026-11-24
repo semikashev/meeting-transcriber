@@ -395,6 +395,10 @@ enum ProtocolError: LocalizedError {
     #if !APPSTORE
         case cliNotFound(String)
         case cliFailed(Int, String)
+        /// The Claude account's usage limit is reached (HTTP 429).
+        case cliUsageLimit(String)
+        /// The API refused the connection, usually for its network (HTTP 403).
+        case cliBlocked(String)
         case timeout
     #endif
     case emptyProtocol
@@ -409,6 +413,10 @@ enum ProtocolError: LocalizedError {
             case let .cliNotFound(bin): "'\(bin)' CLI not found. Install: npm install -g @anthropic-ai/claude-code"
 
             case let .cliFailed(code, stderr): "Claude CLI exited with code \(code)\(stderr.isEmpty ? "" : ": \(stderr)")"
+
+            case let .cliUsageLimit(message): "Claude usage limit reached: \(message)"
+
+            case let .cliBlocked(message): "Claude refused the connection: \(message)"
 
             case .timeout: "Claude CLI took too long (>10 min)"
         #endif
